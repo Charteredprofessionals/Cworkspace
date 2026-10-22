@@ -80,8 +80,8 @@ impl Tool for WindowsComputerTool {
     }
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
-        let input: ComputerUseInput = serde_json::from_value(input)
-            .context("invalid `computer_use` tool input")?;
+        let input: ComputerUseInput =
+            serde_json::from_value(input).context("invalid `computer_use` tool input")?;
         ensure_hotkey_listener()?;
         match input.action.as_str() {
             "screenshot" => tokio::task::spawn_blocking(move || capture_window(input.window_id))
@@ -202,10 +202,12 @@ fn capture_window(window_id: Option<u32>) -> Result<ToolOutput> {
     let (width, height) = image.dimensions();
     let mut png = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image).write_to(&mut png, image::ImageFormat::Png)?;
-    let output = ToolOutput::new(format!("Captured window {id} ({title}), {width}x{height} pixels."))
-        .with_title("Windows screenshot")
-        .with_labeled_image("image/png", STANDARD.encode(png.into_inner()), "window")
-        .with_metadata(json!({"window_id": id, "title": title, "width": width, "height": height}));
+    let output = ToolOutput::new(format!(
+        "Captured window {id} ({title}), {width}x{height} pixels."
+    ))
+    .with_title("Windows screenshot")
+    .with_labeled_image("image/png", STANDARD.encode(png.into_inner()), "window")
+    .with_metadata(json!({"window_id": id, "title": title, "width": width, "height": height}));
     Ok(output)
 }
 
@@ -244,7 +246,11 @@ fn inspect_ui(depth: Option<u32>) -> Result<ToolOutput> {
     Ok(ToolOutput::new(format!(
         "UI Automation elements: {}{}\n{}",
         records.len(),
-        if elements.len() > MAX_UI_ELEMENTS { " (capped)" } else { "" },
+        if elements.len() > MAX_UI_ELEMENTS {
+            " (capped)"
+        } else {
+            ""
+        },
         output
     ))
     .with_metadata(json!({"elements": records})))
@@ -266,7 +272,10 @@ fn element_record(element: &UIElement) -> Option<UiElementRecord> {
     Some(UiElementRecord {
         name: element.get_name().unwrap_or_default(),
         control_type: format!("{:?}", element.get_control_type().ok()?),
-        native_handle: element.get_native_window_handle().ok().map(|handle| handle as isize),
+        native_handle: element
+            .get_native_window_handle()
+            .ok()
+            .map(|handle| handle as isize),
         left: bounds.get_left(),
         top: bounds.get_top(),
         right: bounds.get_right(),
@@ -276,22 +285,29 @@ fn element_record(element: &UIElement) -> Option<UiElementRecord> {
 
 fn click(x: i32, y: i32) -> Result<ToolOutput> {
     ensure_synthesis_allowed(&PANIC_SWITCH_ACTIVE)?;
-    let mut enigo = Enigo::new(&Settings::default()).context("initializing Windows input synthesis")?;
+    let mut enigo =
+        Enigo::new(&Settings::default()).context("initializing Windows input synthesis")?;
     enigo.move_mouse(x, y, Coordinate::Abs)?;
     ensure_synthesis_allowed(&PANIC_SWITCH_ACTIVE)?;
     enigo.button(Button::Left, Direction::Click)?;
-    Ok(ToolOutput::new(format!("Clicked screen coordinate ({x}, {y}).")))
+    Ok(ToolOutput::new(format!(
+        "Clicked screen coordinate ({x}, {y})."
+    )))
 }
 
 fn type_text(text: &str) -> Result<ToolOutput> {
     ensure_synthesis_allowed(&PANIC_SWITCH_ACTIVE)?;
-    let mut enigo = Enigo::new(&Settings::default()).context("initializing Windows input synthesis")?;
+    let mut enigo =
+        Enigo::new(&Settings::default()).context("initializing Windows input synthesis")?;
     for chunk in text.as_bytes().chunks(256) {
         ensure_synthesis_allowed(&PANIC_SWITCH_ACTIVE)?;
         let chunk = std::str::from_utf8(chunk).unwrap_or("");
         enigo.text(chunk)?;
     }
-    Ok(ToolOutput::new(format!("Typed {} characters.", text.chars().count())))
+    Ok(ToolOutput::new(format!(
+        "Typed {} characters.",
+        text.chars().count()
+    )))
 }
 
 fn press_key(name: &str) -> Result<ToolOutput> {
@@ -309,7 +325,8 @@ fn press_key(name: &str) -> Result<ToolOutput> {
         "right" => Key::RightArrow,
         _ => bail!("unsupported key name: {name}"),
     };
-    let mut enigo = Enigo::new(&Settings::default()).context("initializing Windows input synthesis")?;
+    let mut enigo =
+        Enigo::new(&Settings::default()).context("initializing Windows input synthesis")?;
     enigo.key(key, Direction::Click)?;
     Ok(ToolOutput::new(format!("Pressed {name}.")))
 }

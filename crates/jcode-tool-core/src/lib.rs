@@ -6,8 +6,8 @@ use jcode_tool_types::ToolOutput;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-mod path_policy;
 mod path_jail;
+mod path_policy;
 pub use path_jail::PathJail;
 pub use path_policy::{
     ArtifactCreated, PathValidator, SessionApprovalRegistration,
@@ -25,8 +25,8 @@ mod win_job {
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
 
@@ -66,9 +66,8 @@ mod win_job {
         }
 
         pub fn assign_process(&self, child: &impl AsRawHandle) -> io::Result<()> {
-            let assigned = unsafe {
-                AssignProcessToJobObject(self.handle, child.as_raw_handle() as HANDLE)
-            };
+            let assigned =
+                unsafe { AssignProcessToJobObject(self.handle, child.as_raw_handle() as HANDLE) };
             if assigned == 0 {
                 Err(io::Error::last_os_error())
             } else {
@@ -448,7 +447,10 @@ mod tests {
             context.resolve_path(Path::new("workspace/file.txt")),
             PathBuf::from("workspace/file.txt")
         );
-        assert_eq!(context.resolve_path(Path::new("private/file.txt")), denied_path());
+        assert_eq!(
+            context.resolve_path(Path::new("private/file.txt")),
+            denied_path()
+        );
     }
 
     #[test]

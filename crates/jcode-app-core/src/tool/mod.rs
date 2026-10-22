@@ -11,7 +11,6 @@ mod calendar;
 mod codemode;
 mod communicate;
 mod compile_remote;
-mod office_docs;
 #[cfg(target_os = "macos")]
 mod computer;
 #[cfg(windows)]
@@ -28,6 +27,7 @@ mod feedback;
 mod file_diff;
 pub(crate) mod file_lock;
 mod gmail;
+mod office_docs;
 // The initiative tool is intentionally unregistered (4928a1c92) but kept for re-enable.
 pub mod applet;
 #[allow(dead_code)]
@@ -55,9 +55,9 @@ mod todo;
 mod user_response;
 mod webfetch;
 mod websearch;
-mod write;
 #[cfg(windows)]
 mod win_job;
+mod write;
 
 use crate::compaction::CompactionManager;
 use crate::provider::Provider;

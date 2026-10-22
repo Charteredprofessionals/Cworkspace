@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::{Context, Result, anyhow};
@@ -52,10 +52,8 @@ struct CoworkRpcInner {
     events: broadcast::Sender<CoworkEvent>,
     approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     mounted_roots: Mutex<HashMap<String, Vec<PathBuf>>>,
-    jail_registrations:
-        Mutex<HashMap<String, crate::tool::SessionPathValidatorRegistration>>,
-    approval_registrations:
-        Mutex<HashMap<String, crate::tool::SessionApprovalRegistration>>,
+    jail_registrations: Mutex<HashMap<String, crate::tool::SessionPathValidatorRegistration>>,
+    approval_registrations: Mutex<HashMap<String, crate::tool::SessionApprovalRegistration>>,
     tasks: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
@@ -108,9 +106,8 @@ impl CoworkRpc {
             },
         );
         let weak = Arc::downgrade(&self.inner);
-        let artifact_registration = crate::tool::register_session_artifact_created_notifier(
-            session_id,
-            move |artifact| {
+        let artifact_registration =
+            crate::tool::register_session_artifact_created_notifier(session_id, move |artifact| {
                 let weak = weak.clone();
                 async move {
                     let inner = weak
@@ -124,15 +121,22 @@ impl CoworkRpc {
                         .map(|_| ())
                         .map_err(|error| error.to_string())
                 }
-            },
-        );
-        Ok((path_registration, approval_registration, artifact_registration))
+            });
+        Ok((
+            path_registration,
+            approval_registration,
+            artifact_registration,
+        ))
     }
 
     pub async fn start_task(&self, goal: String, allowed_roots: Vec<PathBuf>) -> Result<String> {
-        self.start_task_with(goal, allowed_roots, |goal, roots, task_id, rpc| async move {
-            crate::cli::commands::run_cowork_task(goal, roots, task_id, rpc).await
-        })
+        self.start_task_with(
+            goal,
+            allowed_roots,
+            |goal, roots, task_id, rpc| async move {
+                crate::cli::commands::run_cowork_task(goal, roots, task_id, rpc).await
+            },
+        )
         .await
     }
 
@@ -169,7 +173,11 @@ impl CoworkRpc {
                 summary,
             });
         });
-        self.inner.tasks.lock().await.insert(task_id.clone(), handle);
+        self.inner
+            .tasks
+            .lock()
+            .await
+            .insert(task_id.clone(), handle);
         let _ = start.send(());
         Ok(task_id)
     }
@@ -244,10 +252,10 @@ impl CoworkRpc {
         })
         .await
         .context("failed to initialize Cowork path jail")??;
-        let registration = crate::tool::register_session_path_validator(
-            session_id.to_owned(),
-            move |path| jail.verify_path(path),
-        );
+        let registration =
+            crate::tool::register_session_path_validator(session_id.to_owned(), move |path| {
+                jail.verify_path(path)
+            });
         let weak: Weak<CoworkRpcInner> = Arc::downgrade(&self.inner);
         let approval_registration = crate::tool::register_session_approval_requester(
             session_id.to_owned(),
@@ -296,7 +304,9 @@ impl CoworkRpc {
         description: impl Into<String>,
     ) -> Result<bool> {
         if self.inner.events.receiver_count() == 0 {
-            return Err(anyhow!("no Cowork IPC client is connected to approve this action"));
+            return Err(anyhow!(
+                "no Cowork IPC client is connected to approve this action"
+            ));
         }
 
         let id = id.into();
@@ -318,7 +328,9 @@ impl CoworkRpc {
             .is_err()
         {
             self.inner.approvals.lock().await.remove(&id);
-            return Err(anyhow!("Cowork IPC client disconnected before approval was requested"));
+            return Err(anyhow!(
+                "Cowork IPC client disconnected before approval was requested"
+            ));
         }
 
         receiver
@@ -466,7 +478,10 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                 (Some(approval_id), Some(approved)) => {
                     Ok(json!({ "resolved": rpc.approve_tool_call(approval_id, approved).await }))
                 }
-                _ => Err((-32602, "params require string id and boolean approved".to_string())),
+                _ => Err((
+                    -32602,
+                    "params require string id and boolean approved".to_string(),
+                )),
             }
         }
         _ => Err((-32601, format!("Method not found: {}", request.method))),
@@ -491,7 +506,10 @@ pub async fn run_server() -> Result<()> {
             .create(PIPE_NAME)
             .with_context(|| format!("failed to create named pipe {PIPE_NAME}"))?;
         first_instance = false;
-        server.connect().await.context("failed accepting Cowork IPC client")?;
+        server
+            .connect()
+            .await
+            .context("failed accepting Cowork IPC client")?;
 
         let client_rpc = rpc.clone();
         tokio::spawn(async move {

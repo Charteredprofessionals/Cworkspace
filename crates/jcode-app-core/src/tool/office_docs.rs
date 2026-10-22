@@ -119,8 +119,10 @@ impl Tool for OfficeDocsTool {
                     .await
                     .context("XLSX generation task panicked")??;
                 notify_artifact(&ctx, path.clone(), XLSX_MIME).await?;
-                Ok(ToolOutput::new(format!("Created workbook {}", params.file_path))
-                    .with_title(params.file_path))
+                Ok(
+                    ToolOutput::new(format!("Created workbook {}", params.file_path))
+                        .with_title(params.file_path),
+                )
             }
             "create_docx" => {
                 let title = params.title.unwrap_or_else(|| "Report".to_owned());
@@ -131,8 +133,10 @@ impl Tool for OfficeDocsTool {
                     .await
                     .context("DOCX generation task panicked")??;
                 notify_artifact(&ctx, path.clone(), DOCX_MIME).await?;
-                Ok(ToolOutput::new(format!("Created report {}", params.file_path))
-                    .with_title(params.file_path))
+                Ok(
+                    ToolOutput::new(format!("Created report {}", params.file_path))
+                        .with_title(params.file_path),
+                )
             }
             _ => bail!("unsupported office_docs action: {}", params.action),
         }
@@ -147,18 +151,16 @@ async fn create_parent(path: &Path) -> Result<()> {
 }
 
 async fn notify_artifact(ctx: &ToolContext, path: PathBuf, mime_type: &str) -> Result<()> {
-    jcode_tool_core::notify_session_artifact_created(
-        &ctx.session_id,
-        path,
-        mime_type,
-    )
-    .await
-    .map_err(anyhow::Error::msg)
+    jcode_tool_core::notify_session_artifact_created(&ctx.session_id, path, mime_type)
+        .await
+        .map_err(anyhow::Error::msg)
 }
 
 fn create_xlsx(path: &Path, sheets: &[SheetInput]) -> Result<()> {
     let mut workbook = Workbook::new();
-    let header_format = Format::new().set_bold().set_background_color(Color::RGB(0xD9EAD3));
+    let header_format = Format::new()
+        .set_bold()
+        .set_background_color(Color::RGB(0xD9EAD3));
     for (sheet_index, sheet) in sheets.iter().enumerate() {
         if sheet.name.trim().is_empty() {
             bail!("worksheet names cannot be empty");
@@ -196,10 +198,13 @@ fn create_docx(path: &Path, title: &str, sections: &[SectionInput]) -> Result<()
                 .style("Heading1")
                 .add_run(Run::new().add_text(&section.heading)),
         );
-        for paragraph in section.body.split("\n\n").filter(|part| !part.trim().is_empty()) {
-            document = document.add_paragraph(
-                Paragraph::new().add_run(Run::new().add_text(paragraph.trim())),
-            );
+        for paragraph in section
+            .body
+            .split("\n\n")
+            .filter(|part| !part.trim().is_empty())
+        {
+            document = document
+                .add_paragraph(Paragraph::new().add_run(Run::new().add_text(paragraph.trim())));
         }
     }
     document
@@ -242,16 +247,14 @@ mod tests {
         });
         let notification_count = std::sync::Arc::new(AtomicUsize::new(0));
         let notification_counter = std::sync::Arc::clone(&notification_count);
-        let _artifact_registration = jcode_tool_core::register_session_artifact_created_notifier(
-            &session,
-            move |_| {
+        let _artifact_registration =
+            jcode_tool_core::register_session_artifact_created_notifier(&session, move |_| {
                 let count = std::sync::Arc::clone(&notification_counter);
                 async move {
                     count.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 }
-            },
-        );
+            });
 
         let context = context(session, temp.path().to_path_buf());
         let output = OfficeDocsTool::new()
@@ -271,18 +274,21 @@ mod tests {
 
         assert!(output.output.contains("Created workbook"));
         assert_eq!(notification_count.load(Ordering::SeqCst), 1);
-        let summary = crate::context::doc_outline::from_verified_path(&temp.path().join("report.xlsx"))
-            .unwrap();
+        let summary =
+            crate::context::doc_outline::from_verified_path(&temp.path().join("report.xlsx"))
+                .unwrap();
         assert!(summary.contains("Sheet: Sales"));
         assert!(summary.contains("Sheet: Costs"));
 
-        assert!(OfficeDocsTool::new()
-            .execute(
-                json!({ "action": "outline", "file_path": "../outside.xlsx" }),
-                context,
-            )
-            .await
-            .is_err());
+        assert!(
+            OfficeDocsTool::new()
+                .execute(
+                    json!({ "action": "outline", "file_path": "../outside.xlsx" }),
+                    context,
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -311,8 +317,9 @@ mod tests {
             .await
             .unwrap();
 
-        let summary = crate::context::doc_outline::from_verified_path(&temp.path().join("report.docx"))
-            .unwrap();
+        let summary =
+            crate::context::doc_outline::from_verified_path(&temp.path().join("report.docx"))
+                .unwrap();
         assert!(summary.contains("Heading 1: Findings"));
         assert!(summary.contains("Tables: 0"));
     }

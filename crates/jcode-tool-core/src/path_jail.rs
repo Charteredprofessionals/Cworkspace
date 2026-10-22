@@ -28,7 +28,11 @@ impl PathJail {
             )
         })?;
 
-        if self.allowed_roots.iter().any(|root| target.starts_with(root)) {
+        if self
+            .allowed_roots
+            .iter()
+            .any(|root| target.starts_with(root))
+        {
             Ok(target)
         } else {
             Err(format!(
@@ -126,10 +130,8 @@ mod tests {
     impl TestDir {
         fn new() -> Self {
             let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "jcode-path-jail-{}-{id}",
-                std::process::id()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("jcode-path-jail-{}-{id}", std::process::id()));
             fs::create_dir(&path).expect("create test directory");
             Self(path)
         }
@@ -187,7 +189,10 @@ mod tests {
                 .join("workspace-private")
                 .join("new.txt"),
         ] {
-            assert!(jail.verify_path(&candidate).is_err(), "accepted {candidate:?}");
+            assert!(
+                jail.verify_path(&candidate).is_err(),
+                "accepted {candidate:?}"
+            );
         }
     }
 
@@ -204,7 +209,10 @@ mod tests {
         symlink(&outside, root.join("escape")).expect("create symlink");
 
         let jail = PathJail::new(vec![root.clone()]).expect("canonicalize workspace");
-        assert!(jail.verify_path(&root.join("escape").join("secret.txt")).is_err());
+        assert!(
+            jail.verify_path(&root.join("escape").join("secret.txt"))
+                .is_err()
+        );
     }
 
     proptest::proptest! {

@@ -1693,11 +1693,8 @@ async fn init_provider_with_model_policy(
         | ProviderChoice::GeminiApi
         | ProviderChoice::MuseSubscription
         | ProviderChoice::OpenaiCompatible => {
-            super::compatible_runtime::init_compatible_runtime(
-                choice,
-                Arc::clone(&init_notice),
-            )
-            .await?
+            super::compatible_runtime::init_compatible_runtime(choice, Arc::clone(&init_notice))
+                .await?
         }
         ProviderChoice::Antigravity => {
             disable_subscription_runtime_mode();

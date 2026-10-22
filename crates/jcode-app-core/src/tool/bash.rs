@@ -893,10 +893,7 @@ impl Tool for BashTool {
         if std::env::var("JCODE_COWORK_MODE").is_ok_and(|value| value == "1")
             && cowork_command_requires_approval(&params.command)
         {
-            if !ctx
-                .request_approval("bash", params.command.clone())
-                .await?
-            {
+            if !ctx.request_approval("bash", params.command.clone()).await? {
                 anyhow::bail!("Cowork approval denied; command was not executed");
             }
             justification = Some("Approved explicitly by the user in the Cowork UI.".to_owned());

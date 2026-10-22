@@ -6,17 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
 pub type PathValidator = dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync + 'static;
-pub type SessionApprovalRequester = dyn Fn(
-        String,
-        String,
-        String,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send>>
+pub type SessionApprovalRequester = dyn Fn(String, String, String) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send>>
     + Send
     + Sync
     + 'static;
 
-pub type SessionArtifactCreatedNotifier = dyn Fn(ArtifactCreated)
-        -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+pub type SessionArtifactCreatedNotifier = dyn Fn(ArtifactCreated) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
     + Send
     + Sync
     + 'static;
@@ -35,8 +30,9 @@ struct Registration {
 static VALIDATORS: LazyLock<RwLock<HashMap<String, Registration>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
-static APPROVAL_REQUESTERS: LazyLock<RwLock<HashMap<String, (u64, Arc<SessionApprovalRequester>)>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static APPROVAL_REQUESTERS: LazyLock<
+    RwLock<HashMap<String, (u64, Arc<SessionApprovalRequester>)>>,
+> = LazyLock::new(|| RwLock::new(HashMap::new()));
 static ARTIFACT_CREATED_NOTIFIERS: LazyLock<
     RwLock<HashMap<String, (u64, Arc<SessionArtifactCreatedNotifier>)>>,
 > = LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -70,9 +66,8 @@ where
 {
     let session_id = session_id.into();
     let owner = NEXT_OWNER.fetch_add(1, Ordering::Relaxed);
-    let requester: Arc<SessionApprovalRequester> = Arc::new(move |id, tool, description| {
-        Box::pin(requester(id, tool, description))
-    });
+    let requester: Arc<SessionApprovalRequester> =
+        Arc::new(move |id, tool, description| Box::pin(requester(id, tool, description)));
     APPROVAL_REQUESTERS
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -126,9 +121,8 @@ where
 {
     let session_id = session_id.into();
     let owner = NEXT_OWNER.fetch_add(1, Ordering::Relaxed);
-    let notifier: Arc<SessionArtifactCreatedNotifier> = Arc::new(move |artifact| {
-        Box::pin(notifier(artifact))
-    });
+    let notifier: Arc<SessionArtifactCreatedNotifier> =
+        Arc::new(move |artifact| Box::pin(notifier(artifact)));
     ARTIFACT_CREATED_NOTIFIERS
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -232,14 +226,25 @@ mod tests {
     fn dropping_registration_disables_session_validator() {
         let session = format!("path-policy-{}", NEXT_OWNER.fetch_add(1, Ordering::Relaxed));
         let registration = register_session_path_validator(&session, |path| Ok(path.to_path_buf()));
-        assert!(verify_session_path(&session, Path::new("/path")).unwrap().is_some());
+        assert!(
+            verify_session_path(&session, Path::new("/path"))
+                .unwrap()
+                .is_some()
+        );
         drop(registration);
-        assert!(verify_session_path(&session, Path::new("/path")).unwrap().is_none());
+        assert!(
+            verify_session_path(&session, Path::new("/path"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn session_artifact_notifier_receives_created_artifact() {
-        let session = format!("artifact-policy-{}", NEXT_OWNER.fetch_add(1, Ordering::Relaxed));
+        let session = format!(
+            "artifact-policy-{}",
+            NEXT_OWNER.fetch_add(1, Ordering::Relaxed)
+        );
         let received = Arc::new(std::sync::Mutex::new(Vec::new()));
         let received_by_notifier = Arc::clone(&received);
         let _registration = register_session_artifact_created_notifier(&session, move |artifact| {

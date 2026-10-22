@@ -107,8 +107,11 @@ impl Tool for ApplyPatchTool {
                 if let PatchHunk::DeleteFile { path } = hunk {
                     let resolved = ctx.verify_path(Path::new(path))?;
                     anyhow::ensure!(
-                        ctx.request_approval("apply_patch", format!("Delete {}", resolved.display()))
-                            .await?,
+                        ctx.request_approval(
+                            "apply_patch",
+                            format!("Delete {}", resolved.display())
+                        )
+                        .await?,
                         "Cowork approval denied; file was not deleted"
                     );
                 }
@@ -123,16 +126,20 @@ impl Tool for ApplyPatchTool {
         // Capture whole-file states, including move destinations and AddFile
         // overwrites. Diff the final state so repeated hunks share one coordinate
         // system and failed operations cannot produce a speculative preview.
-        let lock_paths = hunks.iter().flat_map(|hunk| {
-            let (path, destination) = match hunk {
-                PatchHunk::AddFile { path, .. } | PatchHunk::DeleteFile { path } => (path, None),
-                PatchHunk::UpdateFile { path, move_to, .. } => (path, move_to.as_ref()),
-            };
-            std::iter::once(path)
-                .chain(destination)
-                .map(|path| ctx.verify_path(Path::new(path)))
-        })
-        .collect::<Result<Vec<_>>>()?;
+        let lock_paths = hunks
+            .iter()
+            .flat_map(|hunk| {
+                let (path, destination) = match hunk {
+                    PatchHunk::AddFile { path, .. } | PatchHunk::DeleteFile { path } => {
+                        (path, None)
+                    }
+                    PatchHunk::UpdateFile { path, move_to, .. } => (path, move_to.as_ref()),
+                };
+                std::iter::once(path)
+                    .chain(destination)
+                    .map(|path| ctx.verify_path(Path::new(path)))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let _locks = super::file_lock::lock_all(lock_paths).await;
         let mut before = std::collections::BTreeMap::new();
         for hunk in &hunks {

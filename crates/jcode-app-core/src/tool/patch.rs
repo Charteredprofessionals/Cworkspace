@@ -91,10 +91,7 @@ impl Tool for PatchTool {
             .iter()
             .map(|patch| ctx.verify_path(Path::new(&patch.path)))
             .collect::<Result<Vec<_>>>()?;
-        let _locks = super::file_lock::lock_all(
-            lock_paths,
-        )
-        .await;
+        let _locks = super::file_lock::lock_all(lock_paths).await;
         let config_watch = super::config_edit_notice::ConfigEditWatch::begin();
         let mut results = Vec::new();
 

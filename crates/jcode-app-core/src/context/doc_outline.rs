@@ -9,7 +9,12 @@ const SAMPLE_ROWS: usize = 3;
 const PDF_FIRST_PAGE_LIMIT: usize = 1600;
 
 pub fn from_verified_path(path: &Path) -> Result<String> {
-    match path.extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase).as_deref() {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
         Some("xlsx") | Some("xlsm") | Some("xls") | Some("xlsb") => outline_workbook(path),
         Some("csv") => outline_csv(path),
         Some("docx") => outline_docx(path),
@@ -21,7 +26,11 @@ pub fn from_verified_path(path: &Path) -> Result<String> {
 fn outline_workbook(path: &Path) -> Result<String> {
     let mut workbook = open_workbook_auto(path).context("opening spreadsheet")?;
     let sheet_names = workbook.sheet_names().to_vec();
-    let mut output = format!("Workbook: {}\nSheets: {}", path.display(), sheet_names.len());
+    let mut output = format!(
+        "Workbook: {}\nSheets: {}",
+        path.display(),
+        sheet_names.len()
+    );
     for name in sheet_names {
         let range = workbook
             .worksheet_range(&name)
@@ -41,7 +50,10 @@ fn outline_workbook(path: &Path) -> Result<String> {
             output.push_str(&format!(
                 "\nSample {}: {}",
                 index + 1,
-                row.iter().map(ToString::to_string).collect::<Vec<_>>().join(" | ")
+                row.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
             ));
         }
     }
@@ -143,7 +155,9 @@ fn outline_docx(path: &Path) -> Result<String> {
             Ok(quick_xml::events::Event::End(element)) => {
                 let name = element.local_name();
                 if name.as_ref() == b"tc" && outline.in_cell {
-                    outline.current_row.push(std::mem::take(&mut outline.current_cell));
+                    outline
+                        .current_row
+                        .push(std::mem::take(&mut outline.current_cell));
                     outline.in_cell = false;
                 } else if name.as_ref() == b"tr" && outline.current_table.is_some() {
                     if let Some(table) = outline.current_table.as_mut() {
@@ -158,7 +172,9 @@ fn outline_docx(path: &Path) -> Result<String> {
                         && let Some(level) = heading_level(&style)
                         && !outline.paragraph_text.trim().is_empty()
                     {
-                        outline.headings.push((level, outline.paragraph_text.trim().to_owned()));
+                        outline
+                            .headings
+                            .push((level, outline.paragraph_text.trim().to_owned()));
                     }
                     outline.in_paragraph = false;
                 }
@@ -236,7 +252,12 @@ fn outline_pdf(path: &Path) -> Result<String> {
     ))
 }
 
-fn collect_bookmarks(document: &lopdf::Document, ids: &[u32], depth: usize, output: &mut Vec<String>) {
+fn collect_bookmarks(
+    document: &lopdf::Document,
+    ids: &[u32],
+    depth: usize,
+    output: &mut Vec<String>,
+) {
     for id in ids {
         if let Some(bookmark) = document.bookmark_table.get(id) {
             output.push(format!("{}- {}", "  ".repeat(depth), bookmark.title));
@@ -254,12 +275,11 @@ mod tests {
     fn docx_outline_reports_heading_hierarchy_and_tables() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("outline.docx");
-        let document = Docx::new()
-            .add_paragraph(
-                Paragraph::new()
-                    .style("Heading1")
-                    .add_run(Run::new().add_text("Summary")),
-            );
+        let document = Docx::new().add_paragraph(
+            Paragraph::new()
+                .style("Heading1")
+                .add_run(Run::new().add_text("Summary")),
+        );
         document.build().pack(File::create(&path).unwrap()).unwrap();
 
         let summary = outline_docx(&path).unwrap();
