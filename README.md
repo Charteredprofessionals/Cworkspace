@@ -11,15 +11,15 @@
 <a href="https://trendshift.io/repositories/25042?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-25042" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/25042" alt="1jehuang/jcode | Trendshift" width="250" height="55"></a>
 </p>
 
-# jcode
+# Cworkspace
 
 <p>
-  <strong>High-performance coding agents.</strong><br>
+  <strong>High-performance coding agents with a Claude Cowork-style desktop companion.</strong><br>
   Run dozens of agents in parallel without melting your machine. More agents, less RAM, no lag.
 </p>
 
-[![Last Commit](https://badgen.net/github/last-commit/1jehuang/jcode/master?icon=github)](https://github.com/1jehuang/jcode/commits/master)
-[![GitHub Stars](https://badgen.net/github/stars/1jehuang/jcode?icon=github)](https://github.com/1jehuang/jcode/stargazers)
+[![Last Commit](https://badgen.net/github/last-commit/Charteredprofessionals/Cworkspace/master?icon=github)](https://github.com/Charteredprofessionals/Cworkspace/commits/master)
+[![GitHub Stars](https://badgen.net/github/stars/Charteredprofessionals/Cworkspace?icon=github)](https://github.com/Charteredprofessionals/Cworkspace/stargazers)
 [![GitHub Downloads](https://img.shields.io/github/downloads/1jehuang/jcode/total?style=flat-square)](https://github.com/1jehuang/jcode/releases)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/nBe9vGyK9a)
 
