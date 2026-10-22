@@ -6,6 +6,197 @@ use jcode_tool_types::ToolOutput;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+mod path_policy;
+mod path_jail;
+pub use path_jail::PathJail;
+pub use path_policy::{
+    ArtifactCreated, PathValidator, SessionApprovalRegistration,
+    SessionArtifactCreatedRegistration, SessionPathValidatorRegistration,
+    notify_session_artifact_created, register_session_approval_requester,
+    register_session_artifact_created_notifier, register_session_path_validator,
+    request_session_approval, verify_session_path,
+};
+
+#[cfg(windows)]
+mod win_job {
+    use std::io;
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+
+    const JOB_MEMORY_LIMIT_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+    pub struct WinJobGuard {
+        handle: HANDLE,
+    }
+
+    impl WinJobGuard {
+        pub fn new() -> io::Result<Self> {
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+            limits.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_JOB_MEMORY;
+            limits.JobMemoryLimit = JOB_MEMORY_LIMIT_BYTES;
+            let configured = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+
+            if configured == 0 {
+                let error = io::Error::last_os_error();
+                unsafe { CloseHandle(handle) };
+                return Err(error);
+            }
+
+            Ok(Self { handle })
+        }
+
+        pub fn assign_process(&self, child: &impl AsRawHandle) -> io::Result<()> {
+            let assigned = unsafe {
+                AssignProcessToJobObject(self.handle, child.as_raw_handle() as HANDLE)
+            };
+            if assigned == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Drop for WinJobGuard {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod win_job {
+    use std::io;
+
+    pub struct WinJobGuard;
+
+    impl WinJobGuard {
+        pub fn new() -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Win32 job objects are only available on Windows",
+            ))
+        }
+
+        pub fn assign_process<T>(&self, _child: &T) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Win32 job objects are only available on Windows",
+            ))
+        }
+    }
+}
+
+pub use win_job::WinJobGuard;
+
+#[cfg(test)]
+mod win_job_tests {
+    use super::WinJobGuard;
+
+    #[cfg(windows)]
+    #[test]
+    fn creates_and_closes_a_configured_job_object() {
+        drop(WinJobGuard::new().expect("create configured Windows job object"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dropping_guard_terminates_descendant_processes_within_100ms() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+
+        fn process_wait_result(pid: u32, timeout_ms: u32) -> u32 {
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            if handle.is_null() {
+                return WAIT_OBJECT_0;
+            }
+            let result = unsafe { WaitForSingleObject(handle, timeout_ms) };
+            unsafe { CloseHandle(handle) };
+            result
+        }
+
+        let guard = WinJobGuard::new().expect("create configured job object");
+        let mut parent = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Start-Sleep -Milliseconds 150; $child = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 30') -PassThru; $child.Id",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start PowerShell parent");
+        guard
+            .assign_process(&parent)
+            .expect("assign parent to job object");
+
+        let mut child_pid_output = String::new();
+        parent
+            .stdout
+            .take()
+            .expect("capture child PID")
+            .read_to_string(&mut child_pid_output)
+            .expect("read child PID");
+        assert!(parent.wait().expect("wait for parent").success());
+        let child_pid = child_pid_output
+            .trim()
+            .parse::<u32>()
+            .expect("PowerShell prints the descendant PID");
+        assert_eq!(process_wait_result(child_pid, 0), WAIT_TIMEOUT);
+
+        drop(guard);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < deadline {
+            if process_wait_result(child_pid, 0) == WAIT_OBJECT_0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            process_wait_result(child_pid, 0),
+            WAIT_OBJECT_0,
+            "job close left descendant PID {child_pid} alive after 100ms"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn reports_unsupported_platform() {
+        assert_eq!(
+            WinJobGuard::new()
+                .err()
+                .expect("Win32 jobs are unsupported on this platform")
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
+}
+
 pub const TOOL_INTENT_DESCRIPTION: &str =
     "Required short label shown in the UI: why this call is being made.";
 
@@ -139,6 +330,18 @@ impl ToolContext {
     }
 
     pub fn resolve_path(&self, path: &Path) -> PathBuf {
+        let resolved = self.resolve_path_without_validation(path);
+        match verify_session_path(&self.session_id, &resolved) {
+            Ok(Some(verified)) => verified,
+            Ok(None) if std::env::var("JCODE_COWORK_MODE").is_ok_and(|value| value == "1") => {
+                denied_path()
+            }
+            Err(_) => denied_path(),
+            Ok(None) => resolved,
+        }
+    }
+
+    fn resolve_path_without_validation(&self, path: &Path) -> PathBuf {
         if path.is_absolute() {
             path.to_path_buf()
         } else if let Some(ref base) = self.working_dir {
@@ -147,6 +350,43 @@ impl ToolContext {
             path.to_path_buf()
         }
     }
+
+    pub fn verify_path(&self, path: &Path) -> anyhow::Result<PathBuf> {
+        let resolved = self.resolve_path_without_validation(path);
+        match verify_session_path(&self.session_id, &resolved).map_err(anyhow::Error::msg)? {
+            Some(verified) => Ok(verified),
+            None if std::env::var("JCODE_COWORK_MODE").is_ok_and(|value| value == "1") => {
+                anyhow::bail!("SECURITY_VIOLATION: Cowork session has no mounted workspace roots")
+            }
+            None => Ok(resolved),
+        }
+    }
+
+    pub async fn request_approval(
+        &self,
+        tool_name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> anyhow::Result<bool> {
+        match request_session_approval(
+            &self.session_id,
+            self.tool_call_id.clone(),
+            tool_name.into(),
+            description.into(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?
+        {
+            Some(approved) => Ok(approved),
+            None if std::env::var("JCODE_COWORK_MODE").is_ok_and(|value| value == "1") => {
+                anyhow::bail!("approval unavailable; Cowork action denied")
+            }
+            None => Ok(false),
+        }
+    }
+}
+
+fn denied_path() -> PathBuf {
+    PathBuf::from("\0")
 }
 
 /// A tool that can be executed by the agent.
@@ -183,6 +423,33 @@ pub trait Tool: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_path_resolution_cannot_bypass_a_registered_validator() {
+        let session = format!("resolved-path-{}", std::process::id());
+        let _registration = register_session_path_validator(&session, |path| {
+            if path.starts_with("workspace") {
+                Ok(path.to_path_buf())
+            } else {
+                Err("outside workspace".to_owned())
+            }
+        });
+        let context = ToolContext {
+            session_id: session,
+            message_id: String::new(),
+            tool_call_id: String::new(),
+            working_dir: None,
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+
+        assert_eq!(
+            context.resolve_path(Path::new("workspace/file.txt")),
+            PathBuf::from("workspace/file.txt")
+        );
+        assert_eq!(context.resolve_path(Path::new("private/file.txt")), denied_path());
+    }
 
     #[test]
     fn subcall_ids_are_parent_scoped_and_retry_stable() {

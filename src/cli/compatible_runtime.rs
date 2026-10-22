@@ -24,7 +24,7 @@ use std::sync::Arc;
 /// the interactive path.
 pub(super) async fn init_compatible_runtime(
     choice: &ProviderChoice,
-    notify: &dyn Fn(&str),
+    notify: Arc<dyn Fn(&str) + Send + Sync>,
 ) -> Result<Arc<dyn provider::Provider>> {
     if matches!(choice, ProviderChoice::MuseSubscription) {
         return init_muse_subscription_runtime(choice, notify).await;
@@ -80,7 +80,7 @@ pub(super) async fn init_compatible_runtime(
 
 async fn init_muse_subscription_runtime(
     choice: &ProviderChoice,
-    notify: &dyn Fn(&str),
+    notify: Arc<dyn Fn(&str) + Send + Sync>,
 ) -> Result<Arc<dyn provider::Provider>> {
     disable_subscription_runtime_mode();
     // Native Muse subscription (experimental opt-in). No API-key consent

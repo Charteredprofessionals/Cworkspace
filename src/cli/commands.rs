@@ -2652,6 +2652,45 @@ pub async fn run_single_message_command(
     run_single_message_with_agent(&mut agent, provider, message, emit_json, emit_ndjson).await
 }
 
+pub async fn run_cowork_task(
+    goal: String,
+    allowed_roots: Vec<PathBuf>,
+    task_id: String,
+    rpc: crate::cli::cowork_rpc::CoworkRpc,
+) -> Result<String> {
+    let roots = crate::cli::cowork_rpc::validate_workspace_roots(allowed_roots).await?;
+    let working_dir = roots[0].clone();
+
+    let choice = super::provider_init::ProviderChoice::Auto;
+    let provider = super::provider_init::init_provider_for_run(&choice, None, false).await?;
+    if provider.model_capabilities_need_refresh()
+        && let Err(error) = provider.prefetch_models().await
+    {
+        crate::logging::warn(&format!(
+            "Could not refresh model capabilities before Cowork task: {error}"
+        ));
+    }
+    let registry = crate::tool::Registry::new(provider.clone()).await;
+    let mut agent = crate::agent::Agent::new(provider, registry);
+    agent.set_working_dir(&working_dir.display().to_string());
+    let session_id = agent.session_id().to_owned();
+    let _registrations = rpc.register_agent_session(&session_id, roots).await?;
+    let base_prompt = crate::prompt::load_base_system_prompt(Some(&working_dir));
+    agent.set_system_prompt(&format!(
+        "{}\n\n{}",
+        base_prompt,
+        crate::cli::cowork_persona::COWORK_PERSONA
+    ));
+
+    rpc.emit_event(crate::cli::cowork_rpc::CoworkEvent::AgentSpawned {
+        agent_id: session_id,
+        task_id,
+    })?;
+    let result = agent.run_once_capture(&goal).await;
+    agent.mark_closed();
+    result
+}
+
 /// Provider id for `jcode run --json`/`--ndjson` output.
 ///
 /// Every direct OpenAI-compatible profile (Ollama, LM Studio, DeepSeek, custom

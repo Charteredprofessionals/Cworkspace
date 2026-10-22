@@ -44,6 +44,26 @@ pub(super) fn destructive_command_refusal(
     }
 }
 
+pub(super) fn cowork_command_requires_approval(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens
+        .iter()
+        .any(|token| matches!(*token, "remove-item" | "del" | "rmdir" | "format-volume"))
+    {
+        return true;
+    }
+
+    tokens.windows(3).any(|triple| {
+        triple[0] == "invoke-webrequest"
+            && triple[1] == "method"
+            && matches!(triple[2], "post" | "put")
+    })
+}
+
 /// The `bash` tool's JSON schema, including the `justification` field the
 /// destructive-command gate consumes.
 ///
@@ -124,6 +144,33 @@ mod tests {
         ] {
             assert!(
                 destructive_command_refusal(command, None, std::env::current_dir().ok()).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn cowork_gate_flags_destructive_windows_commands_and_post_put_requests() {
+        for command in [
+            "Remove-Item report.docx",
+            "del report.docx",
+            "rmdir old-folder",
+            "Format-Volume -DriveLetter E",
+            "Invoke-WebRequest https://example.invalid -Method POST",
+            "Invoke-WebRequest -Method=PUT https://example.invalid/api",
+        ] {
+            assert!(
+                super::cowork_command_requires_approval(command),
+                "{command}"
+            );
+        }
+
+        for command in [
+            "Get-Content report.docx",
+            "Invoke-WebRequest https://example.invalid -Method GET",
+        ] {
+            assert!(
+                !super::cowork_command_requires_approval(command),
                 "{command}"
             );
         }

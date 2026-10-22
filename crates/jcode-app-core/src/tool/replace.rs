@@ -151,7 +151,7 @@ impl Tool for ReplaceTool {
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let params: ReplaceInput = serde_json::from_value(input)?;
         let matcher = Matcher::new(&params)?;
-        let root = ctx.resolve_path(Path::new(params.path.as_deref().unwrap_or(".")));
+        let root = ctx.verify_path(Path::new(params.path.as_deref().unwrap_or(".")))?;
         anyhow::ensure!(root.exists(), "Path not found: {}", root.display());
 
         let files = {
@@ -160,6 +160,10 @@ impl Tool for ReplaceTool {
             tokio::task::spawn_blocking(move || collect_files(&root, glob.as_deref())).await??
         };
 
+        let files = files
+            .iter()
+            .map(|file| ctx.verify_path(file))
+            .collect::<Result<Vec<_>>>()?;
         let mut changes = Vec::new();
         let _locks = super::file_lock::lock_all(files.iter().cloned()).await;
         for file in files {

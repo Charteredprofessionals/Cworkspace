@@ -368,7 +368,7 @@ pub(super) fn collect_bash_exposure(
 fn normalize_context_path(path: &str, search_root: &Path, ctx: &ToolContext) -> Option<String> {
     let path = path.trim().trim_matches('"').trim_matches('\'');
     let path = path.strip_prefix("./").unwrap_or(path);
-    let resolved = ctx.resolve_path(Path::new(path));
+    let resolved = ctx.verify_path(Path::new(path)).ok()?;
     if let Ok(relative) = resolved.strip_prefix(search_root) {
         return Some(relative.display().to_string());
     }
@@ -816,7 +816,7 @@ fn file_modified_at(path: &str, search_root: &Path, ctx: &ToolContext) -> Option
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
-        let resolved = ctx.resolve_path(Path::new(path));
+        let resolved = ctx.verify_path(Path::new(path)).ok()?;
         if resolved.starts_with(search_root) {
             resolved
         } else {

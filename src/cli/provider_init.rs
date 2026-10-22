@@ -1551,11 +1551,11 @@ async fn init_provider_with_model_policy(
         }
     }
 
-    let init_notice = |message: &str| {
+    let init_notice: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |message: &str| {
         if show_init_messages {
             output::stderr_info(message);
         }
-    };
+    });
 
     let provider: Arc<dyn provider::Provider> = match choice {
         ProviderChoice::Jcode => {
@@ -1693,7 +1693,11 @@ async fn init_provider_with_model_policy(
         | ProviderChoice::GeminiApi
         | ProviderChoice::MuseSubscription
         | ProviderChoice::OpenaiCompatible => {
-            super::compatible_runtime::init_compatible_runtime(choice, &init_notice).await?
+            super::compatible_runtime::init_compatible_runtime(
+                choice,
+                Arc::clone(&init_notice),
+            )
+            .await?
         }
         ProviderChoice::Antigravity => {
             disable_subscription_runtime_mode();

@@ -33,6 +33,17 @@ pub fn load_base_system_prompt(working_dir: Option<&Path>) -> String {
 
 /// Prompt guidance for the optional Mermaid rendering capability.
 pub const MERMAID_PROMPT: &str = "# Mermaid\n\nRender fenced `mermaid` blocks inline.";
+pub const COWORK_MODE_PROMPT: &str = r#"# Cowork Mode
+
+You are a knowledge-work assistant. Focus on understanding the user's goal, organizing research and source material, auditing data for consistency and gaps, synthesizing clear documents, and generating reviewable artifacts. Work in concise, verifiable steps and log progress as you go. Prefer document and data outcomes over code changes unless the user requests code work. Preserve existing materials. Before any action with destructive or external side effects, request explicit user approval and wait for the decision. Never treat silence, disconnection, or an unavailable approval service as consent."#;
+
+fn cowork_mode_enabled() -> bool {
+    cowork_mode_enabled_from(std::env::var("JCODE_COWORK_MODE").ok().as_deref())
+}
+
+fn cowork_mode_enabled_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
 
 /// Harness capabilities that conditionally contribute prompt modules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,7 +399,30 @@ pub fn build_system_prompt_full_with_capabilities(
     working_dir: Option<&Path>,
     capabilities: PromptCapabilities,
 ) -> (String, ContextInfo) {
+    build_system_prompt_full_with_capabilities_and_cowork_mode(
+        skill_prompt,
+        available_skills,
+        is_selfdev,
+        memory_prompt,
+        working_dir,
+        capabilities,
+        cowork_mode_enabled(),
+    )
+}
+
+fn build_system_prompt_full_with_capabilities_and_cowork_mode(
+    skill_prompt: Option<&str>,
+    available_skills: &[SkillInfo],
+    is_selfdev: bool,
+    memory_prompt: Option<&str>,
+    working_dir: Option<&Path>,
+    capabilities: PromptCapabilities,
+    cowork_mode: bool,
+) -> (String, ContextInfo) {
     let mut parts = base_system_prompt_parts(capabilities, working_dir);
+    if cowork_mode {
+        parts.push(COWORK_MODE_PROMPT.to_string());
+    }
     let mut info = ContextInfo {
         system_prompt_chars: parts.join("\n\n").len(),
         ..Default::default()
@@ -488,6 +522,7 @@ pub fn build_system_prompt_split_with_capabilities(
         working_dir,
         capabilities,
         agents_md,
+        cowork_mode_enabled(),
     )
 }
 
@@ -512,6 +547,7 @@ pub fn build_system_prompt_split_with_agents_md(
         working_dir,
         PromptCapabilities::current(),
         agents_md,
+        cowork_mode_enabled(),
     )
 }
 
@@ -523,8 +559,12 @@ fn build_system_prompt_split_with_capabilities_and_agents_md(
     working_dir: Option<&Path>,
     capabilities: PromptCapabilities,
     agents_md: (Option<String>, ContextInfo),
+    cowork_mode: bool,
 ) -> (SplitSystemPrompt, ContextInfo) {
     let mut static_parts = base_system_prompt_parts(capabilities, working_dir);
+    if cowork_mode {
+        static_parts.push(COWORK_MODE_PROMPT.to_string());
+    }
     let mut dynamic_parts = Vec::new();
     let mut info = ContextInfo {
         system_prompt_chars: static_parts.join("\n\n").len(),

@@ -855,7 +855,7 @@ where
 
 #[path = "bash_destructive_gate.rs"]
 mod destructive_gate;
-use destructive_gate::destructive_command_refusal;
+use destructive_gate::{cowork_command_requires_approval, destructive_command_refusal};
 #[async_trait]
 impl Tool for BashTool {
     fn name(&self) -> &str {
@@ -876,12 +876,36 @@ impl Tool for BashTool {
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let mut params: BashInput = serde_json::from_value(input)?;
+        let ctx = if std::env::var("JCODE_COWORK_MODE").is_ok_and(|value| value == "1") {
+            let mut ctx = ctx;
+            let working_dir = ctx
+                .working_dir
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Cowork shell requires a mounted workspace"))?;
+            ctx.working_dir = Some(ctx.verify_path(&working_dir)?);
+            ctx
+        } else {
+            ctx
+        };
         let run_in_background = params.run_in_background.unwrap_or(false);
+
+        let mut justification = params.justification.clone();
+        if std::env::var("JCODE_COWORK_MODE").is_ok_and(|value| value == "1")
+            && cowork_command_requires_approval(&params.command)
+        {
+            if !ctx
+                .request_approval("bash", params.command.clone())
+                .await?
+            {
+                anyhow::bail!("Cowork approval denied; command was not executed");
+            }
+            justification = Some("Approved explicitly by the user in the Cowork UI.".to_owned());
+        }
 
         // Destructive-command gate (#604), before background dispatch.
         if let Some(refusal) = destructive_command_refusal(
             &params.command,
-            params.justification.as_deref(),
+            justification.as_deref(),
             ctx.working_dir.clone(),
         ) {
             return Err(anyhow::anyhow!(refusal));
@@ -1021,10 +1045,18 @@ impl BashTool {
             command.stdin(Stdio::piped());
         }
 
+        #[cfg(windows)]
+        let job_guard = super::win_job::WinJobGuard::new()?;
         if let Some(ref dir) = ctx.working_dir {
             command.current_dir(dir);
         }
         let mut child = command.spawn()?;
+        #[cfg(windows)]
+        if let Err(error) = job_guard.assign_process(&child) {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error.into());
+        }
 
         let child_pid = child.id().unwrap_or(0);
         let stdin_handle = child.stdin.take();
@@ -1051,6 +1083,8 @@ impl BashTool {
         // the still-running task off to the background manager instead of killing it.
         let mut work_handle: tokio::task::JoinHandle<Result<ToolOutput>> =
             tokio::spawn(async move {
+                #[cfg(windows)]
+                let _job_guard = job_guard;
                 let stdout_task = tokio::spawn(collect_output_reporting_progress(
                     stdout_handle,
                     stdout_progress,
@@ -1401,12 +1435,22 @@ impl BashTool {
 					}
                     cmd.kill_on_drop(true);
                     configure_background_command_stdio(&mut cmd);
+                    #[cfg(windows)]
+                    let job_guard = super::win_job::WinJobGuard::new()?;
                     if let Some(ref dir) = working_dir {
                         cmd.current_dir(dir);
                     }
                     let mut child = cmd
                         .spawn()
                         .map_err(|e| anyhow::anyhow!("Failed to spawn command: {}", e))?;
+                    #[cfg(windows)]
+                    if let Err(error) = job_guard.assign_process(&child) {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        return Err(error.into());
+                    }
+                    #[cfg(windows)]
+                    let _job_guard = job_guard;
                     #[cfg(unix)]
                     let mut process_group_guard = ProcessGroupKillGuard::new(child.id());
 

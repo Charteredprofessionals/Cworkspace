@@ -236,9 +236,10 @@ fn resolved_root_string(ctx: &ToolContext, path: Option<&str>) -> Option<String>
 }
 
 pub(super) fn resolve_search_root(ctx: &ToolContext, path: Option<&str>) -> Result<PathBuf> {
-    path.map(PathBuf::from)
+    let path = path.map(PathBuf::from)
         .or_else(|| ctx.working_dir.clone())
-        .ok_or_else(|| anyhow::anyhow!("agentgrep requires a session working directory"))
+        .ok_or_else(|| anyhow::anyhow!("agentgrep requires a session working directory"))?;
+    ctx.verify_path(&path)
 }
 
 pub(super) fn summarize_agentgrep_request(

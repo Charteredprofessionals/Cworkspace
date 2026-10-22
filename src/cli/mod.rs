@@ -7,6 +7,8 @@ pub mod cloud_managed;
 pub mod cloud_move;
 pub mod commands;
 pub mod compatible_runtime;
+#[path = "../ipc/cowork_rpc.rs"]
+pub mod cowork_rpc;
 pub mod debug;
 pub mod dispatch;
 pub mod hibernate_wait;
@@ -18,6 +20,8 @@ pub mod output;
 pub mod proctitle;
 pub mod provider_doctor;
 pub mod provider_init;
+#[path = "../prompts/cowork_persona.rs"]
+pub mod cowork_persona;
 pub mod selfdev;
 pub mod ssh;
 #[cfg(unix)]

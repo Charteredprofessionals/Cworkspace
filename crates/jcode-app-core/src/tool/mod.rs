@@ -11,8 +11,11 @@ mod calendar;
 mod codemode;
 mod communicate;
 mod compile_remote;
+mod office_docs;
 #[cfg(target_os = "macos")]
 mod computer;
+#[cfg(windows)]
+mod computer_use_win;
 mod config_edit_notice;
 mod conversation_search;
 mod debug_socket;
@@ -53,6 +56,8 @@ mod user_response;
 mod webfetch;
 mod websearch;
 mod write;
+#[cfg(windows)]
+mod win_job;
 
 use crate::compaction::CompactionManager;
 use crate::provider::Provider;
@@ -85,7 +90,12 @@ use std::sync::{LazyLock, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 
 pub(crate) use jcode_tool_core::intent_schema_property;
-pub use jcode_tool_core::{StdinInputRequest, Tool, ToolContext, ToolExecutionMode};
+pub use jcode_tool_core::{
+    ArtifactCreated, SessionApprovalRegistration, SessionArtifactCreatedRegistration,
+    SessionPathValidatorRegistration, StdinInputRequest, Tool, ToolContext, ToolExecutionMode,
+    register_session_approval_requester, register_session_artifact_created_notifier,
+    register_session_path_validator,
+};
 pub use jcode_tool_types::{ToolImage, ToolOutput};
 pub(crate) use session_search::spawn_recent_index_warmup;
 
@@ -399,6 +409,12 @@ impl Registry {
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
+                "office_docs",
+                office_docs::OfficeDocsTool::new,
+            );
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
                 "agentgrep",
                 agentgrep::AgentGrepTool::new,
             );
@@ -435,6 +451,13 @@ impl Registry {
                 &mut timings,
                 "macos_computer_use",
                 computer::ComputerTool::new,
+            );
+            #[cfg(windows)]
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
+                "computer_use",
+                computer_use_win::WindowsComputerTool::new,
             );
             Self::insert_tool_timed(
                 &mut m,

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "jcode Cowork",
+  "version": "0.1.0",
+  "identifier": "com.jcode.cowork",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "jcode Cowork",
+        "width": 1440,
+        "height": 920,
+        "minWidth": 980,
+        "minHeight": 640,
+        "backgroundColor": "#f3f2ed"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data: blob:; frame-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "shortDescription": "A desktop workspace for knowledge work with jcode",
+    "category": "Productivity"
+  }
+}

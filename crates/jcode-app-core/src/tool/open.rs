@@ -169,7 +169,7 @@ fn resolve_target(target: &str, ctx: &ToolContext) -> Result<ResolvedTarget> {
     }
 
     let expanded = expand_home(trimmed)?;
-    let resolved = ctx.resolve_path(Path::new(&expanded));
+    let resolved = ctx.verify_path(Path::new(&expanded))?;
     resolve_local_target(resolved)
 }
 

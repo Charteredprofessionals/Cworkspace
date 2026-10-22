@@ -19,6 +19,12 @@ pub async fn run() -> Result<()> {
     // Parse once, before startup side effects. Invalid arguments and --help
     // must not harden credential files or create configuration/telemetry state.
     let args = Args::parse();
+    if args.cowork_daemon {
+        unsafe {
+            std::env::set_var("JCODE_COWORK_MODE", "1");
+        }
+        return super::cowork_rpc::run_server().await;
+    }
     // Interactive login prompts (masked secrets, QR codes) are a terminal
     // concern. The shared auth flows reach them through this presenter.
     super::login::install_terminal_login_presenter();

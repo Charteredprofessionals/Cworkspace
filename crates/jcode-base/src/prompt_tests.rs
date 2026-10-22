@@ -40,6 +40,59 @@ fn mermaid_prompt_module_follows_capability() {
     assert!(!disabled.static_part.contains("fenced `mermaid` code block"));
 }
 
+#[test]
+fn cowork_mode_prompt_selection_is_isolated() {
+    assert!(cowork_mode_enabled_from(Some("1")));
+    assert!(!cowork_mode_enabled_from(None));
+    assert!(!cowork_mode_enabled_from(Some("0")));
+    assert!(!cowork_mode_enabled_from(Some("true")));
+
+    let (ordinary_full, _) = build_system_prompt_full_with_capabilities_and_cowork_mode(
+        None,
+        &[],
+        false,
+        None,
+        None,
+        PromptCapabilities::default(),
+        false,
+    );
+    let (cowork_full, _) = build_system_prompt_full_with_capabilities_and_cowork_mode(
+        None,
+        &[],
+        false,
+        None,
+        None,
+        PromptCapabilities::default(),
+        true,
+    );
+    let agents_md = (None, ContextInfo::default());
+    let (ordinary_split, _) = build_system_prompt_split_with_capabilities_and_agents_md(
+        None,
+        &[],
+        false,
+        None,
+        None,
+        PromptCapabilities::default(),
+        agents_md.clone(),
+        false,
+    );
+    let (cowork_split, _) = build_system_prompt_split_with_capabilities_and_agents_md(
+        None,
+        &[],
+        false,
+        None,
+        None,
+        PromptCapabilities::default(),
+        agents_md,
+        true,
+    );
+
+    assert!(!ordinary_full.contains(COWORK_MODE_PROMPT));
+    assert!(!ordinary_split.static_part.contains(COWORK_MODE_PROMPT));
+    assert!(cowork_full.contains(COWORK_MODE_PROMPT));
+    assert!(cowork_split.static_part.contains(COWORK_MODE_PROMPT));
+}
+
 /// Verify skill prompts don't accidentally introduce "Claude Code" identity
 #[test]
 fn test_skill_prompt_integration() {

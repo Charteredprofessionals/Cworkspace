@@ -441,7 +441,7 @@ fn resolve_path_arg(ctx: &ToolContext, path: &str) -> PathBuf {
 
 fn exact_search_file_path(ctx: &ToolContext, path: Option<&str>) -> Option<String> {
     let path = path?;
-    let resolved = resolve_path_arg(ctx, path);
+    let resolved = ctx.verify_path(Path::new(path)).ok()?;
     if !resolved.is_file() {
         return None;
     }

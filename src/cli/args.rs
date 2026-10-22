@@ -67,6 +67,10 @@ pub(crate) struct Args {
     #[arg(long, global = true)]
     pub(crate) trace: bool,
 
+    /// Run the headless Cowork JSON-RPC daemon over the Windows named pipe
+    #[arg(long, global = true)]
+    pub(crate) cowork_daemon: bool,
+
     /// Suppress non-error CLI/status output for scripting and wrappers
     #[arg(long, global = true)]
     pub(crate) quiet: bool,

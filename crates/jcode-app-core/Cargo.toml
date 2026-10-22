@@ -38,6 +38,13 @@ serde_json = { version = "1", features = ["raw_value"] }
 glob = "0.3"
 ignore = "0.4"
 similar = "2"            # diffing for edits
+calamine = "0.37"
+csv = "1"
+docx-rs = "0.4"
+lopdf = "0.42"
+quick-xml = "0.37"
+rust_xlsxwriter = "0.79"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Utilities
 dirs = "5"               # home directory
@@ -139,7 +146,11 @@ async-stream = "0.3"
 jcode-base = { path = "../jcode-base", default-features = false, features = ["test-support"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+enigo = "0.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+uiautomation = "0.25"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+xcap = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 global-hotkey = "0.7"
