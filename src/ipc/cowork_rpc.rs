@@ -553,8 +553,74 @@ pub async fn run_server() -> Result<()> {
 
 #[cfg(not(windows))]
 pub async fn run_server() -> Result<()> {
-    Err(anyhow!("--cowork-daemon is only supported on Windows"))
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::Message;
+    use futures_util::{SinkExt, StreamExt};
+
+    const WS_PORT: u16 = 29384;
+    let addr = format!("127.0.0.1:{}", WS_PORT);
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("failed to bind WebSocket server to {}", addr))?;
+    
+    let rpc = global().clone();
+    tracing::info!("Cowork WebSocket IPC server listening on ws://{}", addr);
+
+    loop {
+        let (stream, _) = listener.accept().await.context("failed to accept TCP connection")?;
+        let client_rpc = rpc.clone();
+        
+        tokio::spawn(async move {
+            let ws_stream = match accept_async(stream).await {
+                Ok(ws) => ws,
+                Err(e) => {
+                    tracing::warn!("WebSocket handshake failed: {}", e);
+                    return;
+                }
+            };
+            
+            let (mut ws_sink, mut ws_stream) = ws_stream.split();
+            let mut events = client_rpc.subscribe();
+            
+            loop {
+                tokio::select! {
+                    msg = ws_stream.next() => {
+                        let Some(Ok(msg)) = msg else { break };
+                        if msg.is_text() {
+                            let text = msg.into_text().unwrap_or_default();
+                            let response = match serde_json::from_str::<RpcRequest>(&text) {
+                                Ok(request) => dispatch_request(request, &client_rpc).await,
+                                Err(error) => Some(rpc_error(None, -32700, format!("Parse error: {error}"))),
+                            };
+                            if let Some(response) = response {
+                                let json = serde_json::to_string(&response).unwrap_or_default();
+                                if ws_sink.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        } else if msg.is_close() {
+                            break;
+                        }
+                    }
+                    event = events.recv() => {
+                        let Ok(event) = event else { continue };
+                        let notification = json!({
+                            "jsonrpc": "2.0",
+                            "method": "cowork/event",
+                            "params": event,
+                        });
+                        let json = serde_json::to_string(&notification).unwrap_or_default();
+                        if ws_sink.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 }
+
 
 #[cfg(test)]
 mod tests {

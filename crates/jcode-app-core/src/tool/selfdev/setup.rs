@@ -334,12 +334,26 @@ impl SelfDevTool {
             std::fs::create_dir_all(parent)?;
         }
 
-        let status = Command::new("git")
+        #[cfg(windows)]
+        let job_guard = super::win_job::WinJobGuard::new()?;
+
+        let mut child = Command::new("git")
             .arg("clone")
             .arg(super::JCODE_REPO_URL)
             .arg(&repo_dir)
-            .status()
+            .spawn()
             .map_err(|e| anyhow::anyhow!("failed to run git clone: {e}"))?;
+
+        #[cfg(windows)]
+        if let Err(error) = job_guard.assign_process(&child) {
+            let _ = child.start_kill();
+            let _ = child.wait();
+            return Err(error.into());
+        }
+
+        let status = child
+            .wait()
+            .map_err(|e| anyhow::anyhow!("failed to wait for git clone: {e}"))?;
         if !status.success() {
             anyhow::bail!("git clone exited with {status}");
         }

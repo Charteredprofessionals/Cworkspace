@@ -11,29 +11,6 @@ pub fn selfdev_status_output() -> Result<ToolOutput> {
         jcode_build_meta::version()
     ));
 
-    if let Some(repo_dir) = build::get_repo_dir() {
-        let output = std::process::Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(&repo_dir)
-            .output()
-            .ok();
-
-        if let Some(output) = output {
-            let changes: Vec<&str> = std::str::from_utf8(&output.stdout)
-                .unwrap_or("")
-                .lines()
-                .collect();
-            if changes.is_empty() {
-                status.push_str("**Working tree:** clean\n");
-            } else {
-                status.push_str(&format!(
-                    "**Working tree:** {} uncommitted change{}\n",
-                    changes.len(),
-                    if changes.len() == 1 { "" } else { "s" }
-                ));
-            }
-        }
-    }
 
     status.push_str("\n## Build Channels\n\n");
 

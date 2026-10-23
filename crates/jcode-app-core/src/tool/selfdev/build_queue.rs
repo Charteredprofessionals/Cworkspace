@@ -101,9 +101,19 @@ export -f cargo
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        #[cfg(windows)]
+        let job_guard = super::win_job::WinJobGuard::new()?;
+
         let mut child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn build command: {}", e))?;
+
+        #[cfg(windows)]
+        if let Err(error) = job_guard.assign_process(&child) {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error.into());
+        };
 
         let mut file = tokio::fs::File::create(&output_path)
             .await

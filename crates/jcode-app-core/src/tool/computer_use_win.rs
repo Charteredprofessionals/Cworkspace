@@ -9,9 +9,10 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use uiautomation::{UIAutomation, UIElement};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetMessageW, MOD_ALT, MOD_CONTROL, MSG, RegisterHotKey, UnregisterHotKey, VK_BACK, WM_HOTKEY,
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    MOD_ALT, MOD_CONTROL, RegisterHotKey, UnregisterHotKey, VK_BACK,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY};
 use xcap::Window;
 
 const PANIC_HOTKEY_ID: i32 = 0x4A43;
@@ -19,7 +20,7 @@ const MAX_UI_ELEMENTS: usize = 160;
 const MAX_TREE_DEPTH: u32 = 8;
 
 static PANIC_SWITCH_ACTIVE: AtomicBool = AtomicBool::new(false);
-static ACTIVE_INTERRUPTS: LazyLock<Mutex<Vec<crate::agent_runtime::InterruptSignal>>> =
+static ACTIVE_INTERRUPTS: LazyLock<Mutex<Vec<jcode_agent_runtime::InterruptSignal>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 static HOTKEY_LISTENER: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
@@ -168,7 +169,7 @@ fn activate_panic_switch() {
     }
 }
 
-fn register_interrupt(interrupt: Option<crate::agent_runtime::InterruptSignal>) {
+fn register_interrupt(interrupt: Option<jcode_agent_runtime::InterruptSignal>) {
     if let Some(interrupt) = interrupt {
         ACTIVE_INTERRUPTS
             .lock()

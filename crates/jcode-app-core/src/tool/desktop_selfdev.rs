@@ -459,6 +459,8 @@ async fn run_command(root: &Path, spec: CommandSpec, timeout: u64) -> Result<Too
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    let job_guard = super::win_job::WinJobGuard::new()?;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -467,6 +469,8 @@ async fn run_command(root: &Path, spec: CommandSpec, timeout: u64) -> Result<Too
     let mut child = command
         .spawn()
         .with_context(|| format!("Start {} in {}", spec.program, root.display()))?;
+    #[cfg(windows)]
+    job_guard.assign_process(&child)?;
     let _group = ProcessGroup(child.id().context("Missing child PID")?);
     let stdout = child.stdout.take().context("Missing stdout")?;
     let stderr = child.stderr.take().context("Missing stderr")?;

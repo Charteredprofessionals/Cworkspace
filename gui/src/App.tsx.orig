@@ -1,0 +1,435 @@
+import { useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
+import {
+  AlertCircle,
+  ArrowDown,
+  ArrowUpRight,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  CircleHelp,
+  Clock3,
+  FileSpreadsheet,
+  FileText,
+  Folder,
+  FolderPlus,
+  History,
+  LoaderCircle,
+  PanelRightClose,
+  Play,
+  Plus,
+  ShieldCheck,
+  Sparkles,
+  StopCircle,
+  X,
+} from "lucide-react";
+import DOMPurify from "dompurify";
+import mammoth from "mammoth";
+import ReactMarkdown from "react-markdown";
+import * as XLSX from "xlsx";
+
+type CoworkEvent = {
+  event: "AgentSpawned" | "ToolInvoked" | "ArtifactCreated" | "ApprovalRequired" | "TaskCompleted";
+  data: Record<string, unknown>;
+};
+
+type FeedEntry = {
+  key: string;
+  event: CoworkEvent["event"];
+  data: Record<string, unknown>;
+  createdAt: number;
+};
+
+type HistoryEntry = {
+  taskId: string;
+  goal: string;
+  status: "running" | "completed" | "stopped" | "failed";
+  updatedAt: number;
+};
+
+type Artifact = {
+  path: string;
+  mime_type?: string;
+};
+
+type ArtifactPayload = {
+  name: string;
+  mime_type: string;
+  content_base64: string;
+};
+
+type PreviewState =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; payload: ArtifactPayload; markdown?: string; docxHtml?: string; rows?: unknown[][]; columns?: number }
+  | { status: "pdf"; payload: ArtifactPayload; url: string };
+
+const HISTORY_KEY = "jcode-cowork-history-v1";
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function text(data: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    const value = data[key];
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return "";
+}
+
+function identifier(data: Record<string, unknown>, key: string) {
+  const value = data[key];
+  return typeof value === "string" || typeof value === "number" ? String(value) : "";
+}
+
+function folderName(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).at(-1) || path;
+}
+
+function initialHistory(): HistoryEntry[] {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+    return Array.isArray(value) ? (value as HistoryEntry[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function decodeBase64(content: string) {
+  const binary = atob(content);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes.buffer;
+}
+
+function App() {
+  const [folders, setFolders] = useState<string[]>([]);
+  const [history, setHistory] = useState<HistoryEntry[]>(initialHistory);
+  const [goal, setGoal] = useState("");
+  const [activeTaskId, setActiveTaskId] = useState("");
+  const [taskStatus, setTaskStatus] = useState<"idle" | "running" | "completed" | "stopped">("idle");
+  const [daemonStatus, setDaemonStatus] = useState<"connecting" | "connected" | "offline">("connecting");
+  const [feed, setFeed] = useState<FeedEntry[]>([]);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [selectedArtifact, setSelectedArtifact] = useState<Artifact | null>(null);
+  const [previewOpen, setPreviewOpen] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [handledApprovals, setHandledApprovals] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 30)));
+  }, [history]);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke("connect_daemon")
+      .then(() => { if (!cancelled) setDaemonStatus("connected"); })
+      .catch((reason: unknown) => {
+        if (!cancelled) {
+          setDaemonStatus("offline");
+          setError(`Could not connect to jcode: ${errorMessage(reason)}`);
+        }
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listen<CoworkEvent>("cowork-event", ({ payload }) => {
+      const entry: FeedEntry = {
+        key: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        event: payload.event,
+        data: payload.data || {},
+        createdAt: Date.now(),
+      };
+      setFeed((current) => [...current, entry]);
+      if (payload.event === "ArtifactCreated") {
+        const path = text(payload.data || {}, "path");
+        if (path) {
+          const artifact = { path, mime_type: text(payload.data || {}, "mime_type") };
+          setArtifacts((current) => [artifact, ...current.filter((item) => item.path !== path)]);
+          setSelectedArtifact(artifact);
+          setPreviewOpen(true);
+        }
+      }
+      if (payload.event === "TaskCompleted") {
+        setTaskStatus("completed");
+        setHistory((current) => current.map((item) => item.taskId === activeTaskId ? { ...item, status: "completed", updatedAt: Date.now() } : item));
+      }
+    })
+      .then((stopListening) => {
+        if (cancelled) stopListening();
+        else unlisten = stopListening;
+      })
+      .catch((reason: unknown) => {
+        if (!cancelled) setError(`Desktop event bridge unavailable: ${errorMessage(reason)}`);
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [activeTaskId]);
+
+  const pendingApprovals = useMemo(
+    () => feed.filter((entry) => entry.event === "ApprovalRequired" && !handledApprovals[identifier(entry.data, "id")]),
+    [feed, handledApprovals],
+  );
+
+  async function mountFolder() {
+    setError("");
+    try {
+      const selected = await open({ directory: true, multiple: false, title: "Choose a workspace folder" });
+      if (typeof selected !== "string") return;
+      setBusy(true);
+      const mountedPath = await invoke<string>("mount_folder", { path: selected });
+      setFolders((current) => current.includes(mountedPath) ? current : [...current, mountedPath]);
+      setDaemonStatus("connected");
+    } catch (reason) {
+      setError(`Could not mount folder: ${errorMessage(reason)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function unmountFolder(path: string) {
+    setError("");
+    try {
+      await invoke("unmount_folder", { path });
+      setFolders((current) => current.filter((folder) => folder !== path));
+    } catch (reason) {
+      setError(`Could not unmount folder: ${errorMessage(reason)}`);
+    }
+  }
+
+  async function startTask(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!goal.trim()) return;
+    setError("");
+    if (!folders.length) {
+      setError("Mount a workspace folder before starting a task.");
+      return;
+    }
+    setBusy(true);
+    setFeed([]);
+    setArtifacts([]);
+    setSelectedArtifact(null);
+    setHandledApprovals({});
+    try {
+      const taskId = await invoke<string>("start_cowork_task", { goal: goal.trim(), allowedRoots: folders });
+      setDaemonStatus("connected");
+      setActiveTaskId(taskId);
+      setTaskStatus("running");
+      setHistory((current) => [{ taskId, goal: goal.trim(), status: "running" as const, updatedAt: Date.now(), feed, artifacts, selectedArtifact, handledApprovals, activeTaskId: taskId, taskStatus: "running" as const } as HistoryEntry, ...current.filter((item) => item.taskId !== taskId)].slice(0, 30));
+    } catch (reason) {
+      setError(`Could not start task: ${errorMessage(reason)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stopTask() {
+    if (!activeTaskId) return;
+    setError("");
+    try {
+      await invoke("stop_task", { taskId: activeTaskId });
+      setTaskStatus("stopped");
+      setHistory((current) => current.map((item) => item.taskId === activeTaskId ? { ...item, status: "stopped", updatedAt: Date.now() } : item));
+    } catch (reason) {
+      setError(`Could not stop task: ${errorMessage(reason)}`);
+    }
+  }
+
+  async function answerApproval(id: string | number, approved: boolean) {
+    setError("");
+    try {
+      await invoke("respond_approval", { id, approved });
+      setHandledApprovals((current) => ({ ...current, [id]: approved }));
+    } catch (reason) {
+      setError(`Could not send approval response: ${errorMessage(reason)}`);
+    }
+  }
+
+  function restoreHistory(item: HistoryEntry) {
+    setGoal(item.goal);
+    setActiveTaskId(item.taskId);
+    setTaskStatus(item.status === "running" ? "running" : item.status === "completed" ? "completed" : "stopped");
+    setFeed([]);
+    setArtifacts([]);
+    setSelectedArtifact(null);
+    setError("History stores task summaries only; daemon events are available for the current connection.");
+  }
+
+  return (
+    <main className="app-shell">
+      <aside className="sidebar">
+        <div className="brand-lockup">
+          <div className="brand-mark"><span>j</span><i /></div>
+          <div><div className="brand-name">jcode <span>cowork</span></div><div className="brand-subtitle">A space for the work ahead</div></div>
+        </div>
+
+        <button className="new-session" onClick={() => { setGoal(""); setFeed([]); setArtifacts([]); setSelectedArtifact(null); setTaskStatus("idle"); setError(""); }}>
+          <Plus size={16} strokeWidth={2.2} /> New task <span>⌘ N</span>
+        </button>
+
+        <section className="sidebar-section">
+          <div className="section-heading"><span>WORKSPACES</span><button className="icon-button small" aria-label="Mount folder" title="Mount folder" onClick={mountFolder}><FolderPlus size={15} /></button></div>
+          <button className="mount-row" onClick={mountFolder} disabled={busy}><Folder size={16} /><span>Mount a folder</span><Plus size={14} /></button>
+          <div className="folder-list">
+            {folders.map((path) => (
+              <div className="folder-item" key={path} title={path}>
+                <span className="folder-dot" />
+                <span className="folder-label">{folderName(path)}</span>
+                <button className="icon-button folder-remove" aria-label={`Unmount ${folderName(path)}`} title="Unmount folder" onClick={() => unmountFolder(path)}><X size={14} /></button>
+              </div>
+            ))}
+            {!folders.length && <p className="sidebar-empty">Your folders stay yours. Mount one to begin.</p>}
+          </div>
+        </section>
+
+        <section className="sidebar-section history-section">
+          <div className="section-heading"><span>RECENT WORK</span><History size={14} /></div>
+          <div className="history-list">
+            {history.map((item) => (
+              <button className={`history-item ${item.taskId === activeTaskId ? "selected" : ""}`} key={item.taskId} onClick={() => restoreHistory(item)} title={item.goal}>
+                <span className={`history-status ${item.status}`} />
+                <span className="history-copy"><strong>{item.goal}</strong><small>{new Date(item.updatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })} · {item.status}</small></span>
+                <ChevronRight size={14} />
+              </button>
+            ))}
+            {!history.length && <p className="sidebar-empty">Your finished tasks will gather here.</p>}
+          </div>
+        </section>
+
+        <div className="sidebar-footer"><div className="avatar">J</div><div><strong>Local workspace</strong><span>Private by default</span></div><ShieldCheck size={16} /></div>
+      </aside>
+
+      <section className="work-area">
+        <header className="topbar">
+          <div className="breadcrumb"><span>Workspace</span><ChevronRight size={13} /><strong>{activeTaskId ? "Active task" : "New session"}</strong></div>
+          <div className="connection-state"><span className={`status-light ${taskStatus === "running" ? "working" : daemonStatus === "connected" ? "online" : ""}`} />{taskStatus === "running" ? "Working" : daemonStatus === "connecting" ? "Connecting to jcode…" : daemonStatus === "offline" ? <button className="reconnect-button" onClick={() => { setDaemonStatus("connecting"); invoke("connect_daemon").then(() => setDaemonStatus("connected")).catch((reason: unknown) => { setDaemonStatus("offline"); setError(`Could not connect to jcode: ${errorMessage(reason)}`); }); }}>Reconnect</button> : "Connected to jcode"}</div>
+        </header>
+
+        <div className="center-scroll">
+          <div className="welcome-block">
+            <div className="eyebrow"><span className="eyebrow-line" /> YOUR DESK, REIMAGINED</div>
+            <h1>Make room for<br /><em>good work.</em></h1>
+            <p>Bring a goal. jcode will organize the steps, keep you in the loop, and place every deliverable right here.</p>
+          </div>
+
+          <form className="goal-form" onSubmit={startTask}>
+            <div className="goal-form-top"><Sparkles size={16} /><label htmlFor="goal-input">What would you like to get done?</label>{folders.length > 0 && <span className="root-count">{folders.length} {folders.length === 1 ? "folder" : "folders"} in scope</span>}</div>
+            <textarea id="goal-input" value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="Draft a project brief, audit these figures, prepare a polished report…" rows={3} disabled={taskStatus === "running"} />
+            <div className="goal-form-bottom"><span><CircleHelp size={14} /> Your mounted folders define the workspace boundary.</span><button className="primary-action" type="submit" disabled={busy || taskStatus === "running" || !goal.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={15} fill="currentColor" />} Start task <ArrowUpRight size={15} /></button></div>
+          </form>
+
+          {error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => setError("")}><X size={15} /></button></div>}
+
+          <div className="feed-heading"><div><span className="feed-kicker">LIVE SESSION</span><h2>Work in motion</h2></div><div className="feed-actions">{taskStatus === "running" && <button className="stop-action" onClick={stopTask}><StopCircle size={15} /> Stop task</button>}<span className={`task-badge ${taskStatus}`}>{taskStatus === "running" ? <><i className="pulse-dot" /> In progress</> : taskStatus === "completed" ? "Completed" : taskStatus === "stopped" ? "Stopped" : "Waiting"}</span></div></div>
+
+          <div className="feed-list">
+            {feed.map((entry) => <FeedCard key={entry.key} entry={entry} handled={handledApprovals} onAnswer={answerApproval} />)}
+            {!feed.length && <div className="feed-empty"><div className="empty-orbit"><ArrowDown size={19} /></div><strong>{taskStatus === "running" ? "Connecting to your task…" : "The next step starts with you"}</strong><span>When work begins, agents, tool activity, and approval requests will appear here.</span></div>}
+          </div>
+          {feed.length > 0 && <div className="feed-end"><span /> Session activity <span /></div>}
+        </div>
+      </section>
+
+      <aside className={`artifact-panel ${previewOpen ? "open" : "closed"}`}>
+        <div className="artifact-header"><div><span className="feed-kicker">DELIVERABLES</span><h2>Artifacts <span>{artifacts.length.toString().padStart(2, "0")}</span></h2></div><button className="icon-button" aria-label="Close artifact panel" title="Close panel" onClick={() => setPreviewOpen(false)}><PanelRightClose size={17} /></button></div>
+        {!previewOpen ? <button className="reopen-preview" onClick={() => setPreviewOpen(true)}>Show artifacts <ChevronDown size={15} /></button> : (
+          <>
+            {artifacts.length > 0 && <div className="artifact-tabs">{artifacts.map((artifact) => <button key={artifact.path} className={`artifact-tab ${selectedArtifact?.path === artifact.path ? "active" : ""}`} title={artifact.path} onClick={() => setSelectedArtifact(artifact)}>{iconForArtifact(artifact.path)}<span>{folderName(artifact.path)}</span></button>)}</div>}
+            <ArtifactPreview artifact={selectedArtifact} />
+          </>
+        )}
+        <div className="artifact-footnote"><ShieldCheck size={14} /><span>Previews read only from mounted folders</span></div>
+      </aside>
+
+      {pendingApprovals.length > 0 && <div className="approval-counter"><span className="pulse-dot" /> {pendingApprovals.length} decision{pendingApprovals.length === 1 ? "" : "s"} needed</div>}
+    </main>
+  );
+}
+
+function iconForArtifact(path: string) {
+  const extension = path.split(".").pop()?.toLowerCase();
+  return extension === "xlsx" || extension === "xls" ? <FileSpreadsheet size={15} /> : <FileText size={15} />;
+}
+
+function FeedCard({ entry, handled, onAnswer }: { entry: FeedEntry; handled: Record<string, boolean>; onAnswer: (id: string | number, approved: boolean) => void }) {
+  const [expanded, setExpanded] = useState(true);
+  const label = entry.event === "AgentSpawned" ? "Agent joined" : entry.event === "ToolInvoked" ? "Tool activity" : entry.event === "ArtifactCreated" ? "Artifact created" : entry.event === "ApprovalRequired" ? "Permission requested" : "Task finished";
+  const approvalId = entry.data.id;
+  const approvalKey = identifier(entry.data, "id");
+  const approvalHandled = approvalKey in handled;
+  const agentName = text(entry.data, "agent", "agent_name", "name") || "Cowork agent";
+  const toolName = text(entry.data, "tool", "tool_name", "name") || "Tool";
+  const description = text(entry.data, "description", "summary", "message", "input", "arguments");
+  const artifactPath = text(entry.data, "path");
+
+  return (
+    <article className={`feed-entry ${entry.event.toLowerCase()}`}>
+      <div className="timeline-rail"><span className={`event-symbol ${entry.event.toLowerCase()}`}>{entry.event === "AgentSpawned" ? <Sparkles size={14} /> : entry.event === "ToolInvoked" ? <ChevronRight size={14} /> : entry.event === "ArtifactCreated" ? <FileText size={14} /> : entry.event === "ApprovalRequired" ? <ShieldCheck size={14} /> : <Check size={14} />}</span><span className="rail-line" /></div>
+      <div className="event-body">
+        <button className="event-title-row" onClick={() => setExpanded((value) => !value)}><div><span className="event-label">{label}</span><strong>{entry.event === "AgentSpawned" ? agentName : entry.event === "ToolInvoked" ? toolName : entry.event === "ArtifactCreated" ? folderName(artifactPath || "New file") : entry.event === "ApprovalRequired" ? text(entry.data, "tool", "tool_name") || "Action needs your approval" : "This task is complete"}</strong></div><span className="event-time"><Clock3 size={12} /> {new Date(entry.createdAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span></button>
+        {expanded && <div className="event-detail">
+          {entry.event === "ApprovalRequired" ? <div className={`approval-card ${approvalHandled ? "answered" : ""}`}><div className="approval-copy"><span className="approval-eyebrow"><ShieldCheck size={13} /> YOUR DECISION</span><p>{description || "An agent is requesting permission to continue with this action."}</p>{text(entry.data, "tool", "tool_name") && <code>{text(entry.data, "tool", "tool_name")}</code>}</div>{approvalHandled ? <div className="approval-result"><Check size={14} /> {handled[approvalKey] ? "Allowed" : "Rejected"}</div> : <div className="approval-actions"><button className="reject-button" onClick={() => typeof approvalId === "string" || typeof approvalId === "number" ? onAnswer(approvalId, false) : undefined}><X size={14} /> Reject</button><button className="allow-button" onClick={() => typeof approvalId === "string" || typeof approvalId === "number" ? onAnswer(approvalId, true) : undefined}><Check size={14} /> Allow</button></div>}</div>
+          : entry.event === "ArtifactCreated" ? <p className="event-description">{artifactPath || description || "A new deliverable is ready to preview."}</p>
+          : <p className="event-description">{description || (entry.event === "AgentSpawned" ? "Preparing a focused workstream." : entry.event === "ToolInvoked" ? "Working through the requested step." : "The requested work has finished.")}</p>}
+        </div>}
+      </div>
+    </article>
+  );
+}
+
+function ArtifactPreview({ artifact }: { artifact: Artifact | null }) {
+  const [preview, setPreview] = useState<PreviewState | null>(null);
+
+  useEffect(() => {
+    if (!artifact) {
+      setPreview(null);
+      return;
+    }
+    let cancelled = false;
+    setPreview({ status: "loading" });
+    invoke<ArtifactPayload>("read_artifact", { path: artifact.path })
+      .then(async (payload) => {
+        if (cancelled) return;
+        const buffer = decodeBase64(payload.content_base64);
+        if (payload.mime_type === "application/pdf") {
+          setPreview({ status: "pdf", payload, url: `data:application/pdf;base64,${payload.content_base64}` });
+        } else if (payload.mime_type === "text/markdown") {
+          setPreview({ status: "ready", payload, markdown: new TextDecoder().decode(buffer) });
+        } else if (payload.mime_type.includes("spreadsheetml") || artifact.path.toLowerCase().endsWith(".xls")) {
+          const workbook = XLSX.read(buffer, { type: "array" });
+          const sheet = workbook.Sheets[workbook.SheetNames[0]];
+          const rows = sheet ? XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: "", blankrows: false }) : [];
+          const columns = rows.reduce((largest, row) => Math.max(largest, row.length), 0);
+          setPreview({ status: "ready", payload, rows: rows.slice(0, 100), columns });
+        } else if (payload.mime_type.includes("wordprocessingml")) {
+          const result = await mammoth.convertToHtml({ arrayBuffer: buffer });
+          if (!cancelled) setPreview({ status: "ready", payload, docxHtml: DOMPurify.sanitize(result.value) });
+        } else {
+          setPreview({ status: "error", message: "This file type does not have a preview." });
+        }
+      })
+      .catch((reason: unknown) => {
+        if (!cancelled) setPreview({ status: "error", message: errorMessage(reason) });
+      });
+    return () => { cancelled = true; };
+  }, [artifact]);
+
+  if (!artifact) return <div className="preview-empty"><div className="preview-illustration"><FileText size={28} /><span /><i /></div><strong>A clear view of what’s done.</strong><p>Created files will appear here, ready to read without leaving your workspace.</p><div className="supported-formats"><span>MD</span><span>PDF</span><span>XLSX</span><span>DOCX</span></div></div>;
+  if (!preview || preview.status === "loading") return <div className="preview-message"><LoaderCircle className="spin" size={19} /><span>Opening {folderName(artifact.path)}…</span></div>;
+  if (preview.status === "error") return <div className="preview-message preview-error"><AlertCircle size={18} /><span>{preview.message}</span></div>;
+  if (preview.status === "pdf") return <div className="pdf-preview"><div className="preview-file-title"><FileText size={15} /><span>{preview.payload.name}</span></div><iframe title={`Preview of ${preview.payload.name}`} src={preview.url} /></div>;
+  if (preview.rows) return <div className="spreadsheet-preview"><div className="preview-file-title"><FileSpreadsheet size={15} /><span>{preview.payload.name}</span></div>{preview.rows.length ? <div className="sheet-scroll"><table><tbody>{preview.rows.map((row, rowIndex) => <tr key={rowIndex}>{Array.from({ length: preview.columns || 1 }, (_, columnIndex) => { const Cell = rowIndex === 0 ? "th" : "td"; return <Cell key={columnIndex}>{String(row[columnIndex] ?? "")}</Cell>; })}</tr>)}</tbody></table></div> : <div className="preview-message">This workbook has no visible rows.</div>}</div>;
+  if (preview.docxHtml) return <div className="document-preview"><div className="preview-file-title"><FileText size={15} /><span>{preview.payload.name}</span></div><article className="docx-content" dangerouslySetInnerHTML={{ __html: preview.docxHtml }} /></div>;
+  return <div className="markdown-preview"><div className="preview-file-title"><FileText size={15} /><span>{preview.payload.name}</span></div><article className="markdown-content"><ReactMarkdown>{preview.markdown || ""}</ReactMarkdown></article></div>;
+}
+
+export default App;

@@ -149,7 +149,7 @@ jcode-base = { path = "../jcode-base", default-features = false, features = ["te
 enigo = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 uiautomation = "0.25"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
 xcap = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]

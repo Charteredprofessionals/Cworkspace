@@ -215,6 +215,8 @@ jcode-tool-core = { path = "crates/jcode-tool-core" }
 
 # Archive extraction (for auto-update)
 tempfile = "3"
+futures-util = "0.3.34"
+tracing = "0.1.44"
 
 [features]
 # Memory recall uses Jev Decisions and needs no local inference stack.

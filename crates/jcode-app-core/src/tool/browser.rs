@@ -986,21 +986,55 @@ async fn run_bridge_cli(
     #[cfg(windows)]
     let _ = (use_session, ctx);
 
-    let output = command
-        .output()
-        .await
+    #[cfg(windows)]
+    let job_guard = super::win_job::WinJobGuard::new()?;
+    let mut child = command
+        .spawn()
         .with_context(|| format!("Failed to run browser bridge action '{}'.", action))?;
+    #[cfg(windows)]
+    if let Err(error) = job_guard.assign_process(&child) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(error.into());
+    }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
 
-    if !output.status.success() {
+    let stdout_fut = async {
+        let mut stdout = Vec::new();
+        if let Some(mut handle) = stdout_handle {
+            use tokio::io::AsyncReadExt;
+            handle.read_to_end(&mut stdout).await.unwrap_or_default();
+        }
+        stdout
+    };
+    let stderr_fut = async {
+        let mut stderr = Vec::new();
+        if let Some(mut handle) = stderr_handle {
+            use tokio::io::AsyncReadExt;
+            handle.read_to_end(&mut stderr).await.unwrap_or_default();
+        }
+        stderr
+    };
+
+    let (stdout, stderr, status) = tokio::join!(stdout_fut, stderr_fut, child.wait());
+
+    let status = status.with_context(|| format!("Failed to wait for browser bridge action '{}'.", action))?;
+    let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+
+    #[cfg(windows)]
+    let _job_guard = job_guard;
+
+    if !status.success() {
         let details = if stderr.is_empty() {
             stdout
         } else if stdout.is_empty() {
             stderr
         } else {
-            format!("{}\n{}", stderr, stdout)
+            format!("{}
+{}", stderr, stdout)
         };
         return Ok(Err(details
             .strip_prefix("Error: ")

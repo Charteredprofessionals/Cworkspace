@@ -30,6 +30,52 @@ import mammoth from "mammoth";
 import ReactMarkdown from "react-markdown";
 import * as XLSX from "xlsx";
 
+
+import React from "react";
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class ErrorBoundary extends React.Component<
+  { children: React.ReactNode; fallback?: React.ReactNode },
+  ErrorBoundaryState
+> {
+  constructor(props: { children: React.ReactNode; fallback?: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error("ErrorBoundary caught:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      if (this.props.fallback) {
+        return this.props.fallback;
+      }
+      return (
+        <div className="error-boundary" style={{ padding: "20px", color: "#dc2626" }}>
+          <h2>Something went wrong</h2>
+          <pre style={{ whiteSpace: "pre-wrap", fontSize: "12px" }}>
+            {this.state.error?.message}
+            {this.state.error?.stack && "\n\n" + this.state.error.stack}
+          </pre>
+          <button onClick={() => this.setState({ hasError: false, error: null })}>
+            Try again
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 type CoworkEvent = {
   event: "AgentSpawned" | "ToolInvoked" | "ArtifactCreated" | "ApprovalRequired" | "TaskCompleted";
   data: Record<string, unknown>;
@@ -224,7 +270,7 @@ function App() {
       setDaemonStatus("connected");
       setActiveTaskId(taskId);
       setTaskStatus("running");
-      setHistory((current) => [{ taskId, goal: goal.trim(), status: "running" as const, updatedAt: Date.now() }, ...current.filter((item) => item.taskId !== taskId)].slice(0, 30));
+      setHistory((current) => [{ taskId, goal: goal.trim(), status: "running" as const, updatedAt: Date.now(), feed, artifacts, selectedArtifact, handledApprovals, activeTaskId: taskId, taskStatus: "running" as const } as HistoryEntry, ...current.filter((item) => item.taskId !== taskId)].slice(0, 30));
     } catch (reason) {
       setError(`Could not start task: ${errorMessage(reason)}`);
     } finally {
@@ -265,6 +311,7 @@ function App() {
   }
 
   return (
+  <ErrorBoundary>
     <main className="app-shell">
       <aside className="sidebar">
         <div className="brand-lockup">
@@ -352,7 +399,7 @@ function App() {
 
       {pendingApprovals.length > 0 && <div className="approval-counter"><span className="pulse-dot" /> {pendingApprovals.length} decision{pendingApprovals.length === 1 ? "" : "s"} needed</div>}
     </main>
-  );
+  </ErrorBoundary>);
 }
 
 function iconForArtifact(path: string) {

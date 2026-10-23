@@ -65,6 +65,8 @@ pub(super) async fn snapshot(root: &Path) -> Result<Snapshot> {
     tokio::task::spawn_blocking(move || collect(&root, &listing)).await?
 }
 
+
+
 async fn git_output(root: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>> {
     tokio::time::timeout(GIT_TIMEOUT, async {
         let mut command = tokio::process::Command::new("git");
@@ -74,6 +76,8 @@ async fn git_output(root: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>>
                 command.env_remove(key);
             }
         }
+        #[cfg(windows)]
+        let job_guard = super::win_job::WinJobGuard::new()?;
         let mut child = command
             .args([
                 "-c",
@@ -90,6 +94,8 @@ async fn git_output(root: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>>
             .kill_on_drop(true)
             .spawn()
             .context("launch git for source snapshot")?;
+        #[cfg(windows)]
+        job_guard.assign_process(&child)?;
         let stdout = child.stdout.take().context("missing git stdout")?;
         let mut output = Vec::new();
         stdout

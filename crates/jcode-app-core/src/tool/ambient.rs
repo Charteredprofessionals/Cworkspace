@@ -852,11 +852,24 @@ impl ScheduleTool {
             .working_dir
             .as_ref()
             .and_then(|wd| {
-                std::process::Command::new("git")
-                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                    .current_dir(wd)
-                    .output()
-                    .ok()
+                #[cfg(windows)]
+                let job_guard = super::win_job::WinJobGuard::new().ok();
+                let mut cmd = std::process::Command::new("git");
+                cmd.args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .current_dir(wd);
+                #[cfg(windows)]
+                let mut child = cmd.spawn().ok()?;
+                #[cfg(not(windows))]
+                let mut child = cmd.spawn().ok()?;
+                #[cfg(windows)]
+                if let Some(ref guard) = job_guard {
+                    if let Err(_) = guard.assign_process(&child) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                }
+                child.wait_with_output().ok()
             })
             .and_then(|out| {
                 if out.status.success() {

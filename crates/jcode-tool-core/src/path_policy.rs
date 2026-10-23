@@ -27,15 +27,16 @@ struct Registration {
     validator: Arc<PathValidator>,
 }
 
-static VALIDATORS: LazyLock<RwLock<HashMap<String, Registration>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+type ApprovalRequestersMap = HashMap<String, (u64, Arc<SessionApprovalRequester>)>;
+type ArtifactNotifiersMap = HashMap<String, (u64, Arc<SessionArtifactCreatedNotifier>)>;
+type ValidatorsMap = HashMap<String, Registration>;
+
+static VALIDATORS: LazyLock<RwLock<ValidatorsMap>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
-static APPROVAL_REQUESTERS: LazyLock<
-    RwLock<HashMap<String, (u64, Arc<SessionApprovalRequester>)>>,
-> = LazyLock::new(|| RwLock::new(HashMap::new()));
-static ARTIFACT_CREATED_NOTIFIERS: LazyLock<
-    RwLock<HashMap<String, (u64, Arc<SessionArtifactCreatedNotifier>)>>,
-> = LazyLock::new(|| RwLock::new(HashMap::new()));
+static APPROVAL_REQUESTERS: LazyLock<RwLock<ApprovalRequestersMap>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static ARTIFACT_CREATED_NOTIFIERS: LazyLock<RwLock<ArtifactNotifiersMap>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub struct SessionApprovalRegistration {
     session_id: String,
