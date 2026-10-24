@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::{Context, Result, anyhow};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, oneshot};
@@ -556,21 +557,23 @@ pub async fn run_server() -> Result<()> {
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
-    use futures_util::{SinkExt, StreamExt};
 
     const WS_PORT: u16 = 29384;
     let addr = format!("127.0.0.1:{}", WS_PORT);
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind WebSocket server to {}", addr))?;
-    
+
     let rpc = global().clone();
     tracing::info!("Cowork WebSocket IPC server listening on ws://{}", addr);
 
     loop {
-        let (stream, _) = listener.accept().await.context("failed to accept TCP connection")?;
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("failed to accept TCP connection")?;
         let client_rpc = rpc.clone();
-        
+
         tokio::spawn(async move {
             let ws_stream = match accept_async(stream).await {
                 Ok(ws) => ws,
@@ -579,10 +582,10 @@ pub async fn run_server() -> Result<()> {
                     return;
                 }
             };
-            
+
             let (mut ws_sink, mut ws_stream) = ws_stream.split();
             let mut events = client_rpc.subscribe();
-            
+
             loop {
                 tokio::select! {
                     msg = ws_stream.next() => {
@@ -620,7 +623,6 @@ pub async fn run_server() -> Result<()> {
         });
     }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -11,7 +11,6 @@ pub fn selfdev_status_output() -> Result<ToolOutput> {
         jcode_build_meta::version()
     ));
 
-
     status.push_str("\n## Build Channels\n\n");
 
     if let Ok(Some(current)) = build::read_current_version() {

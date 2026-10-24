@@ -968,34 +968,101 @@ async fn run_bridge_cli(
     use_session: bool,
     ctx: &ToolContext,
 ) -> Result<std::result::Result<String, String>> {
-    let mut command = tokio::process::Command::new(bin);
-    command.arg(action).arg(params_json);
-    command.kill_on_drop(true);
-    command.stdin(std::process::Stdio::null());
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-    crate::browser::apply_bridge_browser_env(&mut command, browser);
-
     #[cfg(not(windows))]
-    if use_session
-        && let Some(session_name) =
-            crate::browser::ensure_browser_session_for_async(&ctx.session_id, browser).await
     {
-        command.env("BROWSER_SESSION", session_name);
+        let mut command = tokio::process::Command::new(bin);
+        command.arg(action).arg(params_json);
+        command.kill_on_drop(true);
+        command.stdin(std::process::Stdio::null());
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        crate::browser::apply_bridge_browser_env(&mut command, browser);
+
+        if use_session
+            && let Some(session_name) =
+                crate::browser::ensure_browser_session_for_async(&ctx.session_id, browser).await
+        {
+            command.env("BROWSER_SESSION", session_name);
+        }
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("Failed to run browser bridge action '{}'.", action))?;
+
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+
+        let stdout_fut = async {
+            let mut stdout = Vec::new();
+            if let Some(mut handle) = stdout_handle {
+                use tokio::io::AsyncReadExt;
+                handle.read_to_end(&mut stdout).await.unwrap_or_default();
+            }
+            stdout
+        };
+        let stderr_fut = async {
+            let mut stderr = Vec::new();
+            if let Some(mut handle) = stderr_handle {
+                use tokio::io::AsyncReadExt;
+                handle.read_to_end(&mut stderr).await.unwrap_or_default();
+            }
+            stderr
+        };
+
+        let (stdout, stderr, status) = tokio::join!(stdout_fut, stderr_fut, child.wait());
+
+        let status = status
+            .with_context(|| format!("Failed to wait for browser bridge action '{}'.", action))?;
+        let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
     }
     #[cfg(windows)]
-    let _ = (use_session, ctx);
+    {
+        let _ = (use_session, ctx);
 
-    #[cfg(windows)]
-    let job_guard = super::win_job::WinJobGuard::new()?;
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("Failed to run browser bridge action '{}'.", action))?;
-    #[cfg(windows)]
-    if let Err(error) = job_guard.assign_process(&child) {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        return Err(error.into());
+        let mut command = std::process::Command::new(bin);
+        command.arg(action).arg(params_json);
+        command.stdin(std::process::Stdio::null());
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        crate::browser::apply_bridge_browser_env(&mut command, browser);
+
+        let job_guard = super::win_job::WinJobGuard::new()?;
+        let child = command
+            .spawn()
+            .with_context(|| format!("Failed to run browser bridge action '{}'.", action))?;
+        if let Err(error) = job_guard.assign_process(&child) {
+            let _ = child.kill();
+            return Err(error.into());
+        }
+
+        // Convert std::process::Child to tokio::process::Child for async I/O
+        let child = tokio::process::Child::from_std(child)?;
+
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+
+        let stdout_fut = async {
+            let mut stdout = Vec::new();
+            if let Some(mut handle) = stdout_handle {
+                use tokio::io::AsyncReadExt;
+                handle.read_to_end(&mut stdout).await.unwrap_or_default();
+            }
+            stdout
+        };
+        let stderr_fut = async {
+            let mut stderr = Vec::new();
+            if let Some(mut handle) = stderr_handle {
+                use tokio::io::AsyncReadExt;
+                handle.read_to_end(&mut stderr).await.unwrap_or_default();
+            }
+            stderr
+        };
+
+        let (stdout, stderr, status) = tokio::join!(stdout_fut, stderr_fut, child.wait());
+
+        let status = status
+            .with_context(|| format!("Failed to wait for browser bridge action '{}'.", action))?;
+        let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
     }
 
     let stdout_handle = child.stdout.take();
@@ -1020,7 +1087,8 @@ async fn run_bridge_cli(
 
     let (stdout, stderr, status) = tokio::join!(stdout_fut, stderr_fut, child.wait());
 
-    let status = status.with_context(|| format!("Failed to wait for browser bridge action '{}'.", action))?;
+    let status = status
+        .with_context(|| format!("Failed to wait for browser bridge action '{}'.", action))?;
     let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
 
@@ -1033,8 +1101,11 @@ async fn run_bridge_cli(
         } else if stdout.is_empty() {
             stderr
         } else {
-            format!("{}
-{}", stderr, stdout)
+            format!(
+                "{}
+{}",
+                stderr, stdout
+            )
         };
         return Ok(Err(details
             .strip_prefix("Error: ")

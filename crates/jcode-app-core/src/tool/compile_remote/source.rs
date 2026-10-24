@@ -65,8 +65,6 @@ pub(super) async fn snapshot(root: &Path) -> Result<Snapshot> {
     tokio::task::spawn_blocking(move || collect(&root, &listing)).await?
 }
 
-
-
 async fn git_output(root: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>> {
     tokio::time::timeout(GIT_TIMEOUT, async {
         let mut command = tokio::process::Command::new("git");
