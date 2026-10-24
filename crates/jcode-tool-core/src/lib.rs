@@ -21,8 +21,6 @@ pub use path_policy::{
 mod win_job {
     use std::io;
     use std::mem::{size_of, zeroed};
-    use std::os::windows::io::AsRawHandle;
-
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
@@ -65,9 +63,15 @@ mod win_job {
             Ok(Self { handle })
         }
 
-        pub fn assign_process(&self, child: &impl AsRawHandle) -> io::Result<()> {
-            let assigned =
-                unsafe { AssignProcessToJobObject(self.handle, child.as_raw_handle() as HANDLE) };
+        pub fn assign_process(&self, pid: u32) -> io::Result<()> {
+            use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
+
+            let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let assigned = unsafe { AssignProcessToJobObject(self.handle, handle) };
+            unsafe { CloseHandle(handle) };
             if assigned == 0 {
                 Err(io::Error::last_os_error())
             } else {
@@ -97,7 +101,7 @@ mod win_job {
             ))
         }
 
-        pub fn assign_process<T>(&self, _child: &T) -> io::Result<()> {
+        pub fn assign_process(&self, _pid: u32) -> io::Result<()> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Win32 job objects are only available on Windows",
@@ -151,7 +155,7 @@ mod win_job_tests {
             .spawn()
             .expect("start PowerShell parent");
         guard
-            .assign_process(&parent)
+            .assign_process(parent.id())
             .expect("assign parent to job object");
 
         let mut child_pid_output = String::new();
@@ -298,6 +302,10 @@ pub struct ToolContext {
     pub stdin_request_tx: Option<tokio::sync::mpsc::UnboundedSender<StdinInputRequest>>,
     pub graceful_shutdown_signal: Option<InterruptSignal>,
     pub execution_mode: ToolExecutionMode,
+    /// When true, `verify_path` and `resolve_path` deny any path that does not
+    /// have a registered session validator. When false (default for existing
+    /// callers), unvalidated paths pass through for backward compatibility.
+    pub require_validator: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +333,7 @@ impl ToolContext {
             stdin_request_tx: self.stdin_request_tx.clone(),
             graceful_shutdown_signal: self.graceful_shutdown_signal.clone(),
             execution_mode: self.execution_mode,
+            require_validator: self.require_validator,
         }
     }
 
@@ -332,6 +341,7 @@ impl ToolContext {
         let resolved = self.resolve_path_without_validation(path);
         match verify_session_path(&self.session_id, &resolved) {
             Ok(Some(verified)) => verified,
+            Ok(None) if self.require_validator => denied_path(),
             Ok(None) if std::env::var("JCODE_COWORK_MODE").is_ok_and(|value| value == "1") => {
                 denied_path()
             }
@@ -354,6 +364,9 @@ impl ToolContext {
         let resolved = self.resolve_path_without_validation(path);
         match verify_session_path(&self.session_id, &resolved).map_err(anyhow::Error::msg)? {
             Some(verified) => Ok(verified),
+            None if self.require_validator => {
+                anyhow::bail!("SECURITY_VIOLATION: no path validator registered for session")
+            }
             None if std::env::var("JCODE_COWORK_MODE").is_ok_and(|value| value == "1") => {
                 anyhow::bail!("SECURITY_VIOLATION: Cowork session has no mounted workspace roots")
             }
@@ -441,6 +454,7 @@ mod tests {
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: ToolExecutionMode::Direct,
+            require_validator: false,
         };
 
         assert_eq!(
@@ -463,6 +477,7 @@ mod tests {
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: ToolExecutionMode::AgentTurn,
+            require_validator: false,
         };
         let label = "batch-1-compile_remote".to_string();
         let first = context.for_subcall(label.clone());
@@ -481,7 +496,7 @@ mod tests {
         assert_ne!(first.tool_call_id, second.tool_call_id);
         assert_eq!(first.session_id, second.session_id);
         assert_eq!(first.message_id, second.message_id);
-    }
+}
 
     #[test]
     fn ensure_intent_adds_property_and_required() {
