@@ -84,7 +84,8 @@ async fn main() -> Result<()> {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: ToolExecutionMode::Direct,
-    };
+    require_validator: false,
+};
 
     let mut cases = Vec::new();
     cases.push(ToolCase {
@@ -176,7 +177,8 @@ async fn main() -> Result<()> {
         let ctx = ToolContext {
             tool_call_id: format!("harness-{}", idx + 1),
             ..base_ctx.clone()
-        };
+        require_validator: false,
+};
         println!("\n== {} ({}) ==", case.name, case.label);
         match registry.execute(case.name, case.input.clone(), ctx).await {
             Ok(output) => {
@@ -189,7 +191,8 @@ async fn main() -> Result<()> {
                 println!("[error] {}", err);
             }
         }
-    }
+    require_validator: false,
+}
 
     Ok(())
 }

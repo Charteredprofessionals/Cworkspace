@@ -274,7 +274,8 @@ async fn test_request_permission_rejects_non_ambient_session() {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: crate::tool::ToolExecutionMode::Direct,
-    };
+    require_validator: false,
+};
 
     let err = tool
         .execute(input, ctx)
@@ -431,7 +432,8 @@ async fn test_schedule_tool_defaults_to_resuming_originating_session() {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: crate::tool::ToolExecutionMode::Direct,
-    };
+    require_validator: false,
+};
 
     let output = tool
         .execute(input, ctx)
@@ -488,7 +490,8 @@ async fn test_schedule_tool_requires_time() {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: crate::tool::ToolExecutionMode::Direct,
-    };
+    require_validator: false,
+};
 
     let err = tool
         .execute(input, ctx)

@@ -13,7 +13,8 @@ fn ctx() -> ToolContext {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: ToolExecutionMode::Direct,
-    }
+    require_validator: false,
+}
 }
 
 async fn run_action(v: Value) -> Result<ToolOutput> {

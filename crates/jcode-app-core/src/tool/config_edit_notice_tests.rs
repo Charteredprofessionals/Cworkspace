@@ -165,7 +165,8 @@ async fn the_write_tool_reports_config_changes_end_to_end() {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: crate::tool::ToolExecutionMode::Direct,
-    };
+    require_validator: false,
+};
 
     let output = crate::tool::write::WriteTool
         .execute(
@@ -215,7 +216,8 @@ async fn apply_patch_reports_config_changes() {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: crate::tool::ToolExecutionMode::Direct,
-    };
+    require_validator: false,
+};
 
     let patch_text = format!(
         "*** Begin Patch\n*** Update File: {}\n@@\n-centered = false\n+centered = true\n*** End Patch\n",

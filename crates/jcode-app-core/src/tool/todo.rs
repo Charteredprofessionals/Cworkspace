@@ -1858,7 +1858,8 @@ mod tests {
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: crate::tool::ToolExecutionMode::Direct,
-        }
+        require_validator: false,
+}
     }
 
     /// Issue #695, the visibly-stale case. The todos panel renders the

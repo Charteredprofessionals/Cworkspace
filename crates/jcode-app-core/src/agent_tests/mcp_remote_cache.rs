@@ -151,7 +151,8 @@ fn context(agent: &Agent) -> crate::tool::ToolContext {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: crate::tool::ToolExecutionMode::Direct,
-    }
+    require_validator: false,
+}
 }
 
 async fn wait_for_tool(registry: &Registry, name: &str) {

@@ -32,7 +32,8 @@ fn test_context() -> ToolContext {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: super::super::ToolExecutionMode::Direct,
-    }
+    require_validator: false,
+}
 }
 
 async fn registry_with_batch_and_echo() -> Registry {

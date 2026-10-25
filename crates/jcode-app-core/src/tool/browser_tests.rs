@@ -427,7 +427,8 @@ async fn handoff_disabled_switch_removes_schema_and_rejects_execution_before_pro
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: super::super::ToolExecutionMode::Direct,
-        };
+        require_validator: false,
+};
         // An unknown browser makes the enabled branch hermetic. In the
         // disabled branch the guard must fire before even resolving a provider.
         let err = tool
