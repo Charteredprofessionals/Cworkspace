@@ -53,7 +53,7 @@ jobs:
     # Every other job in this workflow needs `create-release`, directly or
     # transitively, so gating this one job skips the whole workflow: a skipped
     # dependency skips its dependents.
-    if: github.repository == '1jehuang/jcode'
+    if: github.repository == 'Charteredprofessionals/Cworkspace'
     runs-on: ubuntu-latest
     # Exact-commit CI includes a native Windows test job with a 150-minute cap.
     timeout-minutes: 190
@@ -1048,18 +1048,18 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no"
 
-          git clone git@github.com:1jehuang/homebrew-jcode.git /tmp/homebrew-jcode
+          git clone git@github.com:Charteredprofessionals/homebrew-jcode.git /tmp/homebrew-jcode
 
           cat > /tmp/homebrew-jcode/Formula/jcode.rb << FORMULA
           class Jcode < Formula
             desc "AI coding agent powered by Claude and ChatGPT"
-            homepage "https://github.com/1jehuang/jcode"
+            homepage "https://github.com/Charteredprofessionals/Cworkspace"
             version "${VERSION_NUM}"
             license "MIT"
 
             on_macos do
               on_arm do
-                url "https://github.com/1jehuang/jcode/releases/download/${VERSION}/jcode-macos-aarch64.tar.gz"
+                url "https://github.com/Charteredprofessionals/Cworkspace/releases/download/${VERSION}/jcode-macos-aarch64.tar.gz"
                 sha256 "${MACOS_ARM_SHA}"
 
                 def install
@@ -1068,7 +1068,7 @@ jobs:
               end
 
               on_intel do
-                url "https://github.com/1jehuang/jcode/releases/download/${VERSION}/jcode-macos-x86_64.tar.gz"
+                url "https://github.com/Charteredprofessionals/Cworkspace/releases/download/${VERSION}/jcode-macos-x86_64.tar.gz"
                 sha256 "${MACOS_INTEL_SHA}"
 
                 def install
@@ -1079,7 +1079,7 @@ jobs:
 
             on_linux do
               on_intel do
-                url "https://github.com/1jehuang/jcode/releases/download/${VERSION}/jcode-linux-x86_64.tar.gz"
+                url "https://github.com/Charteredprofessionals/Cworkspace/releases/download/${VERSION}/jcode-linux-x86_64.tar.gz"
                 sha256 "${LINUX_SHA}"
 
                 def install
@@ -1093,7 +1093,7 @@ jobs:
               end
 
               on_arm do
-                url "https://github.com/1jehuang/jcode/releases/download/${VERSION}/jcode-linux-aarch64.tar.gz"
+                url "https://github.com/Charteredprofessionals/Cworkspace/releases/download/${VERSION}/jcode-linux-aarch64.tar.gz"
                 sha256 "${LINUX_ARM_SHA}"
 
                 def install
@@ -1145,7 +1145,7 @@ jobs:
           VERSION_NUM="${VERSION#v}"
 
           LINUX_SHA=$(sha256sum artifacts/jcode-linux-x86_64/jcode-linux-x86_64.tar.gz | cut -d' ' -f1)
-          LINUX_URL="https://github.com/1jehuang/jcode/releases/download/${VERSION}/jcode-linux-x86_64.tar.gz"
+          LINUX_URL="https://github.com/Charteredprofessionals/Cworkspace/releases/download/${VERSION}/jcode-linux-x86_64.tar.gz"
 
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
@@ -1162,13 +1162,13 @@ jobs:
           git remote set-url origin ssh://aur@aur.archlinux.org/jcode-bin.git
 
           cat > PKGBUILD << 'PKGBUILD_END'
-          # Maintainer: Jeremy Huang <jeremyhuang55555@gmail.com>
+          # Maintainer: Charteredprofessionals <94949997+Charteredprofessionals@users.noreply.github.com>
           pkgname=jcode-bin
           pkgver=VERSION_PLACEHOLDER
           pkgrel=1
           pkgdesc="AI coding agent powered by Claude and ChatGPT"
           arch=('x86_64')
-          url="https://github.com/1jehuang/jcode"
+          url="https://github.com/Charteredprofessionals/Cworkspace"
           license=('MIT')
           provides=('jcode')
           conflicts=('jcode')
@@ -1199,7 +1199,7 @@ jobs:
           printf '\tpkgdesc = AI coding agent powered by Claude and ChatGPT\n' >> .SRCINFO
           printf '\tpkgver = %s\n' "${VERSION_NUM}" >> .SRCINFO
           printf '\tpkgrel = 1\n' >> .SRCINFO
-          printf '\turl = https://github.com/1jehuang/jcode\n' >> .SRCINFO
+          printf '\turl = https://github.com/Charteredprofessionals/Cworkspace\n' >> .SRCINFO
           printf '\tarch = x86_64\n' >> .SRCINFO
           printf '\tlicense = MIT\n' >> .SRCINFO
           printf '\tprovides = jcode\n' >> .SRCINFO
@@ -1208,8 +1208,8 @@ jobs:
           printf '\tsha256sums = %s\n' "${LINUX_SHA}" >> .SRCINFO
           printf '\npkgname = jcode-bin\n' >> .SRCINFO
 
-          git config user.name "Jeremy Huang"
-          git config user.email "jeremyhuang55555@gmail.com"
+          git config user.name "Charteredprofessionals"
+          git config user.email "94949997+Charteredprofessionals@users.noreply.github.com"
           git add PKGBUILD .SRCINFO
           git commit -m "Update to ${VERSION}" || echo "No changes"
           retry 3 5 git push origin master

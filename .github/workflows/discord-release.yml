@@ -29,7 +29,7 @@ jobs:
     # belongs to the canonical repository. On a fork the webhook secret is
     # absent and the step would fail rather than post, but the guard makes that
     # independent of whether the fork happens to hold the secret.
-    if: github.repository == '1jehuang/jcode'
+    if: github.repository == 'Charteredprofessionals/Cworkspace'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

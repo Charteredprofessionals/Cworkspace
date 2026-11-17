@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   publish:
-    name: Publish @1jehuang/jcode-sdk
+    name: Publish @charteredprofessionals/jcode-sdk
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -73,6 +73,8 @@ jobs:
       # the package matching the consumer's os/cpu from optionalDependencies.
       - name: Publish platform runtime packages
         working-directory: ${{ github.workspace }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for package in sdk/npm/*; do
             name=$(node -p "require('./$package/package.json').name")
@@ -85,4 +87,6 @@ jobs:
           done
 
       - name: Publish with npm provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public --provenance

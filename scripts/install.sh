@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="1jehuang/jcode"
+REPO="Charteredprofessionals/Cworkspace"
 RELEASE_METADATA_BASE="${JCODE_RELEASE_METADATA_BASE:-https://jcode.sh/releases}"
 IS_WINDOWS=false
 IS_TERMUX=false

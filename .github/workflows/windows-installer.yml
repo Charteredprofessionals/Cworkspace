@@ -2,9 +2,10 @@ name: Windows Installer
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
+  # Dispatch manually after a release tag is published. The former
+  # `push: tags: v*` trigger was removed (R-6): it raced the release
+  # pipeline and could publish a partial installer for the same tag.
+  # (Do not re-add a `v*` tag push trigger; release.yml owns tag events.)
 
 permissions:
   contents: read
@@ -76,7 +77,7 @@ jobs:
       - name: Find installer artifacts
         id: artifacts
         run: |
-          $installers = Get-ChildItem gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle -Filter "*.msi","*.exe" -Recurse -ErrorAction SilentlyContinue
+          $installers = Get-ChildItem gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle -Recurse -Include *.msi,*.exe -ErrorAction SilentlyContinue
           if (-not $installers) {
             Write-Error "No installer artifacts found"
             exit 1
