@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   update:
-    if: github.repository == '1jehuang/jcode'
+    if: github.repository == 'Charteredprofessionals/Cworkspace'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

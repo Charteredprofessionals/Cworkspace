@@ -38,7 +38,7 @@ env:
 
 jobs:
   quiet-and-ci:
-    if: github.repository == '1jehuang/jcode' && vars.JCODE_V1_PREVIEW_ENABLED != 'false' && github.ref == 'refs/heads/master'
+    if: github.repository == 'Charteredprofessionals/Cworkspace' && vars.JCODE_V1_PREVIEW_ENABLED != 'false' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 205
     steps:
@@ -228,7 +228,7 @@ jobs:
 
   publish:
     needs: [quiet-and-ci, build, native-arm-runtime]
-    if: github.repository == '1jehuang/jcode' && vars.JCODE_V1_PREVIEW_ENABLED != 'false'
+    if: github.repository == 'Charteredprofessionals/Cworkspace' && vars.JCODE_V1_PREVIEW_ENABLED != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

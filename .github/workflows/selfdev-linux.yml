@@ -25,7 +25,7 @@ env:
 
 jobs:
   verify:
-    if: github.repository == '1jehuang/jcode' && github.ref == 'refs/heads/master'
+    if: github.repository == 'Charteredprofessionals/Cworkspace' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     outputs:
       build: ${{ steps.release.outputs.build }}

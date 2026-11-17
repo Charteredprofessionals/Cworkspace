@@ -21,7 +21,7 @@ permissions:
 jobs:
   reconcile:
     if: >-
-      github.repository == '1jehuang/jcode' &&
+      github.repository == 'Charteredprofessionals/Cworkspace' &&
       vars.JCODE_V1_PREVIEW_ENABLED != 'false' &&
       (github.event_name != 'workflow_run' ||
        (github.event.workflow_run.event == 'push' &&

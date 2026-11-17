@@ -30,7 +30,7 @@ env:
 
 jobs:
   producer:
-    if: github.repository == '1jehuang/jcode' && github.ref == 'refs/heads/master'
+    if: github.repository == 'Charteredprofessionals/Cworkspace' && github.ref == 'refs/heads/master'
     runs-on: ${{ inputs.lane == 'linux-arm64' && 'ubuntu-24.04' || 'macos-15' }}
     timeout-minutes: 120
     outputs:
@@ -143,7 +143,7 @@ jobs:
 
   sign-macos:
     needs: [producer, native-verify]
-    if: inputs.sign_macos && inputs.lane == 'macos-arm64' && github.repository == '1jehuang/jcode' && github.ref == 'refs/heads/master'
+    if: inputs.sign_macos && inputs.lane == 'macos-arm64' && github.repository == 'Charteredprofessionals/Cworkspace' && github.ref == 'refs/heads/master'
     runs-on: macos-15
     # Configure required reviewers AND deployment branch restriction to master.
     environment: native-handoff-signing
