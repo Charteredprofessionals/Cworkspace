@@ -1021,6 +1021,7 @@ impl Agent {
                             stdin_request_tx: self.stdin_request_tx.clone(),
                             graceful_shutdown_signal: Some(self.graceful_shutdown.clone()),
                             execution_mode: ToolExecutionMode::AgentTurn,
+                            require_validator: false,
                         };
                         crate::telemetry::record_tool_call();
                         let tool_result = self
@@ -1632,6 +1633,7 @@ impl Agent {
                     stdin_request_tx: self.stdin_request_tx.clone(),
                     graceful_shutdown_signal: Some(self.graceful_shutdown.clone()),
                     execution_mode: ToolExecutionMode::AgentTurn,
+                    require_validator: false,
                 };
 
                 if trace {

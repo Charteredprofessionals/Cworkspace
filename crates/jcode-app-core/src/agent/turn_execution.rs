@@ -1035,6 +1035,7 @@ impl Agent {
             stdin_request_tx: self.stdin_request_tx.clone(),
             graceful_shutdown_signal: Some(self.graceful_shutdown.clone()),
             execution_mode: ToolExecutionMode::Direct,
+            require_validator: false,
         };
         self.registry.execute(name, input, ctx).await
     }

@@ -1170,6 +1170,7 @@ impl App {
                                             stdin_request_tx: None,
                                             graceful_shutdown_signal: None,
                                             execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+                                            require_validator: false,
                                         };
                                         let tool_result = self
                                             .registry
@@ -1462,6 +1463,7 @@ impl App {
                     stdin_request_tx: None,
                     graceful_shutdown_signal: None,
                     execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+                    require_validator: false,
                 };
 
                 Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
