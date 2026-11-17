@@ -44,15 +44,97 @@ pub(super) fn destructive_command_refusal(
     }
 }
 
+/// True when a Cowork-session shell command must pause for user approval.
+///
+/// Two layers, both required:
+/// 1. A Cowork denylist for Windows/Unix primitives the blast-radius engine
+///    may not see through (PowerShell aliases, `cmd /c del`,
+///    `-EncodedCommand` base64 wrapping, `reg delete`, `net user`).
+/// 2. The same `jcode-command-risk` engine the CLI gate uses, so every
+///    `Confirm`-or-worse verdict - including Unix `rm`/`dd`/`mkfs` and
+///    cross-platform obfuscation - also pauses for approval in Cowork mode.
+///
+/// Catastrophic verdicts are already denied outright by
+/// [`destructive_command_refusal`] inside the bash tool, so this function only
+/// ever *adds* approval prompts on top of that refusal path.
 pub(super) fn cowork_command_requires_approval(command: &str) -> bool {
+    if cowork_denylist_matches(command) {
+        return true;
+    }
+
+    let mut risk_ctx = jcode_command_risk::RiskContext::from_env(None);
+    #[cfg(not(windows))]
+    {
+        risk_ctx.scratch_dir = super::tool_scratch_dir();
+    }
+    !jcode_command_risk::assess(command, &risk_ctx)
+        .level
+        .runs_immediately()
+}
+
+/// The cheap tokenized denylist. Kept separate from the risk-engine check so
+/// the Cowork-specific Windows coverage stays testable in isolation.
+fn cowork_denylist_matches(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
+    // Base64-wrapped PowerShell evades tokenization entirely; any encoded
+    // payload must go through approval.
+    if lower.contains("encodedcommand") {
+        return true;
+    }
+
     let tokens: Vec<&str> = lower
         .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
         .filter(|token| !token.is_empty())
         .collect();
+
+    // Destructive primitives: PowerShell cmdlets and their aliases.
+    if tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "remove-item"
+                | "del"
+                | "rmdir"
+                | "rd"
+                | "ri"
+                | "erase"
+                | "mi"
+                | "format-volume"
+                | "diskpart"
+        )
+    }) {
+        return true;
+    }
+
+    // Windows delegation wrappers: cmd /c del, cmd /c rd.
+    if tokens.windows(3).any(|triple| {
+        triple[0] == "cmd" && triple[1] == "c" && matches!(triple[2], "del" | "rd" | "rmdir")
+    }) {
+        return true;
+    }
+
+    // Registry and account management.
+    if tokens.windows(2).any(|pair| {
+        (pair[0] == "reg" && pair[1] == "delete")
+            || (pair[0] == "net" && matches!(pair[1], "user" | "localgroup"))
+    }) {
+        return true;
+    }
+
+    // Network writes across the common clients.
     if tokens
         .iter()
-        .any(|token| matches!(*token, "remove-item" | "del" | "rmdir" | "format-volume"))
+        .any(|token| matches!(*token, "curl" | "wget" | "invoke-webrequest" | "invoke-restmethod"))
+        && tokens
+            .iter()
+            .any(|token| matches!(*token, "post" | "put" | "delete"))
+    {
+        return true;
+    }
+
+    // Unix destructive primitives (Cowork over the WS bridge runs these too).
+    if tokens
+        .iter()
+        .any(|token| matches!(*token, "rm" | "shred" | "dd" | "mkfs" | "fdisk"))
     {
         return true;
     }
@@ -155,9 +237,15 @@ mod tests {
             "Remove-Item report.docx",
             "del report.docx",
             "rmdir old-folder",
+            "ri report.docx",
+            "rd old-folder",
+            "erase report.docx",
             "Format-Volume -DriveLetter E",
             "Invoke-WebRequest https://example.invalid -Method POST",
             "Invoke-WebRequest -Method=PUT https://example.invalid/api",
+            "cmd /c del report.docx",
+            "reg delete HKLM\\Software\\Key",
+            "net user attacker Password1! /add",
         ] {
             assert!(
                 super::cowork_command_requires_approval(command),
@@ -168,6 +256,43 @@ mod tests {
         for command in [
             "Get-Content report.docx",
             "Invoke-WebRequest https://example.invalid -Method GET",
+        ] {
+            assert!(
+                !super::cowork_command_requires_approval(command),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn cowork_gate_flags_encoded_payloads_and_unix_primitives() {
+        for command in [
+            // -EncodedCommand evades tokenization; always approve first.
+            "powershell -EncodedCommand RwBvAG4AdA==",
+            "pwsh -NoProfile -EncodedCommand AA==",
+            "rm report.docx",
+            "rm -rf build/",
+            "shred secret.txt",
+            "dd if=/dev/zero of=/dev/sda",
+            "mkfs.ext4 /dev/sdb1",
+            "curl -X POST https://example.invalid/upload",
+        ] {
+            assert!(
+                super::cowork_command_requires_approval(command),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn cowork_gate_stays_quiet_for_ordinary_cowork_work() {
+        for command in [
+            "cargo test --lib",
+            "git status --short",
+            "python analyze.py --input data.csv",
+            "ls reports",
+            "echo done",
+            "informational notes about rm tokens inside words", // 'rm' inside a word must not match
         ] {
             assert!(
                 !super::cowork_command_requires_approval(command),

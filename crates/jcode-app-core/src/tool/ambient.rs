@@ -853,7 +853,13 @@ impl ScheduleTool {
             .as_ref()
             .and_then(|wd| {
                 #[cfg(windows)]
-                let job_guard = super::win_job::WinJobGuard::new().ok();
+                // Fail closed (S-9): without a job guard this git child would
+                // escape Win32 process containment, so skip the probe rather
+                // than spawn uncontained.
+                let job_guard = match super::win_job::WinJobGuard::new() {
+                    Ok(guard) => Some(guard),
+                    Err(_) => return None,
+                };
                 let mut cmd = std::process::Command::new("git");
                 cmd.args(["rev-parse", "--abbrev-ref", "HEAD"])
                     .current_dir(wd);
@@ -863,7 +869,7 @@ impl ScheduleTool {
                 let mut child = cmd.spawn().ok()?;
                 #[cfg(windows)]
                 if let Some(ref guard) = job_guard {
-                    if let Err(_) = guard.assign_process(&child) {
+                    if guard.assign_process(&child).is_err() {
                         let _ = child.kill();
                         let _ = child.wait();
                         return None;

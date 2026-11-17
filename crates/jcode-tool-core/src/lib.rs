@@ -11,9 +11,10 @@ mod path_policy;
 pub use path_jail::PathJail;
 pub use path_policy::{
     ArtifactCreated, PathValidator, SessionApprovalRegistration,
-    SessionArtifactCreatedRegistration, SessionPathValidatorRegistration,
-    notify_session_artifact_created, register_session_approval_requester,
-    register_session_artifact_created_notifier, register_session_path_validator,
+    SessionArtifactCreatedRegistration, SessionPathValidatorRegistration, SessionToolInvokedRegistration,
+    ToolInvoked, notify_session_artifact_created, notify_session_tool_invoked,
+    register_session_approval_requester, register_session_artifact_created_notifier,
+    register_session_path_validator, register_session_tool_invoked_notifier,
     request_session_approval, verify_session_path,
 };
 

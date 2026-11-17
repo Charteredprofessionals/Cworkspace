@@ -90,6 +90,8 @@ struct CoworkRpcInner {
     mounted_roots: Mutex<HashMap<String, Vec<PathBuf>>>,
     jail_registrations: Mutex<HashMap<String, crate::tool::SessionPathValidatorRegistration>>,
     approval_registrations: Mutex<HashMap<String, crate::tool::SessionApprovalRegistration>>,
+    tool_invoked_registrations:
+        Mutex<HashMap<String, crate::tool::SessionToolInvokedRegistration>>,
     tasks: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
@@ -104,6 +106,7 @@ impl CoworkRpc {
                 mounted_roots: Mutex::new(HashMap::new()),
                 jail_registrations: Mutex::new(HashMap::new()),
                 approval_registrations: Mutex::new(HashMap::new()),
+                tool_invoked_registrations: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(HashMap::new()),
             }),
         }
@@ -161,6 +164,7 @@ impl CoworkRpc {
         crate::tool::SessionPathValidatorRegistration,
         crate::tool::SessionApprovalRegistration,
         crate::tool::SessionArtifactCreatedRegistration,
+        crate::tool::SessionToolInvokedRegistration,
     )> {
         let jail_roots = validate_workspace_roots(roots).await?;
         let session_id = session_id.to_owned();
@@ -203,10 +207,30 @@ impl CoworkRpc {
                         .map_err(|error| error.to_string())
                 }
             });
+        let weak = Arc::downgrade(&self.inner);
+        let tool_invoked_registration = crate::tool::register_session_tool_invoked_notifier(
+            session_id,
+            move |invoked| {
+                let weak = weak.clone();
+                async move {
+                    let inner = weak
+                        .upgrade()
+                        .ok_or_else(|| "Cowork daemon disconnected".to_owned())?;
+                    CoworkRpc { inner }
+                        .emit_event(CoworkEvent::ToolInvoked {
+                            tool_call_id: invoked.tool_call_id,
+                            tool_name: invoked.tool_name,
+                        })
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                }
+            },
+        );
         Ok((
             path_registration,
             approval_registration,
             artifact_registration,
+            tool_invoked_registration,
         ))
     }
 
@@ -353,6 +377,25 @@ impl CoworkRpc {
                 }
             },
         );
+        let weak: Weak<CoworkRpcInner> = Arc::downgrade(&self.inner);
+        let tool_invoked_registration = crate::tool::register_session_tool_invoked_notifier(
+            session_id.to_owned(),
+            move |invoked| {
+                let weak = weak.clone();
+                async move {
+                    let inner = weak
+                        .upgrade()
+                        .ok_or_else(|| "Cowork daemon disconnected".to_owned())?;
+                    CoworkRpc { inner }
+                        .emit_event(CoworkEvent::ToolInvoked {
+                            tool_call_id: invoked.tool_call_id,
+                            tool_name: invoked.tool_name,
+                        })
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                }
+            },
+        );
         self.inner
             .mounted_roots
             .lock()
@@ -368,6 +411,11 @@ impl CoworkRpc {
             .lock()
             .await
             .insert(session_id.to_owned(), approval_registration);
+        self.inner
+            .tool_invoked_registrations
+            .lock()
+            .await
+            .insert(session_id.to_owned(), tool_invoked_registration);
         Ok(())
     }
 

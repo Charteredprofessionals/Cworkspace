@@ -7,10 +7,6 @@
 
 <br><br>
 
-<p>
-<a href="https://trendshift.io/repositories/25042?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-25042" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/25042" alt="1jehuang/jcode | Trendshift" width="250" height="55"></a>
-</p>
-
 # Cworkspace
 
 <p>
@@ -20,10 +16,9 @@
 
 [![Last Commit](https://badgen.net/github/last-commit/Charteredprofessionals/Cworkspace/master?icon=github)](https://github.com/Charteredprofessionals/Cworkspace/commits/master)
 [![GitHub Stars](https://badgen.net/github/stars/Charteredprofessionals/Cworkspace?icon=github)](https://github.com/Charteredprofessionals/Cworkspace/stargazers)
-[![GitHub Downloads](https://img.shields.io/github/downloads/1jehuang/jcode/total?style=flat-square)](https://github.com/1jehuang/jcode/releases)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/nBe9vGyK9a)
+[![GitHub Downloads](https://img.shields.io/github/downloads/Charteredprofessionals/Cworkspace/total?style=flat-square)](https://github.com/Charteredprofessionals/Cworkspace/releases)
 
-[Website](https://jcode.sh) · [Docs](https://jcode.sh/docs) · [OpenAI Ultrafast](docs/OPENAI_ULTRAFAST.md) · [SDK](https://jcode.sh/sdk) · [Benchmarks](https://jcode.sh/bench) · [Screenshots](#screenshots) · [Install](#installation) · [Contributing](CONTRIBUTING.md)
+[OpenAI Ultrafast](docs/OPENAI_ULTRAFAST.md) · [Screenshots](#screenshots) · [Install](#installation) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
@@ -58,7 +53,7 @@
 
 ```bash
 # macOS & Linux
-curl -fsSL https://jcode.sh/install | bash
+curl -fsSL https://raw.githubusercontent.com/Charteredprofessionals/Cworkspace/master/scripts/install.sh | bash
 ```
 
 [Windows installation instructions](https://jcode.sh/docs#install).

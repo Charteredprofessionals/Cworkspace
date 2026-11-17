@@ -16,10 +16,21 @@ pub type SessionArtifactCreatedNotifier = dyn Fn(ArtifactCreated) -> Pin<Box<dyn
     + Sync
     + 'static;
 
+pub type SessionToolInvokedNotifier = dyn Fn(ToolInvoked) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+    + Send
+    + Sync
+    + 'static;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactCreated {
     pub path: PathBuf,
     pub mime_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolInvoked {
+    pub tool_call_id: String,
+    pub tool_name: String,
 }
 
 struct Registration {
@@ -29,6 +40,7 @@ struct Registration {
 
 type ApprovalRequestersMap = HashMap<String, (u64, Arc<SessionApprovalRequester>)>;
 type ArtifactNotifiersMap = HashMap<String, (u64, Arc<SessionArtifactCreatedNotifier>)>;
+type ToolInvokedNotifiersMap = HashMap<String, (u64, Arc<SessionToolInvokedNotifier>)>;
 type ValidatorsMap = HashMap<String, Registration>;
 
 static VALIDATORS: LazyLock<RwLock<ValidatorsMap>> = LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -36,6 +48,8 @@ static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 static APPROVAL_REQUESTERS: LazyLock<RwLock<ApprovalRequestersMap>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 static ARTIFACT_CREATED_NOTIFIERS: LazyLock<RwLock<ArtifactNotifiersMap>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static TOOL_INVOKED_NOTIFIERS: LazyLock<RwLock<ToolInvokedNotifiersMap>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub struct SessionApprovalRegistration {
@@ -145,6 +159,64 @@ pub async fn notify_session_artifact_created(
         notifier(ArtifactCreated {
             path,
             mime_type: mime_type.into(),
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+pub struct SessionToolInvokedRegistration {
+    session_id: String,
+    owner: u64,
+}
+
+impl Drop for SessionToolInvokedRegistration {
+    fn drop(&mut self) {
+        let mut notifiers = TOOL_INVOKED_NOTIFIERS
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if notifiers
+            .get(&self.session_id)
+            .is_some_and(|(owner, _)| *owner == self.owner)
+        {
+            notifiers.remove(&self.session_id);
+        }
+    }
+}
+
+pub fn register_session_tool_invoked_notifier<F, Fut>(
+    session_id: impl Into<String>,
+    notifier: F,
+) -> SessionToolInvokedRegistration
+where
+    F: Fn(ToolInvoked) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    let session_id = session_id.into();
+    let owner = NEXT_OWNER.fetch_add(1, Ordering::Relaxed);
+    let notifier: Arc<SessionToolInvokedNotifier> =
+        Arc::new(move |invoked| Box::pin(notifier(invoked)));
+    TOOL_INVOKED_NOTIFIERS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(session_id.clone(), (owner, notifier));
+    SessionToolInvokedRegistration { session_id, owner }
+}
+
+pub async fn notify_session_tool_invoked(
+    session_id: &str,
+    tool_call_id: impl Into<String>,
+    tool_name: impl Into<String>,
+) -> Result<(), String> {
+    let notifier = TOOL_INVOKED_NOTIFIERS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(session_id)
+        .map(|(_, notifier)| Arc::clone(notifier));
+    if let Some(notifier) = notifier {
+        notifier(ToolInvoked {
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
         })
         .await?;
     }

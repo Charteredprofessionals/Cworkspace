@@ -6,7 +6,7 @@ use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use uiautomation::{UIAutomation, UIElement};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -97,6 +97,8 @@ impl Tool for WindowsComputerTool {
                 let (Some(x), Some(y)) = (input.x, input.y) else {
                     bail!("click requires x and y coordinates");
                 };
+                ensure_input_approved(&ctx, "click", format!("click at ({x}, {y})")).await?;
+                ensure_synthesis_rate_allowed()?;
                 tokio::task::spawn_blocking(move || click(x, y))
                     .await
                     .context("mouse input task panicked")?
@@ -105,6 +107,13 @@ impl Tool for WindowsComputerTool {
                 register_interrupt(ctx.graceful_shutdown_signal);
                 ensure_synthesis_allowed(&PANIC_SWITCH_ACTIVE)?;
                 let text = input.text.context("type requires text")?;
+                ensure_input_approved(
+                    &ctx,
+                    "type",
+                    format!("type {} characters", text.chars().count()),
+                )
+                .await?;
+                ensure_synthesis_rate_allowed()?;
                 tokio::task::spawn_blocking(move || type_text(&text))
                     .await
                     .context("keyboard input task panicked")?
@@ -113,6 +122,8 @@ impl Tool for WindowsComputerTool {
                 register_interrupt(ctx.graceful_shutdown_signal);
                 ensure_synthesis_allowed(&PANIC_SWITCH_ACTIVE)?;
                 let key = input.key.context("key requires a supported key name")?;
+                ensure_input_approved(&ctx, "key", format!("press {key}")).await?;
+                ensure_synthesis_rate_allowed()?;
                 tokio::task::spawn_blocking(move || press_key(&key))
                     .await
                     .context("keyboard input task panicked")?
@@ -182,6 +193,54 @@ fn ensure_synthesis_allowed(switch: &AtomicBool) -> Result<()> {
     if switch.load(Ordering::SeqCst) {
         bail!("computer input is disabled by Ctrl+Alt+Backspace; restart jcode to re-enable it");
     }
+    Ok(())
+}
+
+/// Rate limit for synthesized desktop input (S-4): at most 240 synthesized
+/// actions per fixed one-minute window. The kill switch is the immediate
+/// mitigation; this bound caps how much input can land between approvals.
+const MAX_SYNTHESIZED_ACTIONS_PER_MINUTE: u64 = 240;
+const RATE_WINDOW_MILLIS: u128 = 60_000;
+
+static RATE_WINDOW_START_MILLIS: AtomicU64 = AtomicU64::new(0);
+static RATE_WINDOW_ACTIONS: AtomicU64 = AtomicU64::new(0);
+
+fn ensure_synthesis_rate_allowed() -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let window_start = RATE_WINDOW_START_MILLIS.load(Ordering::SeqCst);
+    if now.saturating_sub(window_start) >= RATE_WINDOW_MILLIS {
+        RATE_WINDOW_START_MILLIS.store(now, Ordering::SeqCst);
+        RATE_WINDOW_ACTIONS.store(0, Ordering::SeqCst);
+        return Ok(());
+    }
+    let used = RATE_WINDOW_ACTIONS.fetch_add(1, Ordering::SeqCst) + 1;
+    if used > MAX_SYNTHESIZED_ACTIONS_PER_MINUTE {
+        bail!(
+            "computer input rate limit reached ({MAX_SYNTHESIZED_ACTIONS_PER_MINUTE} actions per minute); pause before continuing or press Ctrl+Alt+Backspace to disable input synthesis"
+        );
+    }
+    Ok(())
+}
+
+/// In Cowork sessions, every input-synthesis action pauses for explicit
+/// desktop-user approval before it runs (S-4). The kill switch, rate limit
+/// and approval gate are three independent layers; this is the approval one.
+/// Plain CLI sessions keep their existing TUI permission flow.
+async fn ensure_input_approved(ctx: &ToolContext, action: &str, detail: String) -> Result<()> {
+    let cowork = std::env::var("JCODE_COWORK_MODE").is_ok_and(|value| value == "1");
+    if !cowork {
+        return Ok(());
+    }
+    let approved = ctx
+        .request_approval("computer_use", format!("{action}: {detail}"))
+        .await?;
+    anyhow::ensure!(
+        approved,
+        "computer input action '{action}' was rejected by the desktop user"
+    );
     Ok(())
 }
 
@@ -348,5 +407,19 @@ mod tests {
     fn uia_element_records_include_screen_coordinates() {
         assert_eq!(MAX_TREE_DEPTH, 8);
         assert_eq!(MAX_UI_ELEMENTS, 160);
+    }
+
+    #[test]
+    fn rate_limit_allows_a_full_window_then_rejects_excess() {
+        RATE_WINDOW_START_MILLIS.store(0, Ordering::SeqCst);
+        RATE_WINDOW_ACTIONS.store(0, Ordering::SeqCst);
+        for _ in 0..MAX_SYNTHESIZED_ACTIONS_PER_MINUTE {
+            assert!(ensure_synthesis_rate_allowed().is_ok());
+        }
+        assert!(ensure_synthesis_rate_allowed().is_err());
+        // The limit is per window: once the window is exhausted, the next
+        // window starts fresh (simulated by rewinding the window start).
+        RATE_WINDOW_START_MILLIS.store(0, Ordering::SeqCst);
+        assert!(ensure_synthesis_rate_allowed().is_ok());
     }
 }

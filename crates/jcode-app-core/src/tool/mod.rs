@@ -92,9 +92,10 @@ use tokio::sync::RwLock;
 pub(crate) use jcode_tool_core::intent_schema_property;
 pub use jcode_tool_core::{
     ArtifactCreated, SessionApprovalRegistration, SessionArtifactCreatedRegistration,
-    SessionPathValidatorRegistration, StdinInputRequest, Tool, ToolContext, ToolExecutionMode,
-    register_session_approval_requester, register_session_artifact_created_notifier,
-    register_session_path_validator,
+    SessionPathValidatorRegistration, SessionToolInvokedRegistration, StdinInputRequest, Tool,
+    ToolContext, ToolExecutionMode, ToolInvoked, register_session_approval_requester,
+    register_session_artifact_created_notifier, register_session_path_validator,
+    register_session_tool_invoked_notifier,
 };
 pub use jcode_tool_types::{ToolImage, ToolOutput};
 pub(crate) use session_search::spawn_recent_index_warmup;
@@ -1108,6 +1109,22 @@ impl Registry {
             "TOOL_LIFECYCLE",
             Self::tool_lifecycle_fields("start", name, resolved_name, &input, &ctx),
         );
+
+        // REQ-IPC-02: stream the live tool feed to the Cowork desktop GUI
+        // (B-3). Fire-and-forget: when no desktop client is registered the
+        // notifier simply does nothing, and delivery errors are dropped so a
+        // disconnected GUI can never break tool execution.
+        if let Err(error) = jcode_tool_core::notify_session_tool_invoked(
+            &ctx.session_id,
+            ctx.tool_call_id.clone(),
+            resolved_name,
+        )
+        .await
+        {
+            crate::logging::debug(&format!(
+                "cowork ToolInvoked delivery skipped: {error}"
+            ));
+        }
 
         let started_at = std::time::Instant::now();
         let result = tool.execute(input.clone(), ctx.clone()).await;
