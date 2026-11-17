@@ -1,5 +1,6 @@
 /target
-Cargo.lock
+# Cargo.lock is intentionally COMMITTED for this application workspace
+# (binary crates must pin reproducible release builds). Do not re-add it here.
 __pycache__/
 ios_simulator_screenshot.png
 /.wrangler/
@@ -21,3 +22,14 @@ captures/
 /*.avif
 /*.mp4
 /*.png
+
+# Dependency and build outputs are generated, never versioned.
+node_modules/
+gui/dist/
+gui/src-tauri/target/
+
+# Editor/agent local state.
+/.vscode/
+/.claude/
+/.jcode/
+*.orig
