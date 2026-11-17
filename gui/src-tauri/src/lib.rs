@@ -15,6 +15,11 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use uuid::Uuid;
 
 const PIPE_NAME: &str = r"\\.\pipe\jcode-cowork";
+/// Must stay in sync with `src/ipc/cowork_rpc.rs` (`token_file_path`): the
+/// daemon publishes a 256-bit capability token here before accepting pipe
+/// clients, and every RPC request must carry it or the daemon rejects the
+/// call as unauthorized.
+const TOKEN_FILE_NAME: &str = "jcode-cowork-ipc.token";
 const KNOWN_EVENTS: [&str; 5] = [
     "AgentSpawned",
     "ToolInvoked",
@@ -22,6 +27,25 @@ const KNOWN_EVENTS: [&str; 5] = [
     "ApprovalRequired",
     "TaskCompleted",
 ];
+
+fn read_capability_token() -> Result<String, String> {
+    let path = std::env::temp_dir().join(TOKEN_FILE_NAME);
+    fs::read_to_string(&path)
+        .map(|token| token.trim().to_owned())
+        .map_err(|error| {
+            format!(
+                "Cowork capability token not found at {}: {error}. Is the daemon running?",
+                path.display()
+            )
+        })
+        .and_then(|token| {
+            if token.is_empty() {
+                Err("Cowork capability token file is empty".to_owned())
+            } else {
+                Ok(token)
+            }
+        })
+}
 
 struct Bridge {
     connection: Mutex<Option<Arc<RpcConnection>>>,
@@ -65,6 +89,7 @@ impl Default for Bridge {
 
 struct RpcConnection {
     writer: Mutex<Option<File>>,
+    auth_token: String,
     pending: Arc<Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>>,
     next_id: AtomicU64,
     alive: AtomicBool,
@@ -84,10 +109,12 @@ impl RpcConnection {
     }
 
     fn open(app: AppHandle) -> Result<Arc<Self>, String> {
+        let auth_token = read_capability_token()?;
         let pipe = open_named_pipe()?;
         let reader = pipe.try_clone().map_err(|error| error.to_string())?;
         let connection = Arc::new(Self {
             writer: Mutex::new(Some(pipe)),
+            auth_token,
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
@@ -150,6 +177,7 @@ impl RpcConnection {
             "id": id,
             "method": method,
             "params": params,
+            "auth": { "token": self.auth_token },
         });
         let write_result = (|| {
             let mut writer = self
