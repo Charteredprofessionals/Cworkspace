@@ -87,6 +87,7 @@ mod tests {
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: ToolExecutionMode::Direct,
+            require_validator: false,
         };
         let stats = || -> SessionEditStats {
             serde_json::from_slice(

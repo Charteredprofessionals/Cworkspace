@@ -23,6 +23,7 @@ fn fixture_context() -> ToolContext {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: ToolExecutionMode::Direct,
+        require_validator: false,
     }
 }
 

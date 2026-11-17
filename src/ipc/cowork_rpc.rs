@@ -192,7 +192,9 @@ impl CoworkRpc {
         );
         let weak = Arc::downgrade(&self.inner);
         let artifact_registration =
-            crate::tool::register_session_artifact_created_notifier(session_id, move |artifact| {
+            crate::tool::register_session_artifact_created_notifier(
+                session_id.clone(),
+                move |artifact| {
                 let weak = weak.clone();
                 async move {
                     let inner = weak

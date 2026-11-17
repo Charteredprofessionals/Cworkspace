@@ -83,6 +83,7 @@ else:
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: crate::tool::ToolExecutionMode::Direct,
+            require_validator: false,
         }
     }
 }

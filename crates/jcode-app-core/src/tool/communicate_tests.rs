@@ -1417,6 +1417,7 @@ fn test_ctx(session_id: &str, working_dir: &Path) -> ToolContext {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: ToolExecutionMode::Direct,
+        require_validator: false,
     }
 }
 

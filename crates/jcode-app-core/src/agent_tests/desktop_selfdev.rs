@@ -99,6 +99,7 @@ async fn desktop_selfdev_is_automatic_separate_and_restored() {
                     stdin_request_tx: None,
                     graceful_shutdown_signal: None,
                     execution_mode: ToolExecutionMode::Direct,
+                    require_validator: false,
                 },
             )
             .await;

@@ -131,6 +131,7 @@ fn ctx() -> ToolContext {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: super::super::super::ToolExecutionMode::Direct,
+        require_validator: false,
     }
 }
 fn input() -> BrowserInput {

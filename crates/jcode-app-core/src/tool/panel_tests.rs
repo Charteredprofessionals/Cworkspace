@@ -11,6 +11,7 @@ fn context(dir: &std::path::Path, session: &str) -> ToolContext {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
+        require_validator: false,
     }
 }
 

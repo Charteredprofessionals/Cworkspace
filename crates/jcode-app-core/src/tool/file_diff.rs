@@ -139,6 +139,7 @@ mod tests {
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: ToolExecutionMode::Direct,
+            require_validator: false,
         };
         let path = home.path().join("file.rs");
         let original: String = (1..=100).map(|n| format!("line {n}\n")).collect();

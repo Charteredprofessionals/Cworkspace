@@ -64,6 +64,7 @@ fn mcp_test_context(working_dir: &std::path::Path) -> ToolContext {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: ToolExecutionMode::Direct,
+        require_validator: false,
     }
 }
 
@@ -447,6 +448,7 @@ async fn test_batch_resolves_function_namespaced_tools() {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: ToolExecutionMode::Direct,
+        require_validator: false,
     };
 
     let result = registry
@@ -482,6 +484,7 @@ async fn test_batch_rejects_function_namespaced_batch_recursion() {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: ToolExecutionMode::Direct,
+        require_validator: false,
     };
 
     let error = registry
@@ -512,6 +515,7 @@ async fn test_batch_resolves_oauth_names() {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: ToolExecutionMode::Direct,
+        require_validator: false,
     };
 
     let result = registry
@@ -536,6 +540,7 @@ async fn registry_execute_enforces_session_tool_policy_after_alias_resolution() 
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: ToolExecutionMode::Direct,
+        require_validator: false,
     };
 
     let result = registry
@@ -586,6 +591,7 @@ async fn registry_execute_pre_tool_hook_blocks_and_allows() {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: ToolExecutionMode::Direct,
+        require_validator: false,
     };
 
     let blocked = registry
@@ -1204,6 +1210,7 @@ async fn unknown_tool_error_lists_available_tools_and_suggestions() {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: ToolExecutionMode::Direct,
+        require_validator: false,
     };
     let err = registry
         .execute("ToolSearch", serde_json::json!({}), ctx)
@@ -1437,6 +1444,7 @@ async fn execute_big_output(input: Value) -> String {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: ToolExecutionMode::Direct,
+        require_validator: false,
     };
 
     registry
@@ -1589,6 +1597,7 @@ async fn test_batch_guards_both_its_subcalls_and_its_own_aggregate() {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: ToolExecutionMode::Direct,
+        require_validator: false,
     };
     let calls = serde_json::json!([
         { "tool": "big_output", "intent": "one" },
