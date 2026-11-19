@@ -197,7 +197,6 @@ pub fn authenticate_server_sync<S>(stream: &mut S, expected_token: &str) -> std:
 where
     S: std::io::Read + std::io::Write,
 {
-    use std::io::Write as _;
     let line = read_line_bounded_sync(stream, MAX_AUTH_LINE)?;
     let token = line.strip_prefix("AUTH ").map(str::trim_end).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::PermissionDenied, "missing AUTH frame")
@@ -218,7 +217,6 @@ pub fn authenticate_client_sync<S>(stream: &mut S, token: &str) -> std::io::Resu
 where
     S: std::io::Read + std::io::Write,
 {
-    use std::io::Write;
     stream.write_all(format!("AUTH {token}\n").as_bytes())?;
     stream.flush()?;
     let mut reply = [0u8; 3];
