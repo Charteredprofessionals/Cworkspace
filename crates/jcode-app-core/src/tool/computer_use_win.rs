@@ -92,7 +92,7 @@ impl Tool for WindowsComputerTool {
                 .await
                 .context("UI Automation task panicked")?,
             "click" => {
-                register_interrupt(ctx.graceful_shutdown_signal);
+                register_interrupt(ctx.graceful_shutdown_signal.clone());
                 ensure_synthesis_allowed(&PANIC_SWITCH_ACTIVE)?;
                 let (Some(x), Some(y)) = (input.x, input.y) else {
                     bail!("click requires x and y coordinates");
@@ -104,7 +104,7 @@ impl Tool for WindowsComputerTool {
                     .context("mouse input task panicked")?
             }
             "type" => {
-                register_interrupt(ctx.graceful_shutdown_signal);
+                register_interrupt(ctx.graceful_shutdown_signal.clone());
                 ensure_synthesis_allowed(&PANIC_SWITCH_ACTIVE)?;
                 let text = input.text.context("type requires text")?;
                 ensure_input_approved(
@@ -119,7 +119,7 @@ impl Tool for WindowsComputerTool {
                     .context("keyboard input task panicked")?
             }
             "key" => {
-                register_interrupt(ctx.graceful_shutdown_signal);
+                register_interrupt(ctx.graceful_shutdown_signal.clone());
                 ensure_synthesis_allowed(&PANIC_SWITCH_ACTIVE)?;
                 let key = input.key.context("key requires a supported key name")?;
                 ensure_input_approved(&ctx, "key", format!("press {key}")).await?;
