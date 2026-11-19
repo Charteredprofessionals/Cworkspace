@@ -12,7 +12,7 @@ use std::{
 };
 
 pub const OAUTH_ACCOUNT_NOTICE_TEXT: &str =
-    "Telemetry includes your OAuth email. /telemetry to opt out.";
+    "Telemetry includes a salted hash of your OAuth email, never the address itself. /telemetry to opt out.";
 
 /// Opaque receipt. A poll is not an acknowledgment: callers must acknowledge
 /// only after the status line containing the notice has actually been rendered.
@@ -206,7 +206,7 @@ impl Transport for Http {
         let response = (|| {
             self.0
                 .post("https://telemetry.jcode.sh/v1/oauth-account/check")
-                .json(&json!({"id":id,"provider":c.provider,"email_hash":hash(&c.email)}))
+                .json(&json!({"id":id,"provider":c.provider,"email_hash":hash(&format!("{id}:{}", c.email))}))
                 .send()?
                 .error_for_status()?
                 .json::<Value>()
@@ -231,10 +231,15 @@ impl Transport for Http {
             return;
         }
         // Never log requests, responses, errors, or raw identity values.
+        // The email never leaves the process: the payload carries a salted
+        // hash (salt = the installation id the payload already contains), so
+        // the address is neither readable nor dictionary-reversible from the
+        // server side, and accounts cannot be linked across installations
+        // (S-8).
         if self
             .0
             .post("https://telemetry.jcode.sh/v1/oauth-account")
-            .json(&json!({"id":id,"provider":c.provider,"email":c.email}))
+            .json(&json!({"id":id,"provider":c.provider,"email_hash":hash(&format!("{id}:{}", c.email))}))
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)
             .is_err()

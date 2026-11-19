@@ -1,7 +1,6 @@
 <div align="center">
 
 <p>
-<a href="https://trendshift.io/repositories/25042?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-25042" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/25042" alt="1jehuang/jcode | Trendshift" width="250" height="55"></a>
 </p>
 
 <picture>
@@ -16,26 +15,23 @@
   Run dozens of agents in parallel without melting your machine. More agents, less RAM, no lag.
 </p>
 
-[![Last Commit](https://img.shields.io/github/last-commit/1jehuang/jcode/master?style=flat-square&logo=github)](https://github.com/1jehuang/jcode/commits/master)
-[![GitHub Stars](https://img.shields.io/github/stars/1jehuang/jcode?style=flat-square&logo=github)](https://github.com/1jehuang/jcode/stargazers)
-[![GitHub Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F1jehuang%2Fjcode%2Fmaster%2Fdocs%2Fbadges%2Fdownloads.json&style=flat-square&logo=github)](https://github.com/1jehuang/jcode/releases)
+[![Last Commit](https://img.shields.io/github/last-commit/Charteredprofessionals/Cworkspace/master?style=flat-square&logo=github)](https://github.com/Charteredprofessionals/Cworkspace/commits/master)
+[![GitHub Stars](https://img.shields.io/github/stars/Charteredprofessionals/Cworkspace?style=flat-square&logo=github)](https://github.com/Charteredprofessionals/Cworkspace/stargazers)
+[![GitHub Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FCharteredprofessionals%2FCworkspace%2Fmaster%2Fdocs%2Fbadges%2Fdownloads.json&style=flat-square&logo=github)](https://github.com/Charteredprofessionals/Cworkspace/releases)
 
-[![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/nBe9vGyK9a)
 [![Y Combinator](https://img.shields.io/badge/Y%20Combinator-S26-F26625?style=flat-square&logo=ycombinator&logoColor=white)](https://www.ycombinator.com/companies/jcode)
-[![X (Twitter)](https://img.shields.io/badge/follow-%401jehuang-000000?style=flat-square&logo=x&logoColor=white)](https://x.com/1jehuang)
-
 </div>
 
 <div align="center">
 
-  <a href="https://github.com/1jehuang/jcode/releases/download/readme-assets/jcode-performance-demo-2026-10.mp4">
-    <img src="https://github.com/1jehuang/jcode/releases/download/readme-assets/jcode-performance-demo-2026-10-30fps.webp" alt="jcode performance demonstration" width="900">
+  <a href="https://github.com/Charteredprofessionals/Cworkspace/releases/download/readme-assets/jcode-performance-demo-2026-10.mp4">
+    <img src="https://github.com/Charteredprofessionals/Cworkspace/releases/download/readme-assets/jcode-performance-demo-2026-10-30fps.webp" alt="jcode performance demonstration" width="900">
   </a>
 
   <p><em>jcode performance demonstration (1x speed)</em></p>
 
-<a href="https://github.com/1jehuang/jcode/releases/download/readme-assets/jcode-yc-launch.mp4">
-  <img src="https://github.com/1jehuang/jcode/releases/download/readme-assets/jcode-yc-launch.webp" alt="jcode YC launch video" width="800">
+<a href="https://github.com/Charteredprofessionals/Cworkspace/releases/download/readme-assets/jcode-yc-launch.mp4">
+  <img src="https://github.com/Charteredprofessionals/Cworkspace/releases/download/readme-assets/jcode-yc-launch.webp" alt="jcode YC launch video" width="800">
 </a>
 
 </div>
@@ -48,7 +44,7 @@
 
 ```bash
 # macOS & Linux
-curl -fsSL https://jcode.sh/install | bash
+curl -fsSL https://raw.githubusercontent.com/Charteredprofessionals/Cworkspace/master/scripts/install.sh | bash
 ```
 
 Want to test a maintainer's latest iteration on Linux x86_64? See
