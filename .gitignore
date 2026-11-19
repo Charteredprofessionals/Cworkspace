@@ -1,5 +1,5 @@
 /target
-Cargo.lock
+# Cargo.lock is committed on purpose (reproducible builds); ignoring it is the bug. (B-9)
 __pycache__/
 /.wrangler/
 /tmp/
@@ -20,3 +20,9 @@ captures/
 /*.avif
 /*.mp4
 /*.png
+
+# Dependency and build artifacts must never be tracked again (B-1).
+node_modules/
+gui/dist/
+gui/src-tauri/target/
+gui/src-tauri/gen/
