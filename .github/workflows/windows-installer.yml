@@ -12,6 +12,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # .cargo/config.toml sets a POSIX rustc wrapper that cannot execute on
+  # Windows; the config prescribes clearing it here (Windows runner image
+  # ships VS 2022 MSVC + Windows SDK, so no choco build-tools install is
+  # needed either — the pinned community package was removed upstream and
+  # failed every run).
+  CARGO_BUILD_RUSTC_WRAPPER: ""
 
 jobs:
   build:
@@ -47,11 +53,6 @@ jobs:
           node-version: '20'
           cache: 'npm'
           cache-dependency-path: gui/package-lock.json
-
-      - name: Install system dependencies
-        run: |
-          choco install -y microsoft-visual-cpp-build-tools --version 14.40.33810 --package-parameters "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.Windows10SDK.19041"
-        shell: pwsh
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version ^2.5
