@@ -32,6 +32,7 @@
 //! why the catastrophic tier is a small, absolute, path-based deny that does
 //! not depend on parsing the command correctly.
 
+mod cowork;
 mod gate;
 mod paths;
 mod tokenize;
@@ -204,6 +205,19 @@ const CONDITIONALLY_DESTRUCTIVE: &[(&str, &[&str])] =
 /// including garbage, produces an assessment rather than an error.
 pub fn assess(command: &str, ctx: &RiskContext) -> RiskAssessment {
     let mut findings = Vec::new();
+    // Cowork denylist (S-3): Windows primitives the blast-radius engine cannot
+    // see through — PowerShell aliases, `cmd /c del`, `-EncodedCommand` base64
+    // wrapping, `reg delete`, `net user`. Runs first and cheap; any match
+    // forces justification before execution.
+    if cowork::matches(command) {
+        findings.push(RiskFinding {
+            level: RiskLevel::Confirm,
+            reason: "Cowork denylist primitive (Windows shell or destructive \
+                     primitive) requires justification before it runs"
+                .into(),
+            target: None,
+        });
+    }
     // Keep the trusted context for literal protected paths, but never approve
     // commands whose own assignments can invalidate known-variable expansion.
     if command.contains("HOME=") || command.contains("JCODE_SCRATCH_DIR=") {
@@ -571,3 +585,7 @@ fn is_safe_redirect_sink(raw: &str) -> bool {
 #[cfg(test)]
 #[path = "assess_tests.rs"]
 mod assess_tests;
+
+#[cfg(test)]
+#[path = "cowork_tests.rs"]
+mod cowork_tests;
