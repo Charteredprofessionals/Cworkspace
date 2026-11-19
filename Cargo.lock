@@ -4672,6 +4672,7 @@ dependencies = [
 name = "jcode-transport"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.3.4",
  "hex",
  "sha2 0.10.9",
  "tokio",

@@ -91,7 +91,7 @@ impl UnixTransport {
         // A bare `No such file or directory` names the syscall and hides the
         // cause: the bridge is not running. Connecting is the first thing
         // anyone does with this SDK, so say what to do about it.
-        let stream = PlatformUnixStream::connect(path).map_err(|cause| {
+        let mut stream = PlatformUnixStream::connect(path).map_err(|cause| {
             Error::new(
                 ErrorKind::ConnectFailed,
                 match cause.kind() {
@@ -114,6 +114,29 @@ impl UnixTransport {
                 },
             )
         })?;
+        // Capability-token handshake (S-1, S-2): the bridge mints a token next
+        // to the socket and requires it before serving any frame. Fail closed
+        // when the token exists but cannot be loaded or presented; connect
+        // unauthenticated only when there is no token file at all, so older
+        // bridges keep working.
+        let token_path = jcode_transport::token_file_path(path);
+        if token_path.exists() {
+            let token = jcode_transport::load_token_file(&token_path).map_err(|cause| {
+                Error::new(
+                    ErrorKind::ConnectFailed,
+                    format!(
+                        "could not read the capability token at {}: {cause}",
+                        token_path.display()
+                    ),
+                )
+            })?;
+            jcode_transport::authenticate_client_sync(&mut stream, &token).map_err(|cause| {
+                Error::new(
+                    ErrorKind::ConnectFailed,
+                    format!("the bridge rejected this client: {cause}"),
+                )
+            })?;
+        }
         Ok(Self(stream))
     }
 }

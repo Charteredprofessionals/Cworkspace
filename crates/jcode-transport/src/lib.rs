@@ -9,6 +9,7 @@
 //! application foundation, and the alternative was duplicating 450 lines of
 //! named pipe handling into it.
 
+mod auth;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -18,3 +19,5 @@ pub use unix::*;
 mod windows;
 #[cfg(windows)]
 pub use windows::*;
+
+pub use auth::*;

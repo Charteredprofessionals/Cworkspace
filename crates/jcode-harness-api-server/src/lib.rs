@@ -261,23 +261,43 @@ pub async fn run_bridge(api_socket: PathBuf, legacy_socket: PathBuf) -> Result<(
     // owner's provider tokens. A bridge must never be more permissive than
     // the thing it bridges to.
     //
-    // Unix only: a Windows named pipe carries an ACL rather than a file mode,
-    // and the transport applies it when publishing the pipe.
+    // The 0600 mode only exists on Unix. A Windows named pipe has no file
+    // mode, and its default DACL is not an access guarantee, so every client
+    // must additionally present the capability token minted below before any
+    // API frame is served (jcode_transport::authenticate_server, S-1/S-2).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&api_socket, std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("restrict API socket {}", api_socket.display()))?;
     }
+    // Capability token (S-1, S-2): minted from the OS CSPRNG and persisted
+    // next to the socket/pipe. Only processes that can read that file — the
+    // owning user's — can present it, which is exactly the access scope the
+    // 0600 mode gives the socket itself on Unix.
+    let token_path = jcode_transport::token_file_path(&api_socket);
+    let capability_token = jcode_transport::generate_capability_token();
+    jcode_transport::persist_token_file(&token_path, &capability_token)
+        .with_context(|| format!("persist capability token {}", token_path.display()))?;
     eprintln!(
         "harness API bridge: listening on {} -> {}",
         api_socket.display(),
         legacy_socket.display()
     );
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (mut stream, _) = listener.accept().await?;
         let legacy = legacy_socket.clone();
+        let capability_token = capability_token.clone();
         tokio::spawn(async move {
+            // Authenticate before serving any frame. On Unix this is defense
+            // in depth behind the 0600 mode; on Windows the token is the
+            // access control. Failed handshakes close the stream unauthenticated.
+            if let Err(error) =
+                jcode_transport::authenticate_server(&mut stream, &capability_token).await
+            {
+                eprintln!("harness API bridge: rejecting unauthenticated client: {error}");
+                return;
+            }
             if let Err(error) = handle_api_client(stream, legacy).await {
                 eprintln!("harness API bridge: client ended: {error:#}");
             }
