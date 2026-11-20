@@ -86,6 +86,14 @@ mod win_job {
             unsafe { CloseHandle(self.handle) };
         }
     }
+
+    // SAFETY: HANDLE is an opaque kernel handle. Win32 job-object APIs
+    // (AssignProcessToJobObject, SetInformationJobObject, CloseHandle) are not
+    // thread-affine, the raw pointer is never dereferenced in Rust, and the
+    // guard keeps unique ownership (Drop runs wherever the owning future
+    // ends). Without this, tool futures that hold the guard across await
+    // points are not Send and cannot be spawned.
+    unsafe impl Send for WinJobGuard {}
 }
 
 #[cfg(not(windows))]
