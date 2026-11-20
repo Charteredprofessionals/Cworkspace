@@ -458,6 +458,16 @@ async fn respond_approval(
     Ok(())
 }
 
+#[tauri::command]
+async fn list_models(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, String> {
+    // The daemon builds routes from auto-fetched provider catalogs; this call
+    // is pipe I/O + JSON, so keep it off the shared runtime workers too.
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("list_models", json!({}))
+    })
+}
+
 #[derive(Serialize)]
 struct ArtifactPayload {
     name: String,
@@ -534,6 +544,7 @@ pub fn run() {
         .manage(bridge)
         .invoke_handler(tauri::generate_handler![
             connect_daemon,
+            list_models,
             mount_folder,
             unmount_folder,
             start_cowork_task,

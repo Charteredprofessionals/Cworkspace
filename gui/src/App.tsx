@@ -76,6 +76,13 @@ class ErrorBoundary extends React.Component<
     return this.props.children;
   }
 }
+type ModelRoute = {
+  model: string;
+  provider: string;
+  available: boolean;
+  detail: string;
+};
+
 type CoworkEvent = {
   event: "AgentSpawned" | "ToolInvoked" | "ArtifactCreated" | "ApprovalRequired" | "TaskCompleted";
   data: Record<string, unknown>;
@@ -165,6 +172,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [handledApprovals, setHandledApprovals] = useState<Record<string, boolean>>({});
+  const [models, setModels] = useState<ModelRoute[]>([]);
 
   useEffect(() => {
     localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 30)));
@@ -182,6 +190,21 @@ function App() {
       });
     return () => { cancelled = true; };
   }, []);
+
+  // Model catalogs auto-fetch in the daemon; refresh whenever the
+  // connection state becomes (or returns to) connected.
+  useEffect(() => {
+    if (daemonStatus !== "connected") return;
+    let cancelled = false;
+    invoke<{ models?: ModelRoute[] }>("list_models")
+      .then((result) => {
+        if (!cancelled) setModels(Array.isArray(result?.models) ? result.models : []);
+      })
+      .catch(() => {
+        if (!cancelled) setModels([]);
+      });
+    return () => { cancelled = true; };
+  }, [daemonStatus]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -335,6 +358,19 @@ function App() {
               </div>
             ))}
             {!folders.length && <p className="sidebar-empty">Your folders stay yours. Mount one to begin.</p>}
+          </div>
+        </section>
+
+        <section className="sidebar-section models-section">
+          <div className="section-heading"><span>MODELS</span><Sparkles size={14} /></div>
+          <div className="model-list">
+            {models.filter((route) => route.available).slice(0, 10).map((route) => (
+              <div className="model-item" key={`${route.provider}:${route.model}`} title={route.detail}>
+                <span className="model-name">{route.model}</span>
+                <span className="model-provider">{route.provider}</span>
+              </div>
+            ))}
+            {!models.length && <p className="sidebar-empty">Model catalogs load automatically once signed in.</p>}
           </div>
         </section>
 

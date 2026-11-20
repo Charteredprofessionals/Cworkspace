@@ -2623,6 +2623,17 @@ pub async fn run_single_message_command(
             "Could not refresh model capabilities before headless run: {error}"
         ));
     }
+    // Model auto-fetch for the remaining providers: every runtime applies
+    // its own TTL + single-flight guard, so repeat calls are cheap; run in
+    // the background to keep `jcode run` startup instant.
+    let provider_for_prefetch = provider.clone();
+    tokio::spawn(async move {
+        if let Err(error) = provider_for_prefetch.prefetch_models().await {
+            crate::logging::warn(&format!(
+                "Could not refresh model catalogs in background: {error}"
+            ));
+        }
+    });
     let registry = crate::tool::Registry::new(provider.clone()).await;
     // Load MCP servers from ~/.jcode/mcp.json so headless `jcode run` has the
     // same `mcp__*` tools as interactive/server sessions. This is non-blocking:
@@ -2670,6 +2681,17 @@ pub async fn run_cowork_task(
             "Could not refresh model capabilities before Cowork task: {error}"
         ));
     }
+    // Model auto-fetch for every provider in the daemon: catalogs refresh in
+    // the background (TTL + single-flight guarded per runtime) so the model
+    // list the GUI reads is current without blocking task start.
+    let provider_for_prefetch = provider.clone();
+    tokio::spawn(async move {
+        if let Err(error) = provider_for_prefetch.prefetch_models().await {
+            crate::logging::warn(&format!(
+                "Could not refresh model catalogs for Cowork session: {error}"
+            ));
+        }
+    });
     let registry = crate::tool::Registry::new(provider.clone()).await;
     let mut agent = crate::agent::Agent::new(provider, registry);
     agent.set_working_dir(&working_dir.display().to_string());

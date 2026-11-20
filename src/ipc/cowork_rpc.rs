@@ -93,6 +93,10 @@ struct CoworkRpcInner {
     tool_invoked_registrations:
         Mutex<HashMap<String, crate::tool::SessionToolInvokedRegistration>>,
     tasks: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Lazily bootstrapped provider used to answer `list_models` without
+    /// waiting for a task. Each runtime auto-fetches its model catalog from
+    /// the provider's own endpoint (TTL-cached, static fallback offline).
+    models_provider: tokio::sync::OnceCell<Arc<dyn crate::provider::Provider>>,
 }
 
 impl CoworkRpc {
@@ -108,8 +112,30 @@ impl CoworkRpc {
                 approval_registrations: Mutex::new(HashMap::new()),
                 tool_invoked_registrations: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(HashMap::new()),
+                models_provider: tokio::sync::OnceCell::new(),
             }),
         }
+    }
+
+    /// Live model routes for the GUI. Bootstraps one provider per daemon
+    /// process; the returned routes are backed by each runtime's auto-fetched
+    /// catalog (with the static fallback list guaranteed non-empty offline).
+    pub async fn list_models(&self) -> Result<Value, String> {
+        let provider = self
+            .inner
+            .models_provider
+            .get_or_try_init(|| async {
+                crate::cli::provider_init::init_provider_for_run(
+                    &crate::cli::provider_init::ProviderChoice::Auto,
+                    None,
+                    false,
+                )
+                .await
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let routes = provider.model_routes();
+        Ok(json!({ "models": routes }))
     }
 
     /// True when the request carries this daemon's capability token. Every
@@ -557,6 +583,10 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
 
     let result = match request.method.as_str() {
         "ping" => Ok(json!({ "name": "jcode-cowork", "version": 1 })),
+        "list_models" => rpc
+            .list_models()
+            .await
+            .map_err(|error| (-32000, error)),
         "mount_folder" => {
             let session_id = request.params.get("session_id").and_then(Value::as_str);
             let path = request.params.get("path").and_then(Value::as_str);
