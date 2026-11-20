@@ -21,7 +21,7 @@ PowerShell 5.1 or later is required by the installer. The x64 build is the defau
 Open PowerShell and run:
 
 ```powershell
-irm https://jcode.sh/install.ps1 | iex
+ irm https://raw.githubusercontent.com/Charteredprofessionals/Cworkspace/master/scripts/install.ps1 | iex
 ```
 
 The installer:
@@ -35,7 +35,7 @@ The installer:
 Alacritty installation and the global launch hotkey are optional and are no longer installed automatically. To request both explicitly:
 
 ```powershell
-$script = [scriptblock]::Create((irm https://jcode.sh/install.ps1))
+$script = [scriptblock]::Create((irm https://raw.githubusercontent.com/Charteredprofessionals/Cworkspace/master/scripts/install.ps1))
 & $script -ConfigureAlacritty -ConfigureHotkey
 ```
 
@@ -46,7 +46,7 @@ fails with an actionable message rather than silently starting a long build.
 To explicitly allow a source build:
 
 ```powershell
-$script = [scriptblock]::Create((irm https://jcode.sh/install.ps1))
+$script = [scriptblock]::Create((irm https://raw.githubusercontent.com/Charteredprofessionals/Cworkspace/master/scripts/install.ps1))
 & $script -BuildFromSource
 ```
 
@@ -68,7 +68,7 @@ Get-Command jcode
 Get-FileHash (Get-Command jcode).Source -Algorithm SHA256
 ```
 
-Compare the hash with `SHA256SUMS` on the matching [GitHub release](https://github.com/1jehuang/jcode/releases/latest).
+Compare the hash with `SHA256SUMS` on the matching [GitHub release](https://github.com/Charteredprofessionals/Cworkspace/releases/latest).
 
 After Authenticode signing is enabled, this must report `Valid`:
 
@@ -102,7 +102,7 @@ The release workflow supports [Azure Artifact Signing](https://azure.microsoft.c
 This is a one-time owner setup and may require Azure billing and organization or identity verification:
 
 1. Create an Artifact Signing account and a public-trust certificate profile.
-2. Create a Microsoft Entra application or managed identity with a federated credential for `1jehuang/jcode` GitHub Actions.
+2. Create a Microsoft Entra application or managed identity with a federated credential for `repo:Charteredprofessionals/Cworkspace:ref:refs/heads/master` GitHub Actions.
 3. Grant it the **Artifact Signing Certificate Profile Signer** role on the certificate profile.
 4. Add these GitHub Actions secrets:
    - `AZURE_CLIENT_ID`

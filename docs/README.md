@@ -1,6 +1,6 @@
-# jcode Docs
+# Cworkspace Docs
 
-Reference documentation for the jcode codebase.
+Reference documentation for the Cworkspace codebase (the jcode CLI plus the Cowork desktop GUI).
 
 ## Layout
 
@@ -9,6 +9,7 @@ Reference documentation for the jcode codebase.
 - `docs/audits/` — point-in-time audits and reviews. Historical snapshots, not kept up to date.
 - `docs/proposals/` — design proposals not yet committed to.
 - `docs/dev/` — developer-facing process and testing notes.
+- `docs/archive/` — dated acceptance, validation, and benchmark logs. Point-in-time snapshots.
 
 ## Key entry points
 
@@ -16,7 +17,7 @@ Reference documentation for the jcode codebase.
 - Swarm: `SWARM_ARCHITECTURE.md`
 - Memory: `MEMORY_ARCHITECTURE.md`, `MEMORY_BUDGET.md`, `MEMORY_INCIDENT_RUNBOOK.md`
 - Refactoring and quality: `REFACTORING.md`, `plans/CODE_QUALITY_10_10_PLAN.md`
-- Desktop app: `DESKTOP_APP_ARCHITECTURE.md`, `DESKTOP_CODEBASE_ARCHITECTURE.md`
+- Desktop app: the Cowork GUI lives in `gui/` (React + Tauri v2); see the repository map in the root README
 - Providers: `PROVIDER_DOCTOR.md`, `AWS_BEDROCK_PROVIDER.md`
 - MCP servers: `MCP_REMOTE.md`
 - Platform: `WINDOWS.md`, `TERMINAL_CAPABILITIES.md`

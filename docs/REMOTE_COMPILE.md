@@ -17,7 +17,7 @@ Account state is reported only in tool results. `action=status` and every
 compile check `/v1/me` with the configured Jcode account credential, and the
 result distinguishes signed out, subscription required, available, service not
 enabled, and account status unknown. Signed-out and subscription-required
-results tell the agent to link to <https://jcode.sh/pricing>. Using a non-Jcode
+results tell the agent to link to the upstream pricing page. Using a non-Jcode
 model does not prevent use of a Jcode subscription.
 
 Every compilation checks access **before reading or uploading source**.

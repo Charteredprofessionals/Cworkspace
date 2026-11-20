@@ -12,7 +12,7 @@ Official releases have two gates: **successful CI for the exact tagged commit** 
    ```bash
    git push origin master
    python3 scripts/check_release_ci.py "$(git rev-parse HEAD)" \
-     --repo 1jehuang/jcode --timeout 0
+     --repo Charteredprofessionals/Cworkspace --timeout 0
    scripts/quick-release.sh --remote v0.98.1
    ```
 
@@ -67,7 +67,7 @@ The fast paths no longer make single-platform releases public immediately. They 
 
 ## CI release workflow
 
-A pushed `v*` tag triggers `.github/workflows/release.yml` in the canonical `1jehuang/jcode` repository:
+A pushed `v*` tag triggers `.github/workflows/release.yml` in the canonical `Charteredprofessionals/Cworkspace` repository:
 
 ```text
 Tag push (after successful exact-SHA main/master CI)
@@ -118,7 +118,7 @@ A missing platform asset fails finalization and keeps a new release as a draft. 
 After making the complete release public, the finalizer downloads the actual public assets and verifies their hashes and exact-SHA unpatched provenance before announcements or package-manager updates. Repeat that verification when checking a release manually:
 
 ```bash
-python3 scripts/verify_public_release.py v0.98.1 --repo 1jehuang/jcode \
+python3 scripts/verify_public_release.py v0.98.1 --repo Charteredprofessionals/Cworkspace \
   --sha "$(git rev-parse 'refs/tags/v0.98.1^{commit}')"
 ```
 

@@ -83,7 +83,7 @@ cargo test -p jcode-provider-openai-runtime --lib \
 Its single-sample time-to-first-text observations are not a benchmark. A real
 latency comparison should measure cold and warmed requests across many turns,
 report warmup hit rate, and include preparation cost when it cannot overlap
-other work. See the [application-level validation report](OPENAI_WEBSOCKET_VALIDATION.md)
+other work. See the [application-level validation report](archive/OPENAI_WEBSOCKET_VALIDATION.md)
 for a repeated enabled-versus-disabled experiment and its limitations.
 
 Native `response.steer` and multiplexed `stream_id` support are separate features

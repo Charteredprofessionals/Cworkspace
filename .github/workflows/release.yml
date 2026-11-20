@@ -1022,14 +1022,6 @@ jobs:
       # Releases created with GITHUB_TOKEN do not trigger `release: published`,
       # but workflow_dispatch is allowed. Queue the dedicated, per-tag
       # announcement workflow without letting Discord block package publishing.
-      - name: Queue Discord release announcement
-        id: discord_announcement
-        continue-on-error: true
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run discord-release.yml --ref "$DEFAULT_BRANCH" -f "tag=${RELEASE_TAG}"
-
       - name: Update Homebrew formula
         env:
           HOMEBREW_DEPLOY_KEY: ${{ secrets.HOMEBREW_DEPLOY_KEY }}
