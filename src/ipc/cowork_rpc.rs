@@ -715,7 +715,7 @@ where
 
 #[cfg(windows)]
 pub async fn run_server() -> Result<()> {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let rpc = global().clone();
