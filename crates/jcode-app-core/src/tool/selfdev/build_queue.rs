@@ -109,10 +109,12 @@ export -f cargo
             .map_err(|e| anyhow::anyhow!("Failed to spawn build command: {}", e))?;
 
         #[cfg(windows)]
-        if let Err(error) = job_guard.assign_process(&child) {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(error.into());
+        if let Some(pid) = child.id() {
+            if let Err(error) = job_guard.assign_process(pid) {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(error.into());
+            }
         };
 
         let mut file = tokio::fs::File::create(&output_path)

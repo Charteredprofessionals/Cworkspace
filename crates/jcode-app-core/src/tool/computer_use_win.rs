@@ -201,7 +201,7 @@ fn ensure_synthesis_allowed(switch: &AtomicBool) -> Result<()> {
 /// actions per fixed one-minute window. The kill switch is the immediate
 /// mitigation; this bound caps how much input can land between approvals.
 const MAX_SYNTHESIZED_ACTIONS_PER_MINUTE: u64 = 240;
-const RATE_WINDOW_MILLIS: u128 = 60_000;
+const RATE_WINDOW_MILLIS: u64 = 60_000;
 
 static RATE_WINDOW_START_MILLIS: AtomicU64 = AtomicU64::new(0);
 static RATE_WINDOW_ACTIONS: AtomicU64 = AtomicU64::new(0);
@@ -336,7 +336,7 @@ fn element_record(element: &UIElement) -> Option<UiElementRecord> {
         native_handle: element
             .get_native_window_handle()
             .ok()
-            .map(|handle| *handle.as_ref() as isize),
+            .map(|handle| handle.as_ref().0 as isize),
         left: bounds.get_left(),
         top: bounds.get_top(),
         right: bounds.get_right(),
