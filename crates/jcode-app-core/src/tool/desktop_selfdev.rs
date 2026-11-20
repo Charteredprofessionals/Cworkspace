@@ -470,7 +470,7 @@ async fn run_command(root: &Path, spec: CommandSpec, timeout: u64) -> Result<Too
         .spawn()
         .with_context(|| format!("Start {} in {}", spec.program, root.display()))?;
     #[cfg(windows)]
-    job_guard.assign_process(&child)?;
+    job_guard.assign_process(child.id().context("Missing child PID")?)?;
     let _group = ProcessGroup(child.id().context("Missing child PID")?);
     let stdout = child.stdout.take().context("Missing stdout")?;
     let stderr = child.stderr.take().context("Missing stderr")?;

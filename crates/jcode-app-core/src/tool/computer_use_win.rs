@@ -167,6 +167,7 @@ fn ensure_hotkey_listener() -> Result<()> {
                 .map_err(|error| format!("panic hotkey listener stopped: {error}"))?
         })
         .as_ref()
+        .copied()
         .map_err(|error| anyhow::anyhow!("cannot install Ctrl+Alt+Backspace kill switch: {error}"))
 }
 
@@ -208,7 +209,7 @@ static RATE_WINDOW_ACTIONS: AtomicU64 = AtomicU64::new(0);
 fn ensure_synthesis_rate_allowed() -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
+        .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default();
     let window_start = RATE_WINDOW_START_MILLIS.load(Ordering::SeqCst);
     if now.saturating_sub(window_start) >= RATE_WINDOW_MILLIS {
@@ -335,7 +336,7 @@ fn element_record(element: &UIElement) -> Option<UiElementRecord> {
         native_handle: element
             .get_native_window_handle()
             .ok()
-            .map(|handle| handle as isize),
+            .map(|handle| *handle.as_ref() as isize),
         left: bounds.get_left(),
         top: bounds.get_top(),
         right: bounds.get_right(),

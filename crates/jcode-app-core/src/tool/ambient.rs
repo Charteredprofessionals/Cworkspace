@@ -869,7 +869,7 @@ impl ScheduleTool {
                 let mut child = cmd.spawn().ok()?;
                 #[cfg(windows)]
                 if let Some(ref guard) = job_guard {
-                    if guard.assign_process(&child).is_err() {
+                    if guard.assign_process(child.id()).is_err() {
                         let _ = child.kill();
                         let _ = child.wait();
                         return None;

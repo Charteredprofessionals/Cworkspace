@@ -335,7 +335,7 @@ impl SelfDevTool {
         }
 
         #[cfg(windows)]
-        let job_guard = super::win_job::WinJobGuard::new()?;
+        let job_guard = crate::tool::win_job::WinJobGuard::new()?;
 
         let mut child = Command::new("git")
             .arg("clone")
@@ -345,8 +345,8 @@ impl SelfDevTool {
             .map_err(|e| anyhow::anyhow!("failed to run git clone: {e}"))?;
 
         #[cfg(windows)]
-        if let Err(error) = job_guard.assign_process(&child) {
-            let _ = child.start_kill();
+        if let Err(error) = job_guard.assign_process(child.id()) {
+            let _ = child.kill();
             let _ = child.wait();
             return Err(error.into());
         }

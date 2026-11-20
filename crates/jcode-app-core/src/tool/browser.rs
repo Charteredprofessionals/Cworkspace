@@ -1027,23 +1027,22 @@ async fn run_bridge_cli(
     {
         let _ = (use_session, ctx);
 
-        let mut command = std::process::Command::new(bin);
+        let mut command = tokio::process::Command::new(bin);
         command.arg(action).arg(params_json);
         command.stdin(std::process::Stdio::null());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         crate::browser::apply_bridge_browser_env(&mut command, browser);
 
-        let child = command
+        let mut child = command
             .spawn()
             .with_context(|| format!("Failed to run browser bridge action '{}'.", action))?;
-        if let Err(error) = job_guard.assign_process(&child) {
-            let _ = child.kill();
-            return Err(error.into());
+        if let Some(pid) = child.id() {
+            if let Err(error) = job_guard.assign_process(pid) {
+                let _ = child.start_kill();
+                return Err(error.into());
+            }
         }
-
-        // Convert std::process::Child to tokio::process::Child for async I/O
-        let mut child = tokio::process::Child::from_std(child)?;
 
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();

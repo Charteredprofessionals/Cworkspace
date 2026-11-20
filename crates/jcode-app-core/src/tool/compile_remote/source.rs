@@ -75,7 +75,7 @@ async fn git_output(root: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>>
             }
         }
         #[cfg(windows)]
-        let job_guard = super::win_job::WinJobGuard::new()?;
+        let job_guard = crate::tool::win_job::WinJobGuard::new()?;
         let mut child = command
             .args([
                 "-c",
@@ -93,7 +93,7 @@ async fn git_output(root: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>>
             .spawn()
             .context("launch git for source snapshot")?;
         #[cfg(windows)]
-        job_guard.assign_process(&child)?;
+        job_guard.assign_process(child.id().context("missing git pid")?)?;
         let stdout = child.stdout.take().context("missing git stdout")?;
         let mut output = Vec::new();
         stdout

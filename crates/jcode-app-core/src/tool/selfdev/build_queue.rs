@@ -102,7 +102,7 @@ export -f cargo
             .stderr(Stdio::piped());
 
         #[cfg(windows)]
-        let job_guard = super::win_job::WinJobGuard::new()?;
+        let job_guard = crate::tool::win_job::WinJobGuard::new()?;
 
         let mut child = cmd
             .spawn()
