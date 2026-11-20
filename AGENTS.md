@@ -1,7 +1,7 @@
 # AGENTS.md - jcode Production Application
 
 ## One-Paragraph App Summary
-jcode is a blazing-fast TUI multi-model coding agent with swarm coordination, 30+ tools, and desktop integration. Provides an interactive agent session via `jcode run` with a long-lived daemon at `~/.jcode/builds/shared-server/jcode`.
+Cworkspace ships the jcode CLI — a blazing-fast TUI multi-model coding agent with swarm coordination, 30+ tools, and desktop integration (interactive sessions via `jcode run`, long-lived daemon at `~/.jcode/builds/shared-server/jcode`) — together with the jcode Cowork desktop GUI (`gui/`, Tauri v2 + React), which drives the daemon over a capability-token-authenticated named pipe.
 
 ## Documentation Index - Read This When...
 
@@ -41,6 +41,8 @@ jcode is a blazing-fast TUI multi-model coding agent with swarm coordination, 30
 | `cargo check -p jcode-app-core` | Verify app core compiles |
 | `cargo test -p jcode-tool-core` | Run core crate tests |
 | `cargo test -p jcode-app-core` | Run app core tests |
+| `npm run tauri dev` (in `gui/`) | Run the Cowork desktop GUI in dev mode |
+| `npm run tauri build` (in `gui/`) | Bundle the Cowork desktop installer |
 | `jcode --version` | Show version info |
 | `scripts/install.sh` | Install stable channel |
 | `scripts/install_release.sh` | Install immutable release |
