@@ -720,7 +720,8 @@ pub async fn verify_copilot_credentials_live(client: &reqwest::Client) -> Result
 /// short-lived HTTP client. Useful for callers (e.g. the TUI crate) that do not
 /// depend on `reqwest` directly.
 pub async fn verify_copilot_credentials_live_default() -> Result<()> {
-    let client = reqwest::Client::new();
+    static VERIFY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = VERIFY_CLIENT.get_or_init(reqwest::Client::new);
     verify_copilot_credentials_live(&client).await
 }
 

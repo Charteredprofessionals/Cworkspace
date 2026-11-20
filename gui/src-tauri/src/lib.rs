@@ -323,7 +323,10 @@ fn ensure_connection(app: &AppHandle, bridge: &Bridge) -> Result<Arc<RpcConnecti
 
 #[tauri::command]
 async fn connect_daemon(app: AppHandle, bridge: State<'_, Bridge>) -> Result<(), String> {
-    ensure_connection(&app, &bridge).map(|_| ())
+    // Opening the pipe, the ping handshake, and the launch retry loop are
+    // blocking; keep them off the shared runtime workers so a slow daemon
+    // start never stalls other IPC commands.
+    tokio::task::block_in_place(|| ensure_connection(&app, &bridge)).map(|_| ())
 }
 
 fn canonical_folder(path: &str) -> Result<PathBuf, String> {
@@ -341,14 +344,17 @@ async fn mount_folder(
     path: String,
 ) -> Result<String, String> {
     let canonical = canonical_folder(&path)?;
-    let connection = ensure_connection(&app, &bridge)?;
-    connection.request(
-        "mount_folder",
-        json!({
-            "session_id": bridge.session_id(),
-            "path": canonical.to_string_lossy(),
-        }),
-    )?;
+    let mounted = tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request(
+            "mount_folder",
+            json!({
+                "session_id": bridge.session_id(),
+                "path": canonical.to_string_lossy(),
+            }),
+        )
+    });
+    mounted?;
     let mut roots = bridge
         .mounted_roots
         .lock()
@@ -366,14 +372,16 @@ async fn unmount_folder(
     path: String,
 ) -> Result<(), String> {
     let canonical = canonical_folder(&path)?;
-    let connection = ensure_connection(&app, &bridge)?;
-    connection.request(
-        "unmount_folder",
-        json!({
-            "session_id": bridge.session_id(),
-            "path": canonical.to_string_lossy(),
-        }),
-    )?;
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request(
+            "unmount_folder",
+            json!({
+                "session_id": bridge.session_id(),
+                "path": canonical.to_string_lossy(),
+            }),
+        )
+    })?;
     if let Ok(mut roots) = bridge.mounted_roots.lock() {
         roots.retain(|root| root != &canonical);
     }
@@ -403,14 +411,19 @@ async fn start_cowork_task(
     if allowed.is_empty() || allowed.iter().any(|path| !mounted.contains(path)) {
         return Err("Tasks can use only folders mounted in this session".to_owned());
     }
-    let connection = ensure_connection(&app, &bridge)?;
-    let response = connection.request(
-        "start_task",
-        json!({
-            "goal": goal,
-            "allowed_roots": allowed.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
-        }),
-    )?;
+    let response = tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request(
+            "start_task",
+            json!({
+                "goal": goal,
+                "allowed_roots": allowed
+                    .iter()
+                    .map(|path| path.to_string_lossy())
+                    .collect::<Vec<_>>(),
+            }),
+        )
+    })?;
     response
         .as_str()
         .or_else(|| response.get("task_id").and_then(Value::as_str))
@@ -424,8 +437,10 @@ async fn stop_task(
     bridge: State<'_, Bridge>,
     task_id: String,
 ) -> Result<(), String> {
-    let connection = ensure_connection(&app, &bridge)?;
-    connection.request("stop_task", json!({ "task_id": task_id }))?;
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("stop_task", json!({ "task_id": task_id }))
+    })?;
     Ok(())
 }
 
@@ -436,8 +451,10 @@ async fn respond_approval(
     id: Value,
     approved: bool,
 ) -> Result<(), String> {
-    let connection = ensure_connection(&app, &bridge)?;
-    connection.request("approve_tool_call", json!({ "id": id, "approved": approved }))?;
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("approve_tool_call", json!({ "id": id, "approved": approved }))
+    })?;
     Ok(())
 }
 
@@ -449,13 +466,34 @@ struct ArtifactPayload {
 }
 
 #[tauri::command]
-fn read_artifact(bridge: State<'_, Bridge>, path: String) -> Result<ArtifactPayload, String> {
-    let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
-    let mounted = bridge
+async fn read_artifact(
+    bridge: State<'_, Bridge>,
+    path: String,
+) -> Result<ArtifactPayload, String> {
+    // Reading + base64-encoding up to 30 MB used to run on the UI thread and
+    // froze the window on large artifacts; run it on the blocking pool with
+    // owned data instead.
+    let mounted_roots = bridge
         .mounted_roots
         .lock()
-        .map_err(|_| "Mounted folder state is unavailable".to_owned())?;
-    if !mounted.iter().any(|root| canonical.starts_with(root)) {
+        .map_err(|_| "Mounted folder state is unavailable".to_owned())?
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        read_artifact_blocking(mounted_roots, path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn read_artifact_blocking(
+    mounted_roots: Vec<PathBuf>,
+    path: String,
+) -> Result<ArtifactPayload, String> {
+    let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
+    if !mounted_roots
+        .iter()
+        .any(|root| canonical.starts_with(root))
+    {
         return Err("Artifact is outside the mounted workspace folders".to_owned());
     }
     let metadata = fs::metadata(&canonical).map_err(|error| error.to_string())?;

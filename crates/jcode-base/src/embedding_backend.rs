@@ -135,6 +135,21 @@ fn default_openai_dim(model: &str) -> usize {
     }
 }
 
+/// Shared blocking client for embeddings calls. Every memory save/recall used
+/// to build a fresh client per call, paying TCP+TLS handshake each time; the
+/// client is stateless and config-invariant, so one instance is reused.
+static EMBEDDING_HTTP_CLIENT: std::sync::OnceLock<reqwest::blocking::Client> =
+    std::sync::OnceLock::new();
+
+fn shared_embedding_client() -> &'static reqwest::blocking::Client {
+    EMBEDDING_HTTP_CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new())
+    })
+}
+
 impl OpenAiEmbeddingBackend {
     /// Construct a backend for `model`, resolving `base_url`/`dim` to sensible
     /// defaults when not supplied.
@@ -178,9 +193,7 @@ impl OpenAiEmbeddingBackend {
         let vectors = std::thread::scope(|scope| {
             scope
                 .spawn(move || -> Result<Vec<Vec<f32>>> {
-                    let client = reqwest::blocking::Client::builder()
-                        .timeout(std::time::Duration::from_secs(60))
-                        .build()?;
+                    let client = shared_embedding_client();
                     let body = serde_json::json!({
                         "model": model,
                         "input": inputs,

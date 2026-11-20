@@ -98,29 +98,29 @@ pub(super) async fn fetch_all_openai_usage_reports() -> Vec<ProviderUsage> {
     let accounts = auth::codex::list_accounts().unwrap_or_default();
     if !accounts.is_empty() {
         let active_label = auth::codex::active_account_label();
-        let mut reports = Vec::with_capacity(accounts.len());
-        for account in &accounts {
+        // Accounts are independent: fetch the reports concurrently instead of
+        // stacking N x RTT serially. join_all preserves input order, so the
+        // displayed report order is unchanged.
+        let reports = futures::future::join_all(accounts.iter().map(|account| {
             let display_name = openai_provider_display_name(
                 &account.label,
                 account.email.as_deref(),
                 accounts.len(),
                 active_label.as_deref() == Some(&account.label),
             );
-            reports.push(
-                fetch_openai_usage_for_account(
-                    display_name,
-                    auth::codex::CodexCredentials {
-                        access_token: account.access_token.clone(),
-                        refresh_token: account.refresh_token.clone(),
-                        id_token: account.id_token.clone(),
-                        account_id: account.account_id.clone(),
-                        expires_at: account.expires_at,
-                    },
-                    Some(account.label.as_str()),
-                )
-                .await,
-            );
-        }
+            fetch_openai_usage_for_account(
+                display_name,
+                auth::codex::CodexCredentials {
+                    access_token: account.access_token.clone(),
+                    refresh_token: account.refresh_token.clone(),
+                    id_token: account.id_token.clone(),
+                    account_id: account.account_id.clone(),
+                    expires_at: account.expires_at,
+                },
+                Some(account.label.as_str()),
+            )
+        }))
+        .await;
         return reports;
     }
 

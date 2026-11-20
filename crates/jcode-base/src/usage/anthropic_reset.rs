@@ -74,11 +74,18 @@ fn authorize(request: reqwest::RequestBuilder, access_token: &str) -> reqwest::R
 
 fn reset_client() -> Result<reqwest::Client> {
     // Never follow redirects with credentials or retry the claim automatically.
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(35))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("Could not create the Claude reset client")
+    // Built once and cloned (cheap Arc) instead of per call.
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(35))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(|error| anyhow::anyhow!("Could not create the Claude reset client: {error}"))
 }
 
 fn http_failure(status: reqwest::StatusCode) -> anyhow::Error {
