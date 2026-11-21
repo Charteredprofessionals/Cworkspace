@@ -150,6 +150,31 @@ type DaemonInfo = {
   log_path: string;
 };
 
+type ProjectMount = {
+  path: string;
+  access: "read_only" | "read_write";
+  added_at: string;
+};
+
+type Project = {
+  id: string;
+  name: string;
+  icon: string;
+  purpose: string;
+  instructions: string;
+  mounts: ProjectMount[];
+  model_default: string | null;
+  task_ids: string[];
+  created_at: string;
+  updated_at: string;
+};
+
+type ApprovalMode = "always_ask" | "auto_allow_readonly";
+
+/// Must match `cowork_rpc::PROTOCOL_VERSION`. The daemon bumps it on breaking
+/// RPC changes; the GUI warns instead of failing mysteriously on a mismatch.
+const PROTOCOL_VERSION = 2;
+
 const HISTORY_KEY = "jcode-cowork-history-v1";
 const SETTINGS_KEY = "cworkspace-settings-v1";
 const FOLDERS_KEY = "cworkspace-folders-v1";
@@ -262,7 +287,23 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [daemonInfo, setDaemonInfo] = useState<DaemonInfo | null>(null);
   const [models, setModels] = useState<ModelRoute[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState("");
+  const [projectDialogOpen, setProjectDialogOpen] = useState(false);
+  const [protocolWarning, setProtocolWarning] = useState("");
+  const [editingTitle, setEditingTitle] = useState<{ tabId: string; value: string } | null>(null);
   const goalInputRef = useRef<HTMLTextAreaElement>(null);
+
+  const activeProject = useMemo(
+    () => projects.find((project) => project.id === activeProjectId) ?? null,
+    [projects, activeProjectId],
+  );
+
+  function refreshProjects() {
+    invoke<{ projects?: Project[] }>("project_list")
+      .then((result) => setProjects(Array.isArray(result?.projects) ? result.projects : []))
+      .catch(() => setProjects([]));
+  }
 
   const activeTab = useMemo(
     () => tabs.find((tab) => tab.id === activeTabId) ?? tabs[0],
@@ -295,6 +336,21 @@ function App() {
       .then(async () => {
         if (cancelled) return;
         setDaemonStatus("connected");
+        // Protocol handshake (Milestone 0 exit criterion): a daemon whose
+        // protocol version predates the GUI's would fail every newer RPC with
+        // "Method not found" — surface that immediately instead.
+        invoke<DaemonInfo>("daemon_info")
+          .then((info) => {
+            setDaemonInfo(info);
+            const version = typeof info?.version === "number" ? info.version : 0;
+            if (version && version < PROTOCOL_VERSION) {
+              setProtocolWarning(
+                `The daemon is running protocol v${version}, this app expects v${PROTOCOL_VERSION}. Restart the app or reinstall to update jcode.exe.`,
+              );
+            }
+          })
+          .catch(() => undefined);
+        refreshProjects();
         const stored = loadStoredFolders();
         const { reopenFolders } = loadSettings();
         if (reopenFolders && stored.length) {
@@ -503,6 +559,46 @@ function App() {
     }
   }
 
+  // Project-scoped mounts carry an explicit access level; the daemon rejects
+  // structured writes into read-only folders before they touch disk.
+  async function mountProjectFolder(access: "read_only" | "read_write") {
+    if (!activeProject) return;
+    try {
+      const selected = await open({ directory: true, multiple: false, title: "Choose a folder for this project" });
+      if (typeof selected !== "string") return;
+      setBusy(true);
+      await invoke("mount_add", { projectId: activeProject.id, path: selected, access });
+      refreshProjects();
+      setDaemonStatus("connected");
+      if (activeTab) patchTab(activeTab.id, { error: "" });
+    } catch (reason) {
+      if (activeTab) patchTab(activeTab.id, { error: `Could not mount folder: ${errorMessage(reason)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revokeProjectMount(path: string) {
+    if (!activeProject) return;
+    try {
+      await invoke("mount_revoke", { projectId: activeProject.id, path });
+      refreshProjects();
+    } catch (reason) {
+      if (activeTab) patchTab(activeTab.id, { error: `Could not revoke folder: ${errorMessage(reason)}` });
+    }
+  }
+
+  async function createProject(name: string, purpose: string, instructions: string) {
+    const result = await invoke<{ project?: Project }>("project_create", {
+      name,
+      purpose,
+      instructions,
+    });
+    refreshProjects();
+    if (result?.project?.id) setActiveProjectId(result.project.id);
+    setProjectDialogOpen(false);
+  }
+
   async function startTask(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const tab = activeTab;
@@ -510,7 +606,11 @@ function App() {
     const goal = tab.goal.trim();
     if (!goal) return;
     patchTab(tab.id, { error: "", notice: "" });
-    if (!folders.length) {
+    if (activeProject && !activeProject.mounts.length) {
+      patchTab(tab.id, { error: "Mount a folder into this project before starting a task." });
+      return;
+    }
+    if (!activeProject && !folders.length) {
       patchTab(tab.id, { error: "Mount a workspace folder before starting a task." });
       return;
     }
@@ -525,7 +625,8 @@ function App() {
     try {
       const taskId = await invoke<string>("start_cowork_task", {
         goal,
-        allowedRoots: folders,
+        projectId: activeProject ? activeProject.id : undefined,
+        allowedRoots: activeProject ? [] : folders,
         model: settings.defaultModel || undefined,
       });
       patchTab(tab.id, {
@@ -619,19 +720,63 @@ function App() {
         </button>
 
         <section className="sidebar-section">
-          <div className="section-heading"><span>WORKSPACES</span><button className="icon-button small" aria-label="Mount folder" title="Mount folder" onClick={mountFolder}><FolderPlus size={15} /></button></div>
-          <button className="mount-row" onClick={mountFolder} disabled={busy}><Folder size={16} /><span>Mount a folder</span><Plus size={14} /></button>
-          <div className="folder-list">
-            {folders.map((path) => (
-              <div className="folder-item" key={path} title={path}>
-                <span className="folder-dot" />
-                <span className="folder-label">{folderName(path)}</span>
-                <button className="icon-button folder-remove" aria-label={`Unmount ${folderName(path)}`} title="Unmount folder" onClick={() => unmountFolder(path)}><X size={14} /></button>
-              </div>
+          <div className="section-heading"><span>PROJECTS</span><button className="icon-button small" aria-label="New project" title="New project" onClick={() => setProjectDialogOpen(true)}><Plus size={15} /></button></div>
+          <div className="project-list">
+            <button className={`project-item ${!activeProjectId ? "selected" : ""}`} onClick={() => setActiveProjectId("")} title="Ad-hoc tasks using session-mounted folders">
+              <span className="project-icon"><Sparkles size={14} /></span><span className="project-name">Ad-hoc sessions</span>
+            </button>
+            {projects.map((project) => (
+              <button
+                className={`project-item ${activeProjectId === project.id ? "selected" : ""}`}
+                key={project.id}
+                onClick={() => setActiveProjectId(project.id)}
+                title={project.purpose || project.name}
+              >
+                <span className="project-icon"><Folder size={14} /></span>
+                <span className="project-name">{project.name}</span>
+                <small className="project-count">{project.task_ids.length}</small>
+              </button>
             ))}
-            {!folders.length && <p className="sidebar-empty">Your folders stay yours. Mount one to begin.</p>}
+            {!projects.length && <p className="sidebar-empty">No projects yet. <button className="link-button" onClick={() => setProjectDialogOpen(true)}>Create one</button> to keep files, instructions, and history together.</p>}
           </div>
         </section>
+
+        {activeProject ? (
+          <section className="sidebar-section">
+            <div className="section-heading"><span>PROJECT FOLDERS</span><FolderPlus size={14} /></div>
+            <div className="mount-choices">
+              <button className="mount-choice" onClick={() => mountProjectFolder("read_write")} disabled={busy}><Folder size={15} /><span>Mount folder — read &amp; write</span></button>
+              <button className="mount-choice" onClick={() => mountProjectFolder("read_only")} disabled={busy}><Folder size={15} /><span>Mount folder — read only</span></button>
+            </div>
+            <div className="folder-list">
+              {activeProject.mounts.map((mount) => (
+                <div className="folder-item" key={mount.path} title={mount.path}>
+                  <span className={`folder-dot ${mount.access === "read_only" ? "readonly" : ""}`} />
+                  <span className="folder-label">{folderName(mount.path)}</span>
+                  <span className={`access-badge ${mount.access}`}>{mount.access === "read_only" ? "read-only" : "read/write"}</span>
+                  <button className="icon-button folder-remove" aria-label={`Revoke ${folderName(mount.path)}`} title="Revoke access" onClick={() => revokeProjectMount(mount.path)}><X size={14} /></button>
+                </div>
+              ))}
+              {!activeProject.mounts.length && <p className="sidebar-empty">Mount a folder to give this project a workspace.</p>}
+            </div>
+            <p className="sidebar-hint">Tasks in “{activeProject.name}” run only inside these folders — writes stay out of read-only mounts.</p>
+          </section>
+        ) : (
+          <section className="sidebar-section">
+            <div className="section-heading"><span>WORKSPACES</span><button className="icon-button small" aria-label="Mount folder" title="Mount folder" onClick={mountFolder}><FolderPlus size={15} /></button></div>
+            <button className="mount-row" onClick={mountFolder} disabled={busy}><Folder size={16} /><span>Mount a folder</span><Plus size={14} /></button>
+            <div className="folder-list">
+              {folders.map((path) => (
+                <div className="folder-item" key={path} title={path}>
+                  <span className="folder-dot" />
+                  <span className="folder-label">{folderName(path)}</span>
+                  <button className="icon-button folder-remove" aria-label={`Unmount ${folderName(path)}`} title="Unmount folder" onClick={() => unmountFolder(path)}><X size={14} /></button>
+                </div>
+              ))}
+              {!folders.length && <p className="sidebar-empty">Your folders stay yours. Mount one to begin.</p>}
+            </div>
+          </section>
+        )}
 
         <section className="sidebar-section models-section">
           <div className="section-heading"><span>MODELS</span><Sparkles size={14} /></div>
@@ -691,7 +836,27 @@ function App() {
                 title={tab.title}
               >
                 <span className={`tab-status ${tab.status} ${tab.status === "running" ? "pulse" : ""}`} />
-                <span className="tab-title">{tab.title}</span>
+                {editingTitle?.tabId === tab.id ? (
+                  <input
+                    className="tab-title-input"
+                    value={editingTitle.value}
+                    autoFocus
+                    aria-label="Tab title"
+                    onChange={(event) => setEditingTitle({ tabId: tab.id, value: event.target.value })}
+                    onClick={(event) => event.stopPropagation()}
+                    onBlur={() => { patchTab(tab.id, { title: editingTitle.value.trim() || tab.title }); setEditingTitle(null); }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") { patchTab(tab.id, { title: editingTitle.value.trim() || tab.title }); setEditingTitle(null); }
+                      if (event.key === "Escape") setEditingTitle(null);
+                    }}
+                  />
+                ) : (
+                  <span
+                    className="tab-title"
+                    onDoubleClick={(event) => { event.stopPropagation(); setEditingTitle({ tabId: tab.id, value: tab.title }); }}
+                    title={`${tab.title} — double-click to rename`}
+                  >{tab.title}</span>
+                )}
                 <button
                   className="icon-button tab-close"
                   aria-label={`Close ${tab.title}`}
@@ -712,14 +877,15 @@ function App() {
           </div>
 
           <form className="goal-form" onSubmit={startTask}>
-            <div className="goal-form-top"><Sparkles size={16} /><label htmlFor="goal-input">What would you like to get done?</label>{folders.length > 0 && <span className="root-count">{folders.length} {folders.length === 1 ? "folder" : "folders"} in scope</span>}</div>
+            <div className="goal-form-top"><Sparkles size={16} /><label htmlFor="goal-input">What would you like to get done?</label>{(activeProject ? activeProject.mounts.length : folders.length) > 0 && <span className="root-count">{activeProject ? `${activeProject.name} · ${activeProject.mounts.length} ${activeProject.mounts.length === 1 ? "folder" : "folders"}` : `${folders.length} ${folders.length === 1 ? "folder" : "folders"} in scope`}</span>}</div>
             <textarea id="goal-input" ref={goalInputRef} value={activeTab?.goal || ""} onChange={(event) => activeTab && patchTab(activeTab.id, { goal: event.target.value })} placeholder="Draft a project brief, audit these figures, prepare a polished report…" rows={3} disabled={activeTab?.status === "running"} />
             <div className="goal-form-bottom">
-              <span><CircleHelp size={14} /> {settings.defaultModel ? `Model: ${settings.defaultModel}` : "Your mounted folders define the workspace boundary."}</span>
+              <span><CircleHelp size={14} /> {settings.defaultModel ? `Model: ${settings.defaultModel}` : activeProject ? `Runs inside “${activeProject.name}” with its instructions and folders.` : "Your mounted folders define the workspace boundary."}</span>
               <button className="primary-action" type="submit" disabled={busy || activeTab?.status === "running" || !activeTab?.goal.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={15} fill="currentColor" />} Start task <ArrowUpRight size={15} /></button>
             </div>
           </form>
 
+          {protocolWarning && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{protocolWarning}</span><button className="icon-button" aria-label="Dismiss warning" onClick={() => setProtocolWarning("")}><X size={15} /></button></div>}
           {activeTab?.notice && <div className="info-banner" role="status"><Sparkles size={15} /><span>{activeTab.notice}</span><button className="icon-button" aria-label="Dismiss notice" onClick={() => patchTab(activeTab.id, { notice: "" })}><X size={14} /></button></div>}
           {activeTab?.error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{activeTab.error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => patchTab(activeTab.id, { error: "" })}><X size={15} /></button></div>}
 
@@ -754,8 +920,80 @@ function App() {
         onChange={updateSetting}
         onClose={() => setSettingsOpen(false)}
       />}
+
+      {projectDialogOpen && <ProjectDialog
+        onClose={() => setProjectDialogOpen(false)}
+        onCreate={createProject}
+      />}
     </main>
   </ErrorBoundary>);
+}
+
+function ProjectDialog({ onClose, onCreate }: {
+  onClose: () => void;
+  onCreate: (name: string, purpose: string, instructions: string) => Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [purpose, setPurpose] = useState("");
+  const [instructions, setInstructions] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!name.trim()) {
+      setError("Give the project a name.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await onCreate(name.trim(), purpose.trim(), instructions);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="settings-overlay" onClick={onClose} role="presentation">
+      <form className="settings-dialog" role="dialog" aria-modal="true" aria-label="New project" onSubmit={submit} onClick={(event) => event.stopPropagation()}>
+        <header className="settings-header">
+          <div><span className="feed-kicker">NEW PROJECT</span><h2>Create a project</h2></div>
+          <button type="button" className="icon-button" aria-label="Close project dialog" onClick={onClose}><X size={17} /></button>
+        </header>
+        <section className="settings-section">
+          <h3>Identity</h3>
+          <div className="settings-row static">
+            <span className="settings-copy"><strong>Name</strong><small>Shown in the sidebar; groups folders, instructions, and task history.</small></span>
+            <input className="settings-input" value={name} autoFocus aria-label="Project name" placeholder="Q4 Close" onChange={(event) => setName(event.target.value)} />
+          </div>
+          <div className="settings-row static">
+            <span className="settings-copy"><strong>Purpose</strong><small>One line describing what this project is for.</small></span>
+            <input className="settings-input" value={purpose} aria-label="Project purpose" placeholder="Finance workspace for the quarterly close" onChange={(event) => setPurpose(event.target.value)} />
+          </div>
+        </section>
+        <section className="settings-section">
+          <h3>Instructions</h3>
+          <textarea
+            className="settings-textarea"
+            value={instructions}
+            aria-label="Project instructions"
+            placeholder="Standing guidance for every task in this project — tone, formats, source-of-truth folders, review rules…"
+            rows={5}
+            onChange={(event) => setInstructions(event.target.value)}
+          />
+          <p className="sidebar-hint">Injected into every task the project starts. You can change it later in project settings.</p>
+        </section>
+        {error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{error}</span></div>}
+        <footer className="settings-footer">
+          <button type="button" className="secondary-action" onClick={onClose}>Cancel</button>
+          <button type="submit" className="primary-action" disabled={busy || !name.trim()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />} Create project</button>
+        </footer>
+      </form>
+    </div>
+  );
 }
 
 function SettingsDialog({ settings, models, daemonInfo, daemonStatus, onChange, onClose }: {
@@ -805,6 +1043,17 @@ function SettingsDialog({ settings, models, daemonInfo, daemonStatus, onChange, 
         </section>
 
         <section className="settings-section">
+          <h3>Capabilities</h3>
+          <ApprovalModeRow />
+          <div className="settings-row static">
+            <span className="settings-copy"><strong>Folder access</strong><small>Tasks read and write only inside folders you mount — per project, with explicit read-only or read/write access. Revoking a mount takes effect immediately.</small></span>
+          </div>
+          <div className="settings-row static">
+            <span className="settings-copy"><strong>Destructive actions</strong><small>Shell commands, file edits, office document creation, and computer control always wait for your approval, regardless of the mode above.</small></span>
+          </div>
+        </section>
+
+        <section className="settings-section">
           <h3>Connection</h3>
           <div className="settings-facts">
             <div><span>Daemon</span><strong>{daemonInfo ? `${daemonInfo.name} · v${String(daemonInfo.version)}` : daemonStatus === "connected" ? "connected" : daemonStatus}</strong></div>
@@ -814,6 +1063,47 @@ function SettingsDialog({ settings, models, daemonInfo, daemonStatus, onChange, 
           </div>
         </section>
       </div>
+    </div>
+  );
+}
+
+/// Approval policy selector backed by the daemon (settings.get/update) so the
+/// policy survives restarts and is enforced daemon-side, not just in the UI.
+function ApprovalModeRow() {
+  const [mode, setMode] = useState<ApprovalMode>("always_ask");
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<{ approval_mode?: ApprovalMode }>("settings_get")
+      .then((result) => {
+        if (!cancelled && result?.approval_mode) setMode(result.approval_mode);
+      })
+      .catch((reason) => { if (!cancelled) setError(errorMessage(reason)); })
+      .finally(() => { if (!cancelled) setLoaded(true); });
+    return () => { cancelled = true; };
+  }, []);
+
+  function choose(next: ApprovalMode) {
+    setMode(next);
+    invoke("settings_update", { approvalMode: next })
+      .then(() => setError(""))
+      .catch((reason) => setError(errorMessage(reason)));
+  }
+
+  return (
+    <div className="settings-row static approval-mode">
+      <span className="settings-copy"><strong>Approval mode</strong><small>
+        {mode === "always_ask"
+          ? "Every gated action asks first — the strict default."
+          : "Read-only tools (open files, search, web fetch) run without prompting; writes, shell commands, and computer control still ask."}
+      </small></span>
+      <div className="approval-mode-options">
+        <button type="button" className={`approval-option ${mode === "always_ask" ? "selected" : ""}`} disabled={!loaded} onClick={() => choose("always_ask")}><ShieldCheck size={14} /> Always ask</button>
+        <button type="button" className={`approval-option ${mode === "auto_allow_readonly" ? "selected" : ""}`} disabled={!loaded} onClick={() => choose("auto_allow_readonly")}><Sparkles size={14} /> Auto-allow read-only</button>
+      </div>
+      {error && <small className="settings-error">{error}</small>}
     </div>
   );
 }
@@ -887,7 +1177,7 @@ function ArtifactPreview({ artifact }: { artifact: Artifact | null }) {
     return () => { cancelled = true; };
   }, [artifact]);
 
-  if (!artifact) return <div className="preview-empty"><div className="preview-illustration"><FileText size={28} /><span /><i /></div><strong>A clear view of what’s done.</strong><p>Created files will appear here, ready to read without leaving your workspace.</p><div className="supported-formats"><span>MD</span><span>PDF</span><span>XLSX</span><span>DOCX</span></div></div>;
+  if (!artifact) return <div className="preview-empty"><div className="preview-illustration"><FileText size={28} /><span /><i /></div><strong>A clear view of what’s done.</strong><p>Created files will appear here, ready to read without leaving your workspace.</p><div className="supported-formats"><span>MD</span><span>PDF</span><span>XLSX</span><span>DOCX</span><span>PPTX</span></div></div>;
   if (!preview || preview.status === "loading") return <div className="preview-message"><LoaderCircle className="spin" size={19} /><span>Opening {folderName(artifact.path)}…</span></div>;
   if (preview.status === "error") return <div className="preview-message preview-error"><AlertCircle size={18} /><span>{preview.message}</span></div>;
   if (preview.status === "pdf") return <div className="pdf-preview"><div className="preview-file-title"><FileText size={15} /><span>{preview.payload.name}</span></div><iframe title={`Preview of ${preview.payload.name}`} src={preview.url} /></div>;

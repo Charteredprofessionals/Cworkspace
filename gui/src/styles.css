@@ -335,3 +335,41 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #728772; outli
 @media (prefers-reduced-motion: reduce) {
   .spin, .pulse-dot, .status-light.working, .tab-status.running { animation: none; }
 }
+
+/* ---- Projects (Milestone 1) ---- */
+.project-list { display: flex; flex-direction: column; gap: 2px; }
+.project-item { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 8px; border: 0; border-radius: 4px; background: transparent; color: var(--ink); font-size: 11.5px; cursor: pointer; text-align: left; }
+.project-item:hover { background: #e3e2da; }
+.project-item.selected { background: #e9e7dc; font-weight: 600; }
+.project-icon { display: inline-flex; color: #7a776c; }
+.project-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-count { color: #8a877c; font-size: 10px; }
+.link-button { border: 0; background: none; padding: 0; color: inherit; font: inherit; text-decoration: underline; cursor: pointer; }
+
+.mount-choices { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.mount-choice { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 9px; border: 1px solid #d7d6cd; border-radius: 5px; background: #fffefa; color: var(--ink); font-size: 11px; cursor: pointer; }
+.mount-choice:hover { border-color: #b8b6a8; background: #f4f2ea; }
+.mount-choice:disabled { opacity: 0.55; cursor: default; }
+
+.folder-dot.readonly { background: #b8b6a8; }
+.access-badge { flex: 0 0 auto; font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 5px; border-radius: 3px; }
+.access-badge.read_write { background: #e2eee9; color: #256a52; }
+.access-badge.read_only { background: #edeae0; color: #7a6f52; }
+
+.tab-title-input { flex: 1; min-width: 0; width: 100%; font: inherit; font-size: 11px; padding: 1px 4px; border: 1px solid #b8b6a8; border-radius: 3px; background: #fffefa; color: var(--ink); }
+
+.settings-input { flex: 0 0 auto; width: 210px; max-width: 100%; height: 30px; padding: 0 8px; border: 1px solid #d7d6cd; border-radius: 4px; background: #fffefa; color: var(--ink); font-size: 11px; }
+.settings-textarea { width: 100%; padding: 8px; border: 1px solid #d7d6cd; border-radius: 5px; background: #fffefa; color: var(--ink); font-size: 11.5px; line-height: 1.5; resize: vertical; }
+.settings-footer { display: flex; justify-content: flex-end; gap: 8px; padding-top: 14px; border-top: 1px solid #e5e3da; }
+.secondary-action { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border: 1px solid #d7d6cd; border-radius: 6px; background: transparent; color: var(--ink); font-size: 11.5px; font-weight: 600; cursor: pointer; }
+.secondary-action:hover { background: #f4f2ea; }
+.approval-mode-options { display: flex; gap: 6px; flex: 0 0 auto; }
+.approval-option { display: inline-flex; align-items: center; gap: 6px; padding: 7px 10px; border: 1px solid #d7d6cd; border-radius: 5px; background: #fffefa; color: var(--ink); font-size: 10.5px; font-weight: 600; cursor: pointer; }
+.approval-option.selected { border-color: #256a52; background: #e2eee9; color: #256a52; }
+.approval-option:disabled { opacity: 0.6; cursor: default; }
+.settings-error { color: #b3261e; font-size: 10.5px; }
+
+@media (max-width: 720px) {
+  .approval-mode-options { flex-direction: column; width: 100%; }
+  .settings-input { width: 100%; }
+}

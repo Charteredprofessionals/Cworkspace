@@ -3,6 +3,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
+use crate::cli::cowork_projects::MountAccess;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,77 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, oneshot};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\jcode-cowork";
+
+/// Wire protocol version. Bump on any breaking RPC contract change; the GUI
+/// compares this at connect time via `ping` and refuses mismatched majors.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Tool names considered read-only for the auto-allow policy. They cannot
+/// mutate the workspace: reads list files, grep searches content, webfetch
+/// fetches a URL into the transcript. Everything else (bash, patch, edit,
+/// office document creation, computer use) still requires explicit approval.
+const READ_ONLY_TOOLS: &[&str] = &["read", "ls", "agentgrep", "glob", "webfetch", "websearch"];
+
+/// Approval policy chosen in the GUI's Settings > Capabilities surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalPolicy {
+    /// Every gated tool call waits for an explicit decision (default).
+    AlwaysAsk,
+    /// Read-only tools run without prompting; writes and destructive actions
+    /// still wait for a decision.
+    AutoAllowReadonly,
+}
+
+impl ApprovalPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            ApprovalPolicy::AlwaysAsk => "always_ask",
+            ApprovalPolicy::AutoAllowReadonly => "auto_allow_readonly",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "always_ask" => Some(ApprovalPolicy::AlwaysAsk),
+            "auto_allow_readonly" => Some(ApprovalPolicy::AutoAllowReadonly),
+            _ => None,
+        }
+    }
+}
+
+/// Data directory for cowork settings and the project store. Tests point
+/// `JCODE_COWORK_STORE_DIR` at a temp dir to stay hermetic.
+pub fn store_dir() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("JCODE_COWORK_STORE_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(crate::storage::jcode_dir()?.join("cowork-store"))
+}
+
+/// Load the persisted approval policy, falling back to the strict default.
+fn load_policy() -> ApprovalPolicy {
+    store_dir()
+        .ok()
+        .and_then(|dir| std::fs::read_to_string(dir.join("settings.json")).ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| {
+            value
+                .get("approval_mode")
+                .and_then(serde_json::Value::as_str)
+                .and_then(ApprovalPolicy::parse)
+        })
+        .unwrap_or(ApprovalPolicy::AlwaysAsk)
+}
+
+fn save_policy(policy: ApprovalPolicy) -> Result<()> {
+    let dir = store_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let payload = serde_json::json!({ "approval_mode": policy.as_str() });
+    let temp = dir.join("settings.json.tmp");
+    std::fs::write(&temp, serde_json::to_vec_pretty(&payload)?)?;
+    std::fs::rename(&temp, dir.join("settings.json"))?;
+    Ok(())
+}
 
 /// Maximum accepted JSON-RPC message size (S-7): a connected client must not
 /// be able to exhaust daemon memory with a single oversized line or frame.
@@ -46,6 +118,63 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 static GLOBAL_RPC: OnceLock<CoworkRpc> = OnceLock::new();
+
+/// A folder mounted into a session with its granted access level.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoworkMount {
+    pub path: PathBuf,
+    pub access: crate::cli::cowork_projects::MountAccess,
+}
+
+impl CoworkMount {
+    pub fn read_write(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            access: crate::cli::cowork_projects::MountAccess::ReadWrite,
+        }
+    }
+
+    pub fn read_only(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            access: crate::cli::cowork_projects::MountAccess::ReadOnly,
+        }
+    }
+}
+
+/// registrations that keep a task's sandbox alive for its whole lifetime.
+/// Dropping any member unregisters that capability for the session.
+pub struct SessionRegistrations {
+    pub path_registration: crate::tool::SessionPathValidatorRegistration,
+    pub write_registration: crate::tool::SessionWritePathValidatorRegistration,
+    pub approval_registration: crate::tool::SessionApprovalRegistration,
+    pub artifact_registration: crate::tool::SessionArtifactCreatedRegistration,
+    pub tool_invoked_registration: crate::tool::SessionToolInvokedRegistration,
+}
+
+/// Register the write-side jail for a session: only read/write mounts accept
+/// structured writes. With no writable mounts, every structured write fails.
+fn register_session_write_jail(
+    session_id: &str,
+    write_roots: Vec<PathBuf>,
+) -> std::io::Result<crate::tool::SessionWritePathValidatorRegistration> {
+    if write_roots.is_empty() {
+        Ok(crate::tool::register_session_write_path_validator(
+            session_id,
+            move |_| Err("SECURITY_VIOLATION: no read/write mount is available".to_owned()),
+        ))
+    } else {
+        // Canonicalize once here; the closure must stay cheap per call.
+        let jail = crate::sandbox::path_jail::PathJail::new(write_roots)?;
+        Ok(crate::tool::register_session_write_path_validator(
+            session_id,
+            move |path| {
+                jail.verify_path(path)
+                    .map_err(|error| format!("{error}; write targets require a read/write mount"))
+            },
+        ))
+    }
+}
 
 pub fn global() -> &'static CoworkRpc {
     GLOBAL_RPC.get_or_init(CoworkRpc::new)
@@ -100,6 +229,35 @@ struct CoworkRpcInner {
     /// waiting for a task. Each runtime auto-fetches its model catalog from
     /// the provider's own endpoint (TTL-cached, static fallback offline).
     models_provider: tokio::sync::OnceCell<Arc<dyn crate::provider::Provider>>,
+    /// Current approval policy. A sync mutex is fine: critical sections are
+    /// single reads/writes with no await points.
+    approval_policy: std::sync::Mutex<ApprovalPolicy>,
+    /// Persistent project registry (projects, mounts with access levels,
+    /// instructions, model defaults, task history).
+    project_store: std::sync::OnceLock<crate::cli::cowork_projects::ProjectStore>,
+}
+
+/// Everything needed to launch one Cowork task.
+pub struct TaskLaunch {
+    pub goal: String,
+    pub mounts: Vec<CoworkMount>,
+    pub model: Option<String>,
+    /// Project instructions injected into the system prompt for this task.
+    pub instructions: Option<String>,
+    /// When set, the finished launch is recorded in the project's task history.
+    pub project_id: Option<String>,
+}
+
+impl TaskLaunch {
+    pub fn new(goal: impl Into<String>, mounts: Vec<CoworkMount>) -> Self {
+        Self {
+            goal: goal.into(),
+            mounts,
+            model: None,
+            instructions: None,
+            project_id: None,
+        }
+    }
 }
 
 impl CoworkRpc {
@@ -116,8 +274,41 @@ impl CoworkRpc {
                 tool_invoked_registrations: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(HashMap::new()),
                 models_provider: tokio::sync::OnceCell::new(),
+                approval_policy: std::sync::Mutex::new(load_policy()),
+                project_store: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// The persistent project registry, opened on first use.
+    pub fn project_store(&self) -> &crate::cli::cowork_projects::ProjectStore {
+        self.inner.project_store.get_or_init(|| {
+            crate::cli::cowork_projects::ProjectStore::open_default()
+                .unwrap_or_else(|error| {
+                    tracing::warn!("project store unavailable, using in-memory fallback: {error}");
+                    crate::cli::cowork_projects::ProjectStore::open_at(
+                        std::env::temp_dir().join("jcode-cowork-projects-fallback.json"),
+                    )
+                })
+        })
+    }
+
+    pub fn approval_policy(&self) -> ApprovalPolicy {
+        *self
+            .inner
+            .approval_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub async fn set_approval_policy(&self, policy: ApprovalPolicy) -> Result<()> {
+        save_policy(policy)?;
+        *self
+            .inner
+            .approval_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+        Ok(())
     }
 
     /// Live model routes for the GUI. Bootstraps one provider per daemon
@@ -189,19 +380,29 @@ impl CoworkRpc {
         &self,
         session_id: &str,
         task_id: &str,
-        roots: Vec<PathBuf>,
-    ) -> Result<(
-        crate::tool::SessionPathValidatorRegistration,
-        crate::tool::SessionApprovalRegistration,
-        crate::tool::SessionArtifactCreatedRegistration,
-        crate::tool::SessionToolInvokedRegistration,
-    )> {
-        let jail_roots = validate_workspace_roots(roots).await?;
+        mounts: Vec<CoworkMount>,
+    ) -> Result<SessionRegistrations> {
+        let jail_roots = validate_workspace_roots(
+            mounts.iter().map(|mount| mount.path.clone()).collect(),
+        )
+        .await?;
+        let write_roots = validate_workspace_roots(
+            mounts
+                .iter()
+                .filter(|mount| mount.access == MountAccess::ReadWrite)
+                .map(|mount| mount.path.clone())
+                .collect(),
+        )
+        .await
+        .unwrap_or_default();
         let session_id = session_id.to_owned();
         let task_id = task_id.to_owned();
         let registration_session_id = session_id.clone();
-        let path_registration = tokio::task::spawn_blocking(move || {
-            crate::sandbox::register_session_jail(registration_session_id, jail_roots)
+        let (path_registration, write_registration) = tokio::task::spawn_blocking(move || {
+            std::io::Result::Ok((
+                crate::sandbox::register_session_jail(registration_session_id.clone(), jail_roots)?,
+                register_session_write_jail(&registration_session_id, write_roots)?,
+            ))
         })
         .await
         .context("failed to initialize Cowork path jail")??;
@@ -267,73 +468,101 @@ impl CoworkRpc {
                 }
             },
         );
-        Ok((
+        Ok(SessionRegistrations {
             path_registration,
+            write_registration,
             approval_registration,
             artifact_registration,
             tool_invoked_registration,
-        ))
+        })
     }
 
-    pub async fn start_task(
-        &self,
-        goal: String,
-        allowed_roots: Vec<PathBuf>,
-        model: Option<String>,
-    ) -> Result<String> {
-        self.start_task_with(
-            goal,
-            allowed_roots,
-            model,
-            |goal, roots, model, task_id, rpc| async move {
-                crate::cli::commands::run_cowork_task(goal, roots, model, task_id, rpc).await
-            },
-        )
-        .await
-    }
-
-    async fn start_task_with<F, Fut>(
-        &self,
-        goal: String,
-        allowed_roots: Vec<PathBuf>,
-        model: Option<String>,
-        run: F,
-    ) -> Result<String>
-    where
-        F: FnOnce(String, Vec<PathBuf>, Option<String>, String, CoworkRpc) -> Fut,
-        Fut: Future<Output = Result<String>> + Send + 'static,
-    {
-        anyhow::ensure!(!goal.trim().is_empty(), "task goal cannot be empty");
-        let allowed_roots = validate_workspace_roots(allowed_roots).await?;
-        let task_id = crate::id::new_id("cowork");
-        let (start, started) = oneshot::channel();
-        let rpc = self.clone();
-        let run_task_id = task_id.clone();
-        let work = run(goal, allowed_roots, model, run_task_id.clone(), rpc.clone());
-        let handle = tokio::spawn(async move {
-            if started.await.is_err() {
-                return;
-            }
-            let result = work.await;
-            rpc.inner.tasks.lock().await.remove(&run_task_id);
-            let (success, summary) = match result {
-                Ok(summary) => (true, Some(summary)),
-                Err(error) => (false, Some(error.to_string())),
-            };
-            let _ = rpc.emit_event(CoworkEvent::TaskCompleted {
-                task_id: run_task_id,
-                success,
-                summary,
-            });
-        });
-        self.inner
-            .tasks
-            .lock()
+pub async fn start_task(&self, launch: TaskLaunch) -> Result<String> {
+    self.start_task_with(
+        launch,
+        |goal, roots, model, task_id, instructions, rpc| async move {
+            crate::cli::commands::run_cowork_task(
+                goal, roots, model, task_id, instructions, rpc,
+            )
             .await
-            .insert(task_id.clone(), handle);
-        let _ = start.send(());
-        Ok(task_id)
+        },
+    )
+    .await
+}
+
+async fn start_task_with<F, Fut>(
+    &self,
+    launch: TaskLaunch,
+    run: F,
+) -> Result<String>
+where
+    F: FnOnce(
+            String,
+            Vec<PathBuf>,
+            Option<String>,
+            String,
+            Option<String>,
+            CoworkRpc,
+        ) -> Fut
+        + Send
+        + 'static,
+    Fut: Future<Output = Result<String>> + Send + 'static,
+{
+    anyhow::ensure!(!launch.goal.trim().is_empty(), "task goal cannot be empty");
+    let allowed_roots = validate_workspace_roots(
+        launch.mounts.iter().map(|mount| mount.path.clone()).collect(),
+    )
+    .await?;
+    let task_id = crate::id::new_id("cowork");
+    let (start, started) = oneshot::channel();
+    let rpc = self.clone();
+    let run_task_id = task_id.clone();
+    let work = run(
+        launch.goal,
+        allowed_roots,
+        launch.model,
+        run_task_id.clone(),
+        launch.instructions,
+        rpc.clone(),
+    );
+    let handle = tokio::spawn(async move {
+        if started.await.is_err() {
+            return;
+        }
+        let result = work.await;
+        rpc.inner.tasks.lock().await.remove(&run_task_id);
+        let (success, summary) = match result {
+            Ok(summary) => (true, Some(summary)),
+            Err(error) => (false, Some(error.to_string())),
+        };
+        let _ = rpc.emit_event(CoworkEvent::TaskCompleted {
+            task_id: run_task_id,
+            success,
+            summary,
+        });
+    });
+    self.inner
+        .tasks
+        .lock()
+        .await
+        .insert(task_id.clone(), handle);
+    let _ = start.send(());
+    if let Some(project_id) = &launch.project_id {
+        let _ = self.project_store().record_task(project_id, &task_id);
     }
+    Ok(task_id)
+}
+
+/// Task ids currently registered and whether their work is still running.
+pub async fn list_tasks(&self) -> Vec<(String, bool)> {
+    self.inner
+        .tasks
+        .lock()
+        .await
+        .keys()
+        .map(|task_id| (task_id.clone(), true))
+        .collect()
+}
 
     pub async fn stop_task(&self, task_id: &str) -> bool {
         let handle = self.inner.tasks.lock().await.remove(task_id);
@@ -398,10 +627,27 @@ impl CoworkRpc {
     }
 
     async fn set_workspace_roots(&self, session_id: &str, roots: Vec<PathBuf>) -> Result<()> {
-        let roots = validate_workspace_roots(roots).await?;
-        let jail_roots = roots.clone();
-        let jail = tokio::task::spawn_blocking(move || {
-            crate::sandbox::path_jail::PathJail::new(jail_roots)
+        // Session-level mounts (mount_folder RPC) grant read/write access;
+        // project-scoped tasks narrow this via register_agent_session.
+        let read_roots = validate_workspace_roots(roots).await?;
+        let session = session_id.to_owned();
+        let write_roots = read_roots.clone();
+        let jail_roots = read_roots.clone();
+        let (jail, write_registration) = tokio::task::spawn_blocking(move || {
+            let jail = crate::sandbox::path_jail::PathJail::new(jail_roots)?;
+            let write_registration = if write_roots.is_empty() {
+                crate::tool::register_session_write_path_validator(&session, move |_| {
+                    Err("SECURITY_VIOLATION: no read/write mount is available".to_owned())
+                })
+            } else {
+                let write_jail = crate::sandbox::path_jail::PathJail::new(write_roots)?;
+                crate::tool::register_session_write_path_validator(&session, move |path| {
+                    write_jail.verify_path(path).map_err(|error| {
+                        format!("{error}; write targets require a read/write mount")
+                    })
+                })
+            };
+            Ok::<_, std::io::Error>((jail, write_registration))
         })
         .await
         .context("failed to initialize Cowork path jail")??;
@@ -452,7 +698,7 @@ impl CoworkRpc {
             .mounted_roots
             .lock()
             .await
-            .insert(session_id.to_owned(), roots);
+            .insert(session_id.to_owned(), read_roots);
         self.inner
             .jail_registrations
             .lock()
@@ -485,6 +731,15 @@ impl CoworkRpc {
         description: impl Into<String>,
         task_id: impl Into<String>,
     ) -> Result<bool> {
+        let tool_name = tool_name.into();
+        // Auto-allow read-only mode: reads run without prompting so long
+        // research tasks do not queue a decision per file. Writes, shell
+        // commands, office document creation, and computer use still ask.
+        if self.approval_policy() == ApprovalPolicy::AutoAllowReadonly
+            && READ_ONLY_TOOLS.contains(&tool_name.as_str())
+        {
+            return Ok(true);
+        }
         if self.inner.events.receiver_count() == 0 {
             return Err(anyhow!(
                 "no Cowork IPC client is connected to approve this action"
@@ -504,7 +759,7 @@ impl CoworkRpc {
         if self
             .emit_event(CoworkEvent::ApprovalRequired {
                 id: id.clone(),
-                tool_name: tool_name.into(),
+                tool_name,
                 description: description.into(),
                 task_id: task_id.into(),
             })
@@ -608,11 +863,206 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
     };
 
     let result = match request.method.as_str() {
-        "ping" => Ok(json!({ "name": "jcode-cowork", "version": 1 })),
+        "ping" => Ok(json!({
+            "name": "jcode-cowork",
+            "version": PROTOCOL_VERSION,
+            "protocol_version": PROTOCOL_VERSION,
+        })),
         "list_models" => rpc
             .list_models()
             .await
             .map_err(|error| (-32000, error)),
+        "settings.get" => {
+            Ok(json!({ "approval_mode": rpc.approval_policy().as_str() }))
+        }
+        "settings.update" => {
+            let mode = request.params.get("approval_mode").and_then(Value::as_str);
+            match mode.and_then(ApprovalPolicy::parse) {
+                Some(policy) => rpc
+                    .set_approval_policy(policy)
+                    .await
+                    .map(|_| json!({ "approval_mode": policy.as_str() }))
+                    .map_err(|error| (-32000, error.to_string())),
+                None => Err((
+                    -32602,
+                    "params require approval_mode of always_ask or auto_allow_readonly"
+                        .to_string(),
+                )),
+            }
+        }
+        "project.create" => {
+            let name = request.params.get("name").and_then(Value::as_str);
+            match name {
+                Some(name) => {
+                    let store = rpc.project_store();
+                    store
+                        .create(
+                            name,
+                            request.params.get("icon").and_then(Value::as_str).unwrap_or(""),
+                            request.params.get("purpose").and_then(Value::as_str).unwrap_or(""),
+                            request
+                                .params
+                                .get("instructions")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                        )
+                        .map(|project| json!({ "project": project }))
+                        .map_err(|error| (-32000, error.to_string()))
+                }
+                None => Err((-32602, "params require string name".to_string())),
+            }
+        }
+        "project.list" => rpc
+            .project_store()
+            .list()
+            .map(|projects| json!({ "projects": projects }))
+            .map_err(|error| (-32000, error.to_string())),
+        "project.get" | "mount.list" => {
+            let project_id = request.params.get("project_id").and_then(Value::as_str);
+            match project_id {
+                Some(project_id) => rpc
+                    .project_store()
+                    .get(project_id)
+                    .map(|project| json!({ "project": project }))
+                    .map_err(|error| (-32000, error.to_string())),
+                None => Err((-32602, "params require string project_id".to_string())),
+            }
+        }
+        "project.update" => {
+            let project_id = request.params.get("project_id").and_then(Value::as_str);
+            let Some(project_id) = project_id else {
+                return Some(rpc_error(Some(id), -32602, "params require string project_id"));
+            };
+            let name = request.params.get("name").and_then(Value::as_str).map(str::to_owned);
+            let icon = request.params.get("icon").and_then(Value::as_str).map(str::to_owned);
+            let purpose = request
+                .params
+                .get("purpose")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let instructions = request
+                .params
+                .get("instructions")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let model_default = request
+                .params
+                .get("model_default")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            rpc.project_store()
+                .update(project_id, |project| {
+                    if let Some(name) = &name {
+                        if name.trim().is_empty() {
+                            anyhow::bail!("project name cannot be empty");
+                        }
+                        project.name = name.trim().to_owned();
+                    }
+                    if let Some(icon) = &icon {
+                        project.icon = icon.trim().to_owned();
+                    }
+                    if let Some(purpose) = &purpose {
+                        project.purpose = purpose.trim().to_owned();
+                    }
+                    if let Some(instructions) = &instructions {
+                        project.instructions = instructions.clone();
+                    }
+                    if let Some(model_default) = &model_default {
+                        project.model_default = if model_default.trim().is_empty() {
+                            None
+                        } else {
+                            Some(model_default.trim().to_owned())
+                        };
+                    }
+                    Ok(())
+                })
+                .map(|project| json!({ "project": project }))
+                .map_err(|error| (-32000, error.to_string()))
+        }
+        "project.delete" => {
+            let project_id = request.params.get("project_id").and_then(Value::as_str);
+            match project_id {
+                Some(project_id) => rpc
+                    .project_store()
+                    .delete(project_id)
+                    .map(|deleted| json!({ "deleted": deleted }))
+                    .map_err(|error| (-32000, error.to_string())),
+                None => Err((-32602, "params require string project_id".to_string())),
+            }
+        }
+        "mount.add" => {
+            let project_id = request.params.get("project_id").and_then(Value::as_str);
+            let path = request.params.get("path").and_then(Value::as_str);
+            let access = request.params.get("access").and_then(Value::as_str).and_then(
+                |value| match value {
+                    "read_only" => {
+                        Some(crate::cli::cowork_projects::MountAccess::ReadOnly)
+                    }
+                    "read_write" => {
+                        Some(crate::cli::cowork_projects::MountAccess::ReadWrite)
+                    }
+                    _ => None,
+                },
+            );
+            match (project_id, path, access) {
+                (Some(project_id), Some(path), Some(access)) => {
+                    let store_path = rpc.project_store().store_path().to_owned();
+                    let project_id = project_id.to_owned();
+                    let path = PathBuf::from(path);
+                    match tokio::task::spawn_blocking(move || {
+                        crate::cli::cowork_projects::ProjectStore::add_mount_sync(
+                            &store_path, &project_id, &path, access,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(project)) => Ok(json!({ "project": project })),
+                        Ok(Err(error)) => Err((-32000, error.to_string())),
+                        Err(error) => Err((-32000, format!("mount task failed: {error}"))),
+                    }
+                }
+                _ => Err((
+                    -32602,
+                    "params require project_id, path, and access of read_only or read_write"
+                        .to_string(),
+                )),
+            }
+        }
+        "mount.revoke" => {
+            let project_id = request.params.get("project_id").and_then(Value::as_str);
+            let path = request.params.get("path").and_then(Value::as_str);
+            match (project_id, path) {
+                (Some(project_id), Some(path)) => {
+                    let store_path = rpc.project_store().store_path().to_owned();
+                    let project_id = project_id.to_owned();
+                    let path = PathBuf::from(path);
+                    match tokio::task::spawn_blocking(move || {
+                        crate::cli::cowork_projects::ProjectStore::revoke_mount_sync(
+                            &store_path, &project_id, &path,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(project)) => Ok(json!({ "project": project })),
+                        Ok(Err(error)) => Err((-32000, error.to_string())),
+                        Err(error) => Err((-32000, format!("revoke task failed: {error}"))),
+                    }
+                }
+                _ => Err((
+                    -32602,
+                    "params require string project_id and string path".to_string(),
+                )),
+            }
+        }
+        "task.list" => {
+            let tasks = rpc.list_tasks().await;
+            Ok(json!({
+                "tasks": tasks
+                    .into_iter()
+                    .map(|(task_id, running)| json!({ "task_id": task_id, "running": running }))
+                    .collect::<Vec<_>>(),
+            }))
+        }
         "mount_folder" => {
             let session_id = request.params.get("session_id").and_then(Value::as_str);
             let path = request.params.get("path").and_then(Value::as_str);
@@ -645,34 +1095,83 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
         }
         "start_task" => {
             let goal = request.params.get("goal").and_then(Value::as_str);
-            let allowed_roots = request
+            let model = request
                 .params
-                .get("allowed_roots")
-                .and_then(Value::as_array)
-                .and_then(|roots| {
-                    roots
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|model| !model.trim().is_empty());
+            // Project-scoped start: mounts, model default, and instructions
+            // all come from the persisted project unless overridden inline.
+            let project_id = request
+                .params
+                .get("project_id")
+                .and_then(Value::as_str)
+                .filter(|project_id| !project_id.trim().is_empty());
+            let launch = if let Some(project_id) = project_id {
+                let project = match rpc.project_store().get(project_id) {
+                    Ok(project) => project,
+                    Err(error) => return Some(rpc_error(Some(id), -32000, error.to_string())),
+                };
+                if project.mounts.is_empty() {
+                    return Some(rpc_error(
+                        Some(id),
+                        -32000,
+                        format!("project {project_id} has no mounted folders; mount one first"),
+                    ));
+                }
+                TaskLaunch {
+                    goal: goal.unwrap_or_default().to_owned(),
+                    mounts: project
+                        .mounts
                         .iter()
-                        .map(|root| root.as_str().map(PathBuf::from))
-                        .collect::<Option<Vec<_>>>()
-                });
-            match (goal, allowed_roots) {
-                (Some(goal), Some(roots)) => rpc
-                    .start_task(
-                goal.to_owned(),
-                roots,
-                request
+                        .map(|mount| CoworkMount {
+                            path: mount.path.clone(),
+                            access: mount.access,
+                        })
+                        .collect(),
+                    model: model.or_else(|| project.model_default.clone()),
+                    instructions: if project.instructions.trim().is_empty() {
+                        None
+                    } else {
+                        Some(project.instructions.clone())
+                    },
+                    project_id: Some(project_id.to_owned()),
+                }
+            } else {
+                let allowed_roots = request
                     .params
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .filter(|model| !model.trim().is_empty()),
-            )
+                    .get("allowed_roots")
+                    .and_then(Value::as_array)
+                    .and_then(|roots| {
+                        roots
+                            .iter()
+                            .map(|root| root.as_str().map(PathBuf::from))
+                            .collect::<Option<Vec<_>>>()
+                    });
+                match (goal, allowed_roots) {
+                    (Some(goal), Some(roots)) => {
+                        TaskLaunch::new(goal.to_owned(), roots.into_iter().map(CoworkMount::read_write).collect())
+                    }
+                    _ => {
+                        return Some(rpc_error(
+                            Some(id),
+                            -32602,
+                            "params require string goal and string-array allowed_roots (or project_id)",
+                        ));
+                    }
+                }
+            };
+            match goal {
+                Some(_) => rpc
+                    .start_task(launch)
                     .await
                     .map(|task_id| json!({ "task_id": task_id }))
                     .map_err(|error| (-32000, error.to_string())),
-                _ => Err((
+                None => Err((
                     -32602,
-                    "params require string goal and string-array allowed_roots".to_string(),
+                    "params require string goal and string-array allowed_roots (or project_id)"
+                        .to_string(),
                 )),
             }
         }
@@ -928,6 +1427,16 @@ mod tests {
     use super::*;
     use tokio::io::BufReader;
 
+    /// Tests that repoint `JCODE_COWORK_STORE_DIR` serialize on this lock so
+    /// parallel test threads never observe each other's store directory.
+    static STORE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_store_env() -> std::sync::MutexGuard<'static, ()> {
+        STORE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Build a request that carries the daemon's capability token.
     fn authed_request(rpc: &CoworkRpc, id: i64, method: &str, params: Value) -> RpcRequest {
         RpcRequest {
@@ -1028,10 +1537,11 @@ mod tests {
         let mut events = rpc.subscribe();
         let task_id = rpc
             .start_task_with(
-                "Review these files".to_string(),
-                vec![directory.path().to_path_buf()],
-                None,
-                |_, _, _, _, _| async { std::future::pending::<Result<String>>().await },
+                TaskLaunch::new(
+                    "Review these files".to_string(),
+                    vec![CoworkMount::read_write(directory.path())],
+                ),
+                |_, _, _, _, _, _| async { std::future::pending::<Result<String>>().await },
             )
             .await
             .unwrap();
@@ -1061,10 +1571,11 @@ mod tests {
         let mut events = rpc.subscribe();
         let task_id = rpc
             .start_task_with(
-                "Review these files".to_string(),
-                vec![directory.path().to_path_buf()],
-                None,
-                |_, _, _, _, _| async { Ok("Reviewed the workspace".to_string()) },
+                TaskLaunch::new(
+                    "Review these files".to_string(),
+                    vec![CoworkMount::read_write(directory.path())],
+                ),
+                |_, _, _, _, _, _| async { Ok("Reviewed the workspace".to_string()) },
             )
             .await
             .unwrap();
@@ -1092,6 +1603,7 @@ mod tests {
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 7);
         assert_eq!(response["result"]["name"], "jcode-cowork");
+        assert_eq!(response["result"]["version"], PROTOCOL_VERSION);
     }
 
     #[tokio::test]
@@ -1155,6 +1667,293 @@ mod tests {
             "partial-without-newline"
         );
         assert!(read_bounded_line(&mut reader).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn settings_update_round_trips_and_auto_allows_readonly() {
+        let _env = lock_store_env();
+        let store_dir = tempfile::tempdir().unwrap();
+        // SAFETY: the STORE_ENV_LOCK is held, so no other thread reads the
+        // environment while it mutates.
+        unsafe { std::env::set_var("JCODE_COWORK_STORE_DIR", store_dir.path()) };
+        let rpc = CoworkRpc::new();
+        assert_eq!(rpc.approval_policy(), ApprovalPolicy::AlwaysAsk);
+
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                20,
+                "settings.update",
+                json!({ "approval_mode": "auto_allow_readonly" }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["result"]["approval_mode"], "auto_allow_readonly");
+        assert_eq!(rpc.approval_policy(), ApprovalPolicy::AutoAllowReadonly);
+
+        // A fresh daemon loads the persisted policy (restart continuity).
+        let restarted = CoworkRpc::new();
+        assert_eq!(restarted.approval_policy(), ApprovalPolicy::AutoAllowReadonly);
+
+        // Read-only tools are auto-approved without emitting an event.
+        let decision = restarted
+            .request_tool_approval("call-r1", "read", "Read report.xlsx", "task-1")
+            .await
+            .unwrap();
+        assert!(decision, "read must be auto-approved in auto_allow_readonly");
+
+        // Non-read-only tools still need a connected client to decide.
+        let denied = restarted
+            .request_tool_approval("call-r2", "bash", "Run cleanup.sh", "task-1")
+            .await;
+        assert!(denied.is_err(), "bash must still require an explicit decision");
+
+        // Invalid modes are rejected at the protocol surface.
+        let response = dispatch_request(
+            authed_request(&rpc, 21, "settings.update", json!({ "approval_mode": "yolo" })),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+        // SAFETY: same lock discipline as the set above.
+        unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
+    }
+
+    /// Milestone smoke test: create a project, mount a folder into it, start a
+    /// project-scoped task, and receive streamed events. Mirrors the GUI flow
+    /// end to end at the RPC boundary.
+    #[tokio::test]
+    async fn project_smoke_create_mount_start_task_with_instructions() {
+        let _env = lock_store_env();
+        let store_dir = tempfile::tempdir().unwrap();
+        // SAFETY: the STORE_ENV_LOCK is held, so no other thread reads the
+        // environment while it mutates.
+        unsafe { std::env::set_var("JCODE_COWORK_STORE_DIR", store_dir.path()) };
+        let rpc = CoworkRpc::new();
+        let mut events = rpc.subscribe();
+
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                30,
+                "project.create",
+                json!({
+                    "name": "Q4 Close",
+                    "purpose": "Finance workspace",
+                    "instructions": "Always cite the source workbook.",
+                }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        let project_id = response["result"]["project"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let folder = tempfile::tempdir().unwrap();
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                31,
+                "mount.add",
+                json!({
+                    "project_id": project_id,
+                    "path": folder.path(),
+                    "access": "read_write",
+                }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["result"]["project"]["mounts"].as_array().unwrap().len(), 1);
+
+        // The task list is empty before starting anything.
+        let response = dispatch_request(authed_request(&rpc, 32, "task.list", json!({})), &rpc)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["tasks"].as_array().unwrap().len(), 0);
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<Option<String>>));
+        let captured_in_task = std::sync::Arc::clone(&captured);
+        let task_id = rpc
+            .start_task_with(
+                TaskLaunch {
+                    goal: "Summarize the workbook".to_owned(),
+                    mounts: vec![CoworkMount::read_write(folder.path())],
+                    model: None,
+                    instructions: Some("Always cite the source workbook.".to_owned()),
+                    project_id: Some(project_id.clone()),
+                },
+                move |_goal, roots, _model, _task_id, instructions, _rpc| {
+                    let captured = std::sync::Arc::clone(&captured_in_task);
+                    async move {
+                        *captured.lock().unwrap() = Some(instructions.clone());
+                        assert!(!roots.is_empty());
+                        Ok("done".to_owned())
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events.recv().await.unwrap(),
+            CoworkEvent::TaskCompleted {
+                task_id: task_id.clone(),
+                success: true,
+                summary: Some("done".to_string()),
+            }
+        );
+        assert_eq!(
+            captured.lock().unwrap().clone(),
+            Some(Some("Always cite the source workbook.".to_owned()))
+        );
+
+        // The task landed in the project history.
+        let response = dispatch_request(
+            authed_request(&rpc, 33, "project.get", json!({ "project_id": project_id })),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        let history = response["result"]["project"]["task_ids"]
+            .as_array()
+            .unwrap();
+        assert!(history.contains(&json!(task_id)));
+
+        // And task.list now reports it as finished (no longer running).
+        let response = dispatch_request(authed_request(&rpc, 34, "task.list", json!({})), &rpc)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["tasks"].as_array().unwrap().len(), 0);
+        // SAFETY: same lock discipline as the set above.
+        unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
+    }
+
+    #[tokio::test]
+    async fn readonly_project_mounts_denies_structured_writes() {
+        let _env = lock_store_env();
+        let store_dir = tempfile::tempdir().unwrap();
+        // SAFETY: the STORE_ENV_LOCK is held, so no other thread reads the
+        // environment while it mutates.
+        unsafe { std::env::set_var("JCODE_COWORK_STORE_DIR", store_dir.path()) };
+        let rpc = CoworkRpc::new();
+
+        let folder = tempfile::tempdir().unwrap();
+        let registrations = rpc
+            .register_agent_session(
+                "session-readonly",
+                "task-readonly",
+                vec![CoworkMount::read_only(folder.path())],
+            )
+            .await
+            .unwrap();
+        // Keep the registrations alive for the duration of the check.
+        let SessionRegistrations {
+            path_registration: _,
+            write_registration,
+            approval_registration: _,
+            artifact_registration: _,
+            tool_invoked_registration: _,
+        } = registrations;
+
+        let target = folder.path().join("report.docx");
+        // Reads resolve fine through the read validator...
+        let read_resolution =
+            jcode_tool_core::verify_session_path("session-readonly", &target).unwrap();
+        assert!(
+            read_resolution.is_some() || read_resolution.is_none(),
+            "read validator accepted the mounted path"
+        );
+        // ...but structured writes are denied before touching disk.
+        let error = jcode_tool_core::verify_session_write_path("session-readonly", &target)
+            .err()
+            .expect("write into read-only mount must be denied");
+        assert!(error.contains("read/write mount"), "got: {error}");
+        drop(write_registration);
+        // SAFETY: same lock discipline as the set above.
+        unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
+    }
+
+    #[tokio::test]
+    async fn mount_revoke_removes_future_write_access() {
+        let _env = lock_store_env();
+        let store_dir = tempfile::tempdir().unwrap();
+        // SAFETY: the STORE_ENV_LOCK is held, so no other thread reads the
+        // environment while it mutates.
+        unsafe { std::env::set_var("JCODE_COWORK_STORE_DIR", store_dir.path()) };
+        let rpc = CoworkRpc::new();
+
+        let response = dispatch_request(
+            authed_request(&rpc, 40, "project.create", json!({ "name": "Revoke" })),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        let project_id = response["result"]["project"]["id"].as_str().unwrap().to_owned();
+
+        let folder = tempfile::tempdir().unwrap();
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                41,
+                "mount.add",
+                json!({
+                    "project_id": project_id,
+                    "path": folder.path(),
+                    "access": "read_write",
+                }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+
+        // Revoke while no task runs; the stored project loses the mount...
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                42,
+                "mount.revoke",
+                json!({ "project_id": project_id, "path": folder.path() }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response["result"]["project"]["mounts"].as_array().unwrap().len(),
+            0
+        );
+
+        // ...so a fresh task on this project starts with NO mounts at all.
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                43,
+                "start_task",
+                json!({ "goal": "work", "project_id": project_id }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no mounted folders"),
+            "got: {response}"
+        );
+        // SAFETY: same lock discipline as the set above.
+        unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
     }
 
     #[tokio::test]

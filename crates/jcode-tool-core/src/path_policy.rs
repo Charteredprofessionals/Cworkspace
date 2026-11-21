@@ -44,6 +44,13 @@ type ToolInvokedNotifiersMap = HashMap<String, (u64, Arc<SessionToolInvokedNotif
 type ValidatorsMap = HashMap<String, Registration>;
 
 static VALIDATORS: LazyLock<RwLock<ValidatorsMap>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+/// Write-side validators for sessions that distinguish read-only mounts from
+/// read/write mounts. When a session registers one, every structured write
+/// (patch, edit, office document creation) must resolve inside the writable
+/// subset; reads keep consulting the broader read validator above. Sessions
+/// without a write validator keep the historical single-validator behavior.
+static WRITE_VALIDATORS: LazyLock<RwLock<ValidatorsMap>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 static APPROVAL_REQUESTERS: LazyLock<RwLock<ApprovalRequestersMap>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -264,6 +271,68 @@ where
     SessionPathValidatorRegistration { session_id, owner }
 }
 
+/// Registration handle for the write-side validator. Dropping it removes the
+/// write validator; the read validator (if any) is unaffected.
+pub struct SessionWritePathValidatorRegistration {
+    session_id: String,
+    owner: u64,
+}
+
+impl Drop for SessionWritePathValidatorRegistration {
+    fn drop(&mut self) {
+        let mut validators = WRITE_VALIDATORS
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if validators
+            .get(&self.session_id)
+            .is_some_and(|entry| entry.owner == self.owner)
+        {
+            validators.remove(&self.session_id);
+        }
+    }
+}
+
+pub fn register_session_write_path_validator<F>(
+    session_id: impl Into<String>,
+    validator: F,
+) -> SessionWritePathValidatorRegistration
+where
+    F: Fn(&Path) -> Result<PathBuf, String> + Send + Sync + 'static,
+{
+    let session_id = session_id.into();
+    let owner = NEXT_OWNER.fetch_add(1, Ordering::Relaxed);
+    WRITE_VALIDATORS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            session_id.clone(),
+            Registration {
+                owner,
+                validator: Arc::new(validator),
+            },
+        );
+    SessionWritePathValidatorRegistration { session_id, owner }
+}
+
+/// Validate a path for a write operation. Falls back to the session's read
+/// validator when no write validator is registered so existing sessions
+/// (single shared root) are unaffected; when one IS registered, only the
+/// writable subset of mounts accepts the path.
+pub fn verify_session_write_path(
+    session_id: &str,
+    path: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let validator = WRITE_VALIDATORS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(session_id)
+        .map(|entry| Arc::clone(&entry.validator));
+    if let Some(validate) = validator {
+        return validate(path).map(Some);
+    }
+    verify_session_path(session_id, path)
+}
+
 pub fn verify_session_path(session_id: &str, path: &Path) -> Result<Option<PathBuf>, String> {
     let validator = VALIDATORS
         .read()
@@ -343,6 +412,75 @@ mod tests {
                 mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     .to_owned(),
             }]
+        );
+    }
+
+    #[test]
+    fn write_validator_falls_back_to_read_validator_when_absent() {
+        let session = format!("write-fallback-{}", NEXT_OWNER.fetch_add(1, Ordering::Relaxed));
+        let _read = register_session_path_validator(&session, |path| {
+            if path.starts_with("/workspace") {
+                Ok(path.to_path_buf())
+            } else {
+                Err("outside workspace".to_owned())
+            }
+        });
+
+        assert_eq!(
+            verify_session_write_path(&session, Path::new("/workspace/file.txt")).unwrap(),
+            Some(PathBuf::from("/workspace/file.txt"))
+        );
+        assert!(verify_session_write_path(&session, Path::new("/private/x")).is_err());
+    }
+
+    #[test]
+    fn write_validator_restricts_writes_to_writable_mounts_only() {
+        let session = format!("write-split-{}", NEXT_OWNER.fetch_add(1, Ordering::Relaxed));
+        // Read validator accepts both mounts; write validator only /rw.
+        let _read = register_session_path_validator(&session, |path| {
+            if path.starts_with("/workspace") {
+                Ok(path.to_path_buf())
+            } else {
+                Err("outside workspace".to_owned())
+            }
+        });
+        let _write = register_session_write_path_validator(&session, |path| {
+            if path.starts_with("/workspace/rw") {
+                Ok(path.to_path_buf())
+            } else {
+                Err("SECURITY_VIOLATION: mount is read-only".to_owned())
+            }
+        });
+
+        // Reads still reach the read-only mount.
+        assert!(verify_session_path(&session, Path::new("/workspace/ro/data.txt")).is_ok());
+        // Writes to the read-only mount are denied...
+        let error = verify_session_write_path(&session, Path::new("/workspace/ro/data.txt"))
+            .unwrap_err();
+        assert!(error.contains("read-only"), "got: {error}");
+        // ...and writes to the read/write mount succeed.
+        assert_eq!(
+            verify_session_write_path(&session, Path::new("/workspace/rw/summary.xlsx"))
+                .unwrap(),
+            Some(PathBuf::from("/workspace/rw/summary.xlsx"))
+        );
+    }
+
+    #[test]
+    fn dropping_write_registration_restores_fallback_behavior() {
+        let session = format!("write-drop-{}", NEXT_OWNER.fetch_add(1, Ordering::Relaxed));
+        let _read = register_session_path_validator(&session, |path| {
+            Ok(path.to_path_buf())
+        });
+        {
+            let _write = register_session_write_path_validator(&session, |_| {
+                Err("denied".to_owned())
+            });
+            assert!(verify_session_write_path(&session, Path::new("/x")).is_err());
+        }
+        assert_eq!(
+            verify_session_write_path(&session, Path::new("/x")).unwrap(),
+            Some(PathBuf::from("/x"))
         );
     }
 }

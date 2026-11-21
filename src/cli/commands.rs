@@ -2668,6 +2668,7 @@ pub async fn run_cowork_task(
     allowed_roots: Vec<PathBuf>,
     model: Option<String>,
     task_id: String,
+    instructions: Option<String>,
     rpc: crate::cli::cowork_rpc::CoworkRpc,
 ) -> Result<String> {
     let roots = crate::cli::cowork_rpc::validate_workspace_roots(allowed_roots).await?;
@@ -2703,14 +2704,28 @@ pub async fn run_cowork_task(
     agent.set_working_dir(&working_dir.display().to_string());
     let session_id = agent.session_id().to_owned();
     let _registrations = rpc
-        .register_agent_session(&session_id, &task_id, roots)
+        .register_agent_session(
+            &session_id,
+            &task_id,
+            roots
+                .iter()
+                .map(|root| crate::cli::cowork_rpc::CoworkMount::read_write(root.clone()))
+                .collect(),
+        )
         .await?;
     let base_prompt = crate::prompt::load_base_system_prompt(Some(&working_dir));
-    agent.set_system_prompt(&format!(
+    let mut system_prompt = format!(
         "{}\n\n{}",
         base_prompt,
         crate::cli::cowork_persona::COWORK_PERSONA
-    ));
+    );
+    if let Some(instructions) = instructions.as_deref().filter(|i| !i.trim().is_empty()) {
+        system_prompt = format!(
+            "{system_prompt}\n\n## Project instructions\n{}",
+            instructions.trim()
+        );
+    }
+    agent.set_system_prompt(&system_prompt);
 
     rpc.emit_event(crate::cli::cowork_rpc::CoworkEvent::AgentSpawned {
         agent_id: session_id,

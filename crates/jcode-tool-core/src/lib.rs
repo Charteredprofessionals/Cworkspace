@@ -11,11 +11,13 @@ mod path_policy;
 pub use path_jail::PathJail;
 pub use path_policy::{
     ArtifactCreated, PathValidator, SessionApprovalRegistration,
-    SessionArtifactCreatedRegistration, SessionPathValidatorRegistration, SessionToolInvokedRegistration,
-    ToolInvoked, notify_session_artifact_created, notify_session_tool_invoked,
+    SessionArtifactCreatedRegistration, SessionPathValidatorRegistration,
+    SessionToolInvokedRegistration, SessionWritePathValidatorRegistration, ToolInvoked,
+    notify_session_artifact_created, notify_session_tool_invoked,
     register_session_approval_requester, register_session_artifact_created_notifier,
     register_session_path_validator, register_session_tool_invoked_notifier,
-    request_session_approval, verify_session_path,
+    register_session_write_path_validator, request_session_approval, verify_session_path,
+    verify_session_write_path,
 };
 
 #[cfg(windows)]
@@ -372,6 +374,26 @@ impl ToolContext {
     pub fn verify_path(&self, path: &Path) -> anyhow::Result<PathBuf> {
         let resolved = self.resolve_path_without_validation(path);
         match verify_session_path(&self.session_id, &resolved).map_err(anyhow::Error::msg)? {
+            Some(verified) => Ok(verified),
+            None if self.require_validator => {
+                anyhow::bail!("SECURITY_VIOLATION: no path validator registered for session")
+            }
+            None if std::env::var("JCODE_COWORK_MODE").is_ok_and(|value| value == "1") => {
+                anyhow::bail!("SECURITY_VIOLATION: Cowork session has no mounted workspace roots")
+            }
+            None => Ok(resolved),
+        }
+    }
+
+    /// Validate a path for a structured write (patch, edit, office document
+    /// creation). When the session registers a write validator (read-only and
+    /// read/write mounts mixed), only the writable subset accepts the path;
+    /// sessions without one fall back to the shared read validator.
+    pub fn verify_write_path(&self, path: &Path) -> anyhow::Result<PathBuf> {
+        let resolved = self.resolve_path_without_validation(path);
+        match verify_session_write_path(&self.session_id, &resolved)
+            .map_err(anyhow::Error::msg)?
+        {
             Some(verified) => Ok(verified),
             None if self.require_validator => {
                 anyhow::bail!("SECURITY_VIOLATION: no path validator registered for session")

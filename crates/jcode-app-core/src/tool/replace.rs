@@ -162,7 +162,7 @@ impl Tool for ReplaceTool {
 
         let files = files
             .iter()
-            .map(|file| ctx.verify_path(file))
+            .map(|file| ctx.verify_write_path(file))
             .collect::<Result<Vec<_>>>()?;
         let mut changes = Vec::new();
         let _locks = super::file_lock::lock_all(files.iter().cloned()).await;

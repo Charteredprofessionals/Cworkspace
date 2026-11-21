@@ -28,6 +28,7 @@ mod file_diff;
 pub(crate) mod file_lock;
 mod gmail;
 mod office_docs;
+mod pptx;
 // The initiative tool is intentionally unregistered (4928a1c92) but kept for re-enable.
 pub mod applet;
 #[allow(dead_code)]
@@ -92,10 +93,12 @@ use tokio::sync::RwLock;
 pub(crate) use jcode_tool_core::intent_schema_property;
 pub use jcode_tool_core::{
     ArtifactCreated, SessionApprovalRegistration, SessionArtifactCreatedRegistration,
-    SessionPathValidatorRegistration, SessionToolInvokedRegistration, StdinInputRequest, Tool,
-    ToolContext, ToolExecutionMode, ToolInvoked, register_session_approval_requester,
+    SessionPathValidatorRegistration, SessionToolInvokedRegistration,
+    SessionWritePathValidatorRegistration, StdinInputRequest, Tool, ToolContext,
+    ToolExecutionMode, ToolInvoked, register_session_approval_requester,
     register_session_artifact_created_notifier, register_session_path_validator,
-    register_session_tool_invoked_notifier,
+    register_session_tool_invoked_notifier, register_session_write_path_validator,
+    verify_session_write_path,
 };
 pub use jcode_tool_types::{ToolImage, ToolOutput};
 pub(crate) use session_search::spawn_recent_index_warmup;

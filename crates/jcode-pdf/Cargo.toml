@@ -9,4 +9,5 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
+lopdf = "0.42"
 pdf-extract = "0.12"

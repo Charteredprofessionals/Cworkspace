@@ -9,6 +9,7 @@ pub mod commands;
 pub mod compatible_runtime;
 #[path = "../prompts/cowork_persona.rs"]
 pub mod cowork_persona;
+pub mod cowork_projects;
 #[path = "../ipc/cowork_rpc.rs"]
 pub mod cowork_rpc;
 pub mod debug;

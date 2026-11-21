@@ -500,6 +500,7 @@ async fn start_cowork_task(
     app: AppHandle,
     bridge: State<'_, Bridge>,
     goal: String,
+    project_id: Option<String>,
     allowed_roots: Vec<String>,
     model: Option<String>,
 ) -> Result<String, String> {
@@ -507,34 +508,45 @@ async fn start_cowork_task(
     if goal.is_empty() {
         return Err("Enter a goal before starting a task".to_owned());
     }
-    let mounted = bridge
-        .mounted_roots
-        .lock()
-        .map_err(|_| "Mounted folder state is unavailable".to_owned())?
-        .clone();
-    let allowed = allowed_roots
-        .iter()
-        .map(|path| canonical_folder(path))
-        .collect::<Result<Vec<_>, _>>()?;
-    if allowed.is_empty() || allowed.iter().any(|path| !mounted.contains(path)) {
-        return Err("Tasks can use only folders mounted in this session".to_owned());
-    }
     let model = model
         .map(|model| model.trim().to_owned())
         .filter(|model| !model.is_empty());
+    let project_id = project_id
+        .map(|project_id| project_id.trim().to_owned())
+        .filter(|project_id| !project_id.is_empty());
+    // Project-scoped tasks take their mounts, model default, and instructions
+    // from the daemon-side project; only ad-hoc tasks need session mounts.
+    let params = if let Some(project_id) = project_id {
+        json!({
+            "goal": goal,
+            "project_id": project_id,
+            "model": model,
+        })
+    } else {
+        let mounted = bridge
+            .mounted_roots
+            .lock()
+            .map_err(|_| "Mounted folder state is unavailable".to_owned())?
+            .clone();
+        let allowed = allowed_roots
+            .iter()
+            .map(|path| canonical_folder(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        if allowed.is_empty() || allowed.iter().any(|path| !mounted.contains(path)) {
+            return Err("Tasks can use only folders mounted in this session".to_owned());
+        }
+        json!({
+            "goal": goal,
+            "allowed_roots": allowed
+                .iter()
+                .map(|path| path.to_string_lossy())
+                .collect::<Vec<_>>(),
+            "model": model,
+        })
+    };
     let response = tokio::task::block_in_place(|| {
         let connection = ensure_connection(&app, &bridge)?;
-        connection.request(
-            "start_task",
-            json!({
-                "goal": goal,
-                "allowed_roots": allowed
-                    .iter()
-                    .map(|path| path.to_string_lossy())
-                    .collect::<Vec<_>>(),
-                "model": model,
-            }),
-        )
+        connection.request("start_task", params)
     })?;
     response
         .as_str()
@@ -577,6 +589,145 @@ async fn list_models(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value,
     tokio::task::block_in_place(|| {
         let connection = ensure_connection(&app, &bridge)?;
         connection.request("list_models", json!({}))
+    })
+}
+
+/// Thin, explicit pass-throughs for the project/settings RPC surface. Each
+/// method is named (no generic invoke) so the GUI↔daemon contract stays
+/// reviewable and the capability token still gates every call daemon-side.
+
+#[tauri::command]
+async fn project_list(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("project.list", json!({}))
+    })
+}
+
+#[tauri::command]
+async fn project_create(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    name: String,
+    icon: Option<String>,
+    purpose: Option<String>,
+    instructions: Option<String>,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request(
+            "project.create",
+            json!({
+                "name": name,
+                "icon": icon.unwrap_or_default(),
+                "purpose": purpose.unwrap_or_default(),
+                "instructions": instructions.unwrap_or_default(),
+            }),
+        )
+    })
+}
+
+#[tauri::command]
+async fn project_update(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    project_id: String,
+    name: Option<String>,
+    icon: Option<String>,
+    purpose: Option<String>,
+    instructions: Option<String>,
+    model_default: Option<String>,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request(
+            "project.update",
+            json!({
+                "project_id": project_id,
+                "name": name,
+                "icon": icon,
+                "purpose": purpose,
+                "instructions": instructions,
+                "model_default": model_default,
+            }),
+        )
+    })
+}
+
+#[tauri::command]
+async fn project_delete(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    project_id: String,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("project.delete", json!({ "project_id": project_id }))
+    })
+}
+
+#[tauri::command]
+async fn mount_add(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    project_id: String,
+    path: String,
+    access: String,
+) -> Result<Value, String> {
+    let canonical = canonical_folder(&path)?;
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request(
+            "mount.add",
+            json!({
+                "project_id": project_id,
+                "path": canonical.to_string_lossy(),
+                "access": access,
+            }),
+        )
+    })
+}
+
+#[tauri::command]
+async fn mount_revoke(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    project_id: String,
+    path: String,
+) -> Result<Value, String> {
+    let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request(
+            "mount.revoke",
+            json!({
+                "project_id": project_id,
+                "path": canonical.to_string_lossy(),
+            }),
+        )
+    })
+}
+
+#[tauri::command]
+async fn settings_get(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("settings.get", json!({}))
+    })
+}
+
+#[tauri::command]
+async fn settings_update(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    approval_mode: String,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request(
+            "settings.update",
+            json!({ "approval_mode": approval_mode }),
+        )
     })
 }
 
@@ -689,7 +840,15 @@ pub fn run() {
             start_cowork_task,
             stop_task,
             respond_approval,
-            read_artifact
+            read_artifact,
+            project_list,
+            project_create,
+            project_update,
+            project_delete,
+            mount_add,
+            mount_revoke,
+            settings_get,
+            settings_update
         ])
         .build(tauri::generate_context!())
         .expect("error while building Cworkspace")

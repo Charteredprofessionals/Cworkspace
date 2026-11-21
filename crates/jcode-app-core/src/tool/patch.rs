@@ -75,7 +75,7 @@ impl Tool for PatchTool {
         if std::env::var("JCODE_COWORK_MODE").is_ok_and(|value| value == "1") {
             for patch in &patches {
                 if patch.is_delete {
-                    let path = ctx.verify_path(Path::new(&patch.path))?;
+                    let path = ctx.verify_write_path(Path::new(&patch.path))?;
                     anyhow::ensure!(
                         ctx.request_approval("patch", format!("Delete {}", path.display()))
                             .await?,
@@ -89,7 +89,7 @@ impl Tool for PatchTool {
         // on it is reported regardless of which patch produced it.
         let lock_paths = patches
             .iter()
-            .map(|patch| ctx.verify_path(Path::new(&patch.path)))
+            .map(|patch| ctx.verify_write_path(Path::new(&patch.path)))
             .collect::<Result<Vec<_>>>()?;
         let _locks = super::file_lock::lock_all(lock_paths).await;
         let config_watch = super::config_edit_notice::ConfigEditWatch::begin();
@@ -100,7 +100,7 @@ impl Tool for PatchTool {
         let mut prepared = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for patch in &patches {
-            let path = ctx.verify_path(Path::new(&patch.path))?;
+            let path = ctx.verify_write_path(Path::new(&patch.path))?;
             let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
             anyhow::ensure!(seen.insert(key), "duplicate patch path: {}", path.display());
             prepared.push(prepare_patch(patch, path).await?);

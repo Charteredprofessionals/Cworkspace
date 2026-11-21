@@ -105,7 +105,7 @@ impl Tool for ApplyPatchTool {
         if std::env::var("JCODE_COWORK_MODE").is_ok_and(|value| value == "1") {
             for hunk in &hunks {
                 if let PatchHunk::DeleteFile { path } = hunk {
-                    let resolved = ctx.verify_path(Path::new(path))?;
+                    let resolved = ctx.verify_write_path(Path::new(path))?;
                     anyhow::ensure!(
                         ctx.request_approval(
                             "apply_patch",
@@ -137,7 +137,7 @@ impl Tool for ApplyPatchTool {
                 };
                 std::iter::once(path)
                     .chain(destination)
-                    .map(|path| ctx.verify_path(Path::new(path)))
+                    .map(|path| ctx.verify_write_path(Path::new(path)))
             })
             .collect::<Result<Vec<_>>>()?;
         let _locks = super::file_lock::lock_all(lock_paths).await;
@@ -149,7 +149,7 @@ impl Tool for ApplyPatchTool {
             };
             for path in std::iter::once(path).chain(destination) {
                 if !before.contains_key(path) {
-                    let resolved = ctx.verify_path(Path::new(path))?;
+                    let resolved = ctx.verify_write_path(Path::new(path))?;
                     before.insert(path.clone(), super::file_diff::snapshot(&resolved).await);
                 }
             }
@@ -161,7 +161,7 @@ impl Tool for ApplyPatchTool {
         for hunk in &hunks {
             match hunk {
                 PatchHunk::AddFile { path, contents } => {
-                    let resolved = ctx.verify_path(Path::new(path))?;
+                    let resolved = ctx.verify_write_path(Path::new(path))?;
                     if let Some(parent) = resolved.parent() {
                         tokio::fs::create_dir_all(parent).await?;
                     }
@@ -192,7 +192,7 @@ impl Tool for ApplyPatchTool {
                     }
                 }
                 PatchHunk::DeleteFile { path } => {
-                    let resolved = ctx.verify_path(Path::new(path))?;
+                    let resolved = ctx.verify_write_path(Path::new(path))?;
                     // `resolve_path` passes absolute paths through unchanged, so
                     // a patch can name any file on disk. The bash gate does not
                     // cover this path, so apply the same absolute deny here
@@ -236,12 +236,12 @@ impl Tool for ApplyPatchTool {
                     move_to,
                     chunks,
                 } => {
-                    let resolved = ctx.verify_path(Path::new(path))?;
+                    let resolved = ctx.verify_write_path(Path::new(path))?;
                     match apply_update_chunks(&resolved, chunks).await {
                         Ok((old_contents, new_contents)) => {
                             let diff = generate_diff_summary(&old_contents, &new_contents);
                             if let Some(dest) = move_to {
-                                let dest_resolved = ctx.verify_path(Path::new(dest))?;
+                                let dest_resolved = ctx.verify_write_path(Path::new(dest))?;
                                 if let Some(parent) = dest_resolved.parent() {
                                     tokio::fs::create_dir_all(parent).await?;
                                 }
