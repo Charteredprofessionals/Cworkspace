@@ -76,21 +76,27 @@ jobs:
           RUSTFLAGS: -C target-cpu=x86-64-v3
 
       - name: Find installer artifacts
-        id: artifacts
         run: |
           $installers = Get-ChildItem gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle -Recurse -Include *.msi,*.exe -ErrorAction SilentlyContinue
           if (-not $installers) {
             Write-Error "No installer artifacts found"
             exit 1
           }
-          $paths = $installers | ForEach-Object { $_.FullName }
-          echo "paths=$($paths -join ';')" >> $env:GITHUB_OUTPUT
+          $installers | ForEach-Object { Write-Host "installer: $($_.FullName)" }
 
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows-installers
-          path: ${{ steps.artifacts.outputs.paths }}
+          # upload-artifact@v4 does NOT split a single-line path on ';': an
+          # "a;b" list is treated as one literal pattern and matches nothing
+          # (run 10 warned "No files were found" and uploaded nothing).
+          # Multi-line globs are the supported form; fail loudly instead of
+          # silently skipping the upload.
+          path: |
+            gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error
           retention-days: 30
 
       - name: Upload main binary
@@ -124,6 +130,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            installers/*
+            installers/**/*
             bin/jcode.exe
           generate_release_notes: true
