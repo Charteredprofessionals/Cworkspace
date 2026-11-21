@@ -27,6 +27,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "externalBin": ["binaries/jcode"],
     "shortDescription": "A desktop workspace for knowledge work with jcode",
     "category": "Productivity",
     "icon": [

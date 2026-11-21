@@ -71,6 +71,18 @@ jobs:
         run: cargo build --profile release-lto
         working-directory: .
 
+      - name: Stage daemon sidecar for bundling
+        # The GUI auto-starts the daemon from its own install directory
+        # (externalBin "binaries/jcode" in tauri.conf.json). Tauri v2 expects
+        # the sidecar named with the target triple; it is installed as plain
+        # jcode.exe next to jcode-cowork-gui.exe. Without this step the
+        # installer ships no daemon and the GUI falls back to whatever
+        # (usually stale or absent) jcode.exe is on PATH.
+        run: |
+          New-Item -ItemType Directory -Force gui/src-tauri/binaries | Out-Null
+          Copy-Item target/release-lto/jcode.exe gui/src-tauri/binaries/jcode-x86_64-pc-windows-msvc.exe -Force
+        working-directory: .
+
       - name: Install GUI dependencies
         run: npm ci
         working-directory: gui

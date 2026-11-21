@@ -47,6 +47,10 @@ fn read_capability_token() -> Result<String, String> {
         })
 }
 
+fn daemon_log_path() -> PathBuf {
+    std::env::temp_dir().join("jcode-cowork-daemon.log")
+}
+
 struct Bridge {
     connection: Mutex<Option<Arc<RpcConnection>>>,
     child: Mutex<Option<Child>>,
@@ -258,12 +262,24 @@ fn launch_daemon(bridge: &Bridge) -> Result<(), String> {
                     .filter(|path| path.exists())
             })
             .unwrap_or_else(|| PathBuf::from("jcode.exe"));
+        // The daemon reports startup failures (anyhow errors, panics) on
+        // stderr, which is invisible to the desktop app. Capture them in a
+        // log file so a daemon that dies before publishing its capability
+        // token is diagnosable instead of silent.
+        let daemon_log = daemon_log_path();
+        let stderr = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&daemon_log)
+            .map(Stdio::from)
+            .unwrap_or(Stdio::null());
         let mut command = Command::new(binary);
         command
             .arg("--cowork-daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(stderr);
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         command.creation_flags(CREATE_NO_WINDOW);
@@ -299,7 +315,10 @@ fn ensure_connection(app: &AppHandle, bridge: &Bridge) -> Result<Arc<RpcConnecti
         Err(_) => launch_daemon(bridge)?,
     }
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // First launch can exceed the daemon's millisecond-scale token publish
+    // by many seconds on Windows: Defender scans a freshly installed
+    // executable before its first run. Retry well past that.
+    let deadline = Instant::now() + Duration::from_secs(20);
     let mut last_error = String::new();
     while Instant::now() < deadline {
         match RpcConnection::open(app.clone()) {
@@ -311,6 +330,25 @@ fn ensure_connection(app: &AppHandle, bridge: &Bridge) -> Result<Arc<RpcConnecti
                 Err(error) => last_error = error,
             },
             Err(error) => last_error = error,
+        }
+        // If the spawned daemon already terminated, retrying the pipe is
+        // pointless — report why it died instead of a timeout-shaped error.
+        // try_lock avoids inverting the child/connection lock order used by
+        // Bridge::shutdown; skipping the check on contention is harmless.
+        if let Ok(child_slot) = bridge.child.try_lock() {
+            if let Some(child) = child_slot.as_ref() {
+                if let Ok(Some(status)) = child.try_wait() {
+                    let exit = status
+                        .code()
+                        .map(|code| format!("exit code {code}"))
+                        .unwrap_or_else(|| "non-zero exit".to_owned());
+                    return Err(format!(
+                        "jcode --cowork-daemon exited with {exit} before accepting connections; \
+                         daemon log: {} (last error: {last_error})",
+                        daemon_log_path().display()
+                    ));
+                }
+            }
         }
         thread::sleep(Duration::from_millis(100));
     }
