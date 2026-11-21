@@ -20,6 +20,7 @@ import {
   PanelRightClose,
   Play,
   Plus,
+  Settings,
   ShieldCheck,
   Sparkles,
   StopCircle,
@@ -100,6 +101,8 @@ type HistoryEntry = {
   goal: string;
   status: "running" | "completed" | "stopped" | "failed";
   updatedAt: number;
+  model?: string;
+  artifacts?: string[];
 };
 
 type Artifact = {
@@ -119,7 +122,43 @@ type PreviewState =
   | { status: "ready"; payload: ArtifactPayload; markdown?: string; docxHtml?: string; rows?: unknown[][]; columns?: number }
   | { status: "pdf"; payload: ArtifactPayload; url: string };
 
+type TabStatus = "idle" | "running" | "completed" | "stopped" | "failed";
+
+type SessionTab = {
+  id: string;
+  title: string;
+  goal: string;
+  status: TabStatus;
+  taskId: string;
+  feed: FeedEntry[];
+  artifacts: Artifact[];
+  selectedArtifact: Artifact | null;
+  handledApprovals: Record<string, boolean>;
+  error: string;
+  notice: string;
+};
+
+type Settings = {
+  reopenFolders: boolean;
+  autoOpenArtifacts: boolean;
+  defaultModel: string;
+};
+
+type DaemonInfo = {
+  name: string;
+  version: unknown;
+  log_path: string;
+};
+
 const HISTORY_KEY = "jcode-cowork-history-v1";
+const SETTINGS_KEY = "cworkspace-settings-v1";
+const FOLDERS_KEY = "cworkspace-folders-v1";
+
+const DEFAULT_SETTINGS: Settings = {
+  reopenFolders: true,
+  autoOpenArtifacts: true,
+  defaultModel: "",
+};
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || "");
 
@@ -144,10 +183,61 @@ function folderName(path: string) {
   return path.split(/[\\/]/).filter(Boolean).at(-1) || path;
 }
 
+function tabTitle(goal: string) {
+  const trimmed = goal.trim();
+  if (!trimmed) return "New session";
+  const words = trimmed.split(/\s+/).slice(0, 7).join(" ");
+  return words.length > 42 ? `${words.slice(0, 42)}…` : words;
+}
+
+let tabCounter = 0;
+function newTab(): SessionTab {
+  tabCounter += 1;
+  return {
+    id: `tab-${tabCounter}-${Date.now().toString(16)}`,
+    title: "New session",
+    goal: "",
+    status: "idle",
+    taskId: "",
+    feed: [],
+    artifacts: [],
+    selectedArtifact: null,
+    handledApprovals: {},
+    error: "",
+    notice: "",
+  };
+}
+
 function initialHistory(): HistoryEntry[] {
   try {
     const value: unknown = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
     return Array.isArray(value) ? (value as HistoryEntry[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function loadSettings(): Settings {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+    if (value && typeof value === "object") {
+      const raw = value as Record<string, unknown>;
+      return {
+        reopenFolders: typeof raw.reopenFolders === "boolean" ? raw.reopenFolders : DEFAULT_SETTINGS.reopenFolders,
+        autoOpenArtifacts: typeof raw.autoOpenArtifacts === "boolean" ? raw.autoOpenArtifacts : DEFAULT_SETTINGS.autoOpenArtifacts,
+        defaultModel: typeof raw.defaultModel === "string" ? raw.defaultModel : DEFAULT_SETTINGS.defaultModel,
+      };
+    }
+  } catch {
+    // fall through to defaults
+  }
+  return { ...DEFAULT_SETTINGS };
+}
+
+function loadStoredFolders(): string[] {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(FOLDERS_KEY) || "[]");
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
   } catch {
     return [];
   }
@@ -161,38 +251,77 @@ function decodeBase64(content: string) {
 }
 
 function App() {
+  const [tabs, setTabs] = useState<SessionTab[]>(() => [newTab()]);
+  const [activeTabId, setActiveTabId] = useState<string>(() => "");
   const [folders, setFolders] = useState<string[]>([]);
   const [history, setHistory] = useState<HistoryEntry[]>(initialHistory);
-  const [goal, setGoal] = useState("");
-  const [activeTaskId, setActiveTaskId] = useState("");
-  const [taskStatus, setTaskStatus] = useState<"idle" | "running" | "completed" | "stopped">("idle");
   const [daemonStatus, setDaemonStatus] = useState<"connecting" | "connected" | "offline">("connecting");
-  const [feed, setFeed] = useState<FeedEntry[]>([]);
-  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  const [selectedArtifact, setSelectedArtifact] = useState<Artifact | null>(null);
   const [previewOpen, setPreviewOpen] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [handledApprovals, setHandledApprovals] = useState<Record<string, boolean>>({});
+  const [settings, setSettings] = useState<Settings>(loadSettings);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [daemonInfo, setDaemonInfo] = useState<DaemonInfo | null>(null);
   const [models, setModels] = useState<ModelRoute[]>([]);
-  const [notice, setNotice] = useState("");
   const goalInputRef = useRef<HTMLTextAreaElement>(null);
+
+  const activeTab = useMemo(
+    () => tabs.find((tab) => tab.id === activeTabId) ?? tabs[0],
+    [tabs, activeTabId],
+  );
+
+  useEffect(() => {
+    if (!tabs.some((tab) => tab.id === activeTabId) && tabs.length) {
+      setActiveTabId(tabs[0].id);
+    }
+  }, [tabs, activeTabId]);
 
   useEffect(() => {
     localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 30)));
   }, [history]);
 
   useEffect(() => {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  }, [settings]);
+
+  useEffect(() => {
+    localStorage.setItem(FOLDERS_KEY, JSON.stringify(folders.slice(0, 12)));
+  }, [folders]);
+
+  // Connect once, then remount the folders from the previous run when the
+  // user asked us to reopen them (Settings → Workspace).
+  useEffect(() => {
     let cancelled = false;
     invoke("connect_daemon")
-      .then(() => { if (!cancelled) setDaemonStatus("connected"); })
+      .then(async () => {
+        if (cancelled) return;
+        setDaemonStatus("connected");
+        const stored = loadStoredFolders();
+        const { reopenFolders } = loadSettings();
+        if (reopenFolders && stored.length) {
+          const remounted: string[] = [];
+          for (const path of stored) {
+            try {
+              const mounted = await invoke<string>("mount_folder", { path });
+              if (!remounted.includes(mounted)) remounted.push(mounted);
+            } catch {
+              // Folder may have moved or been deleted since the last run;
+              // skip it instead of failing the whole launch.
+            }
+          }
+          if (!cancelled && remounted.length) setFolders(remounted);
+        }
+      })
       .catch((reason: unknown) => {
         if (!cancelled) {
           setDaemonStatus("offline");
-          setError(`Could not connect to the Cworkspace daemon: ${errorMessage(reason)}`);
+          setTabs((current) => current.map((tab) => ({
+            ...tab,
+            error: tab.id === (activeTabId || current[0]?.id) ? `Could not connect to the Cworkspace daemon: ${errorMessage(reason)}` : tab.error,
+          })));
         }
       });
     return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Model catalogs auto-fetch in the daemon; refresh whenever the
@@ -210,29 +339,54 @@ function App() {
     return () => { cancelled = true; };
   }, [daemonStatus]);
 
-  function startNewSession() {
-    setGoal("");
-    setFeed([]);
-    setArtifacts([]);
-    setSelectedArtifact(null);
-    setTaskStatus("idle");
-    setError("");
-    setNotice("");
+  function patchTab(tabId: string, patch: Partial<SessionTab> | ((tab: SessionTab) => Partial<SessionTab>)) {
+    setTabs((current) => current.map((tab) => tab.id === tabId
+      ? { ...tab, ...(typeof patch === "function" ? patch(tab) : patch) }
+      : tab));
+  }
+
+  function createTab() {
+    const tab = newTab();
+    setTabs((current) => [...current, tab]);
+    setActiveTabId(tab.id);
     requestAnimationFrame(() => goalInputRef.current?.focus());
   }
 
-  // The "New task" button advertises Ctrl+N (⌘N on macOS); make it real.
+  function closeTab(tabId: string) {
+    setTabs((current) => {
+      const target = current.find((tab) => tab.id === tabId);
+      // A task left running has no window left to report into — stop it.
+      if (target?.status === "running" && target.taskId) {
+        invoke("stop_task", { taskId: target.taskId }).catch(() => undefined);
+      }
+      const next = current.filter((tab) => tab.id !== tabId);
+      return next.length ? next : [newTab()];
+    });
+  }
+
+  // Tab shortcuts: Ctrl/⌘+T opens a tab, Ctrl/⌘+N keeps its original
+  // "new task" meaning (also a new tab), Ctrl/⌘+W closes the active one.
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      const key = event.key.toLowerCase();
+      if (key === "t" || key === "n") {
         event.preventDefault();
-        startNewSession();
+        createTab();
+      } else if (key === "w") {
+        event.preventDefault();
+        if (activeTabId) closeTab(activeTabId);
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTabId]);
 
+  // The daemon tags every cowork event with the task that produced it
+  // (task_id), so each event lands in the tab that owns the task — parallel
+  // sessions never cross-contaminate. Events without a task id (older
+  // daemons) fall back to the one running tab, preserving v0.1.1 behavior.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
@@ -243,19 +397,54 @@ function App() {
         data: payload.data || {},
         createdAt: Date.now(),
       };
-      setFeed((current) => [...current, entry]);
-      if (payload.event === "ArtifactCreated") {
-        const path = text(payload.data || {}, "path");
-        if (path) {
-          const artifact = { path, mime_type: text(payload.data || {}, "mime_type") };
-          setArtifacts((current) => [artifact, ...current.filter((item) => item.path !== path)]);
-          setSelectedArtifact(artifact);
-          setPreviewOpen(true);
+      const taskId = identifier(entry.data, "task_id");
+      setTabs((current) => {
+        let targetId = "";
+        if (taskId) {
+          const owner = current.find((tab) => tab.taskId === taskId);
+          if (owner) targetId = owner.id;
+        } else {
+          const running = current.filter((tab) => tab.status === "running");
+          if (running.length === 1) targetId = running[0].id;
+        }
+        if (!targetId) return current;
+        return current.map((tab) => {
+          if (tab.id !== targetId) return tab;
+          const next: Partial<SessionTab> = { feed: [...tab.feed, entry] };
+          if (entry.event === "ArtifactCreated") {
+            const path = text(entry.data, "path");
+            if (path) {
+              const artifact = { path, mime_type: text(entry.data, "mime_type") };
+              next.artifacts = [artifact, ...tab.artifacts.filter((item) => item.path !== path)];
+              next.selectedArtifact = artifact;
+            }
+          }
+          if (entry.event === "TaskCompleted") {
+            const success = entry.data.success !== false;
+            next.status = success ? "completed" : "failed";
+          }
+          return { ...tab, ...next };
+        });
+      });
+      if (entry.event === "TaskCompleted") {
+        const doneTaskId = taskId || identifier(entry.data, "task_id");
+        const success = entry.data.success !== false;
+        if (doneTaskId) {
+          setHistory((current) => current.map((item) => item.taskId === doneTaskId
+            ? { ...item, status: success ? "completed" as const : "failed" as const, updatedAt: Date.now() }
+            : item));
         }
       }
-      if (payload.event === "TaskCompleted") {
-        setTaskStatus("completed");
-        setHistory((current) => current.map((item) => item.taskId === activeTaskId ? { ...item, status: "completed", updatedAt: Date.now() } : item));
+      if (entry.event === "ArtifactCreated") {
+        const path = text(entry.data, "path");
+        if (path) {
+          setHistory((current) => current.map((item) => item.taskId === taskId
+            ? { ...item, artifacts: [path, ...(item.artifacts || []).filter((existing) => existing !== path)] }
+            : item));
+        }
+      }
+      if (entry.event === "TaskCompleted" || entry.event === "ArtifactCreated") {
+        if (loadSettings().autoOpenArtifacts && entry.event === "ArtifactCreated") setPreviewOpen(true);
       }
     })
       .then((stopListening) => {
@@ -263,22 +452,33 @@ function App() {
         else unlisten = stopListening;
       })
       .catch((reason: unknown) => {
-        if (!cancelled) setError(`Desktop event bridge unavailable: ${errorMessage(reason)}`);
+        if (!cancelled) {
+          setTabs((current) => current.map((tab) => tab.id === (activeTabId || current[0]?.id)
+            ? { ...tab, error: `Desktop event bridge unavailable: ${errorMessage(reason)}` }
+            : tab));
+        }
       });
     return () => {
       cancelled = true;
       unlisten?.();
     };
-  }, [activeTaskId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTabId]);
 
-  const pendingApprovals = useMemo(
-    () => feed.filter((entry) => entry.event === "ApprovalRequired" && !handledApprovals[identifier(entry.data, "id")]),
-    [feed, handledApprovals],
-  );
+  const pendingApprovals = useMemo(() => {
+    const pending: { tabId: string; entry: FeedEntry }[] = [];
+    for (const tab of tabs) {
+      for (const entry of tab.feed) {
+        if (entry.event === "ApprovalRequired" && !tab.handledApprovals[identifier(entry.data, "id")]) {
+          pending.push({ tabId: tab.id, entry });
+        }
+      }
+    }
+    return pending;
+  }, [tabs]);
 
   async function mountFolder() {
-    setError("");
-    setNotice("");
+    const activeId = activeTab?.id;
     try {
       const selected = await open({ directory: true, multiple: false, title: "Choose a workspace folder" });
       if (typeof selected !== "string") return;
@@ -286,83 +486,124 @@ function App() {
       const mountedPath = await invoke<string>("mount_folder", { path: selected });
       setFolders((current) => current.includes(mountedPath) ? current : [...current, mountedPath]);
       setDaemonStatus("connected");
+      if (activeId) patchTab(activeId, { error: "" });
     } catch (reason) {
-      setError(`Could not mount folder: ${errorMessage(reason)}`);
+      if (activeId) patchTab(activeId, { error: `Could not mount folder: ${errorMessage(reason)}` });
     } finally {
       setBusy(false);
     }
   }
 
   async function unmountFolder(path: string) {
-    setError("");
     try {
       await invoke("unmount_folder", { path });
       setFolders((current) => current.filter((folder) => folder !== path));
     } catch (reason) {
-      setError(`Could not unmount folder: ${errorMessage(reason)}`);
+      if (activeTab) patchTab(activeTab.id, { error: `Could not unmount folder: ${errorMessage(reason)}` });
     }
   }
 
   async function startTask(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!goal.trim()) return;
-    setError("");
-    setNotice("");
+    const tab = activeTab;
+    if (!tab) return;
+    const goal = tab.goal.trim();
+    if (!goal) return;
+    patchTab(tab.id, { error: "", notice: "" });
     if (!folders.length) {
-      setError("Mount a workspace folder before starting a task.");
+      patchTab(tab.id, { error: "Mount a workspace folder before starting a task." });
       return;
     }
     setBusy(true);
-    setFeed([]);
-    setArtifacts([]);
-    setSelectedArtifact(null);
-    setHandledApprovals({});
+    patchTab(tab.id, {
+      feed: [],
+      artifacts: [],
+      selectedArtifact: null,
+      handledApprovals: {},
+      title: tabTitle(goal),
+    });
     try {
-      const taskId = await invoke<string>("start_cowork_task", { goal: goal.trim(), allowedRoots: folders });
-      setDaemonStatus("connected");
-      setActiveTaskId(taskId);
-      setTaskStatus("running");
-      setHistory((current) => [{ taskId, goal: goal.trim(), status: "running" as const, updatedAt: Date.now() } as HistoryEntry, ...current.filter((item) => item.taskId !== taskId)].slice(0, 30));
+      const taskId = await invoke<string>("start_cowork_task", {
+        goal,
+        allowedRoots: folders,
+        model: settings.defaultModel || undefined,
+      });
+      patchTab(tab.id, {
+        taskId,
+        status: "running",
+        title: tabTitle(goal),
+      });
+      setHistory((current) => [{
+        taskId,
+        goal,
+        status: "running" as const,
+        updatedAt: Date.now(),
+        model: settings.defaultModel || undefined,
+      }, ...current.filter((item) => item.taskId !== taskId)].slice(0, 30));
     } catch (reason) {
-      setError(`Could not start task: ${errorMessage(reason)}`);
+      patchTab(tab.id, { error: `Could not start task: ${errorMessage(reason)}` });
     } finally {
       setBusy(false);
     }
   }
 
   async function stopTask() {
-    if (!activeTaskId) return;
-    setError("");
+    const tab = activeTab;
+    if (!tab?.taskId) return;
+    patchTab(tab.id, { error: "" });
     try {
-      await invoke("stop_task", { taskId: activeTaskId });
-      setTaskStatus("stopped");
-      setHistory((current) => current.map((item) => item.taskId === activeTaskId ? { ...item, status: "stopped", updatedAt: Date.now() } : item));
+      await invoke("stop_task", { taskId: tab.taskId });
+      patchTab(tab.id, { status: "stopped" });
+      setHistory((current) => current.map((item) => item.taskId === tab.taskId ? { ...item, status: "stopped", updatedAt: Date.now() } : item));
     } catch (reason) {
-      setError(`Could not stop task: ${errorMessage(reason)}`);
+      patchTab(tab.id, { error: `Could not stop task: ${errorMessage(reason)}` });
     }
   }
 
-  async function answerApproval(id: string | number, approved: boolean) {
-    setError("");
+  async function answerApproval(tabId: string, id: string | number, approved: boolean) {
     try {
       await invoke("respond_approval", { id, approved });
-      setHandledApprovals((current) => ({ ...current, [id]: approved }));
+      setTabs((current) => current.map((tab) => tab.id === tabId
+        ? { ...tab, handledApprovals: { ...tab.handledApprovals, [id]: approved } }
+        : tab));
     } catch (reason) {
-      setError(`Could not send approval response: ${errorMessage(reason)}`);
+      patchTab(tabId, { error: `Could not send approval response: ${errorMessage(reason)}` });
     }
   }
 
   function restoreHistory(item: HistoryEntry) {
-    setGoal(item.goal);
-    setActiveTaskId("");
-    setTaskStatus("idle");
-    setFeed([]);
-    setArtifacts([]);
-    setSelectedArtifact(null);
-    setError("");
-    setNotice(`Loaded “${item.goal}” into the composer — review it, then start a fresh task. History keeps task summaries only.`);
+    const tab = activeTab;
+    if (!tab) return;
+    const restoredArtifacts = (item.artifacts || []).map((path) => ({ path, mime_type: "" }));
+    patchTab(tab.id, {
+      goal: item.goal,
+      title: tabTitle(item.goal),
+      taskId: "",
+      status: "idle",
+      feed: [],
+      artifacts: restoredArtifacts,
+      selectedArtifact: restoredArtifacts[0] || null,
+      error: "",
+      notice: `Loaded “${item.goal}” into the composer — review it, then start a fresh task.${restoredArtifacts.length ? " Deliverables from the original run are listed in Artifacts." : ""}`,
+    });
+    if (restoredArtifacts.length) setPreviewOpen(true);
     requestAnimationFrame(() => goalInputRef.current?.focus());
   }
+
+  function openSettings() {
+    setSettingsOpen(true);
+    if (daemonStatus === "connected") {
+      invoke<DaemonInfo>("daemon_info")
+        .then((info) => setDaemonInfo(info))
+        .catch(() => setDaemonInfo(null));
+    }
+  }
+
+  function updateSetting<K extends keyof Settings>(key: K, value: Settings[K]) {
+    setSettings((current) => ({ ...current, [key]: value }));
+  }
+
+  const availableModels = models.filter((route) => route.available);
 
   return (
   <ErrorBoundary>
@@ -373,8 +614,8 @@ function App() {
           <div><div className="brand-name">C<span>workspace</span></div><div className="brand-subtitle">A space for the work ahead</div></div>
         </div>
 
-        <button className="new-session" onClick={startNewSession}>
-          <Plus size={16} strokeWidth={2.2} /> New task <span>{IS_MAC ? "⌘ N" : "Ctrl N"}</span>
+        <button className="new-session" onClick={createTab}>
+          <Plus size={16} strokeWidth={2.2} /> New task <span>{IS_MAC ? "⌘ T" : "Ctrl T"}</span>
         </button>
 
         <section className="sidebar-section">
@@ -395,14 +636,20 @@ function App() {
         <section className="sidebar-section models-section">
           <div className="section-heading"><span>MODELS</span><Sparkles size={14} /></div>
           <div className="model-list">
-            {models.filter((route) => route.available).slice(0, 10).map((route) => (
-              <div className="model-item" key={`${route.provider}:${route.model}`} title={route.detail}>
+            {availableModels.slice(0, 10).map((route) => (
+              <button
+                className={`model-item ${settings.defaultModel === route.model ? "selected" : ""}`}
+                key={`${route.provider}:${route.model}`}
+                title={`${route.detail}\n${settings.defaultModel === route.model ? "Default for new tasks" : "Click to make default"}`}
+                onClick={() => updateSetting("defaultModel", route.model)}
+              >
                 <span className="model-name">{route.model}</span>
-                <span className="model-provider">{route.provider}</span>
-              </div>
+                <span className="model-provider">{settings.defaultModel === route.model ? "default" : route.provider}</span>
+              </button>
             ))}
             {!models.length && <p className="sidebar-empty">Model catalogs load automatically once signed in.</p>}
-            {models.length > 0 && !models.some((route) => route.available) && <p className="sidebar-empty">No models available yet — sign in to a provider to fill this list.</p>}
+            {models.length > 0 && !availableModels.length && <p className="sidebar-empty">No models available yet — sign in to a provider to fill this list.</p>}
+            {availableModels.length > 0 && <p className="sidebar-hint">Click a model to make it the default for new tasks.</p>}
           </div>
         </section>
 
@@ -410,9 +657,12 @@ function App() {
           <div className="section-heading"><span>RECENT WORK</span><History size={14} /></div>
           <div className="history-list">
             {history.map((item) => (
-              <button className={`history-item ${item.taskId === activeTaskId ? "selected" : ""}`} key={item.taskId} onClick={() => restoreHistory(item)} title={item.goal}>
+              <button className={`history-item ${activeTab?.taskId === item.taskId ? "selected" : ""}`} key={item.taskId} onClick={() => restoreHistory(item)} title={item.goal}>
                 <span className={`history-status ${item.status}`} />
-                <span className="history-copy"><strong>{item.goal}</strong><small>{new Date(item.updatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })} · {item.status}</small></span>
+                <span className="history-copy">
+                  <strong>{tabTitle(item.goal)}</strong>
+                  <small>{new Date(item.updatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })} · {item.status}{item.artifacts?.length ? ` · ${item.artifacts.length} file${item.artifacts.length === 1 ? "" : "s"}` : ""}</small>
+                </span>
                 <ChevronRight size={14} />
               </button>
             ))}
@@ -420,55 +670,152 @@ function App() {
           </div>
         </section>
 
-        <div className="sidebar-footer"><div className="avatar">J</div><div><strong>Local workspace</strong><span>Private by default</span></div><ShieldCheck size={16} /></div>
+        <div className="sidebar-footer">
+          <div className="avatar">J</div>
+          <div><strong>Local workspace</strong><span>Private by default</span></div>
+          <button className="icon-button" aria-label="Open settings" title="Settings" onClick={openSettings}><Settings size={16} /></button>
+          <ShieldCheck size={16} />
+        </div>
       </aside>
 
       <section className="work-area">
         <header className="topbar">
-          <div className="breadcrumb"><span>Workspace</span><ChevronRight size={13} /><strong>{activeTaskId ? "Active task" : "New session"}</strong></div>
-          <div className="connection-state"><span className={`status-light ${taskStatus === "running" ? "working" : daemonStatus === "connected" ? "online" : ""}`} />{taskStatus === "running" ? "Working" : daemonStatus === "connecting" ? "Connecting…" : daemonStatus === "offline" ? <button className="reconnect-button" onClick={() => { setDaemonStatus("connecting"); invoke("connect_daemon").then(() => setDaemonStatus("connected")).catch((reason: unknown) => { setDaemonStatus("offline"); setError(`Could not reach the Cworkspace daemon: ${errorMessage(reason)}`); }); }}>Reconnect</button> : "Connected"}</div>
+          <div className="tab-strip" role="tablist" aria-label="Sessions">
+            {tabs.map((tab) => (
+              <div
+                key={tab.id}
+                role="tab"
+                aria-selected={tab.id === activeTab?.id}
+                className={`session-tab ${tab.id === activeTab?.id ? "active" : ""}`}
+                onClick={() => setActiveTabId(tab.id)}
+                title={tab.title}
+              >
+                <span className={`tab-status ${tab.status} ${tab.status === "running" ? "pulse" : ""}`} />
+                <span className="tab-title">{tab.title}</span>
+                <button
+                  className="icon-button tab-close"
+                  aria-label={`Close ${tab.title}`}
+                  onClick={(event) => { event.stopPropagation(); closeTab(tab.id); }}
+                ><X size={12} /></button>
+              </div>
+            ))}
+            <button className="icon-button tab-new" aria-label="New tab" title={IS_MAC ? "New tab (⌘T)" : "New tab (Ctrl+T)"} onClick={createTab}><Plus size={14} /></button>
+          </div>
+          <div className="connection-state"><span className={`status-light ${tabs.some((tab) => tab.status === "running") ? "working" : daemonStatus === "connected" ? "online" : ""}`} />{tabs.some((tab) => tab.status === "running") ? "Working" : daemonStatus === "connecting" ? "Connecting…" : daemonStatus === "offline" ? <button className="reconnect-button" onClick={() => { setDaemonStatus("connecting"); invoke("connect_daemon").then(() => setDaemonStatus("connected")).catch((reason: unknown) => { setDaemonStatus("offline"); if (activeTab) patchTab(activeTab.id, { error: `Could not reach the Cworkspace daemon: ${errorMessage(reason)}` }); }); }}>Reconnect</button> : "Connected"}</div>
         </header>
 
         <div className="center-scroll">
           <div className="welcome-block">
             <div className="eyebrow"><span className="eyebrow-line" /> YOUR DESK, REIMAGINED</div>
             <h1>Make room for<br /><em>good work.</em></h1>
-            <p>Bring a goal. Cworkspace will organize the steps, keep you in the loop, and place every deliverable right here.</p>
+            <p>Bring a goal. Cworkspace will organize the steps, keep you in the loop, and place every deliverable right here — one tab per task, in parallel.</p>
           </div>
 
           <form className="goal-form" onSubmit={startTask}>
             <div className="goal-form-top"><Sparkles size={16} /><label htmlFor="goal-input">What would you like to get done?</label>{folders.length > 0 && <span className="root-count">{folders.length} {folders.length === 1 ? "folder" : "folders"} in scope</span>}</div>
-            <textarea id="goal-input" ref={goalInputRef} value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="Draft a project brief, audit these figures, prepare a polished report…" rows={3} disabled={taskStatus === "running"} />
-            <div className="goal-form-bottom"><span><CircleHelp size={14} /> Your mounted folders define the workspace boundary.</span><button className="primary-action" type="submit" disabled={busy || taskStatus === "running" || !goal.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={15} fill="currentColor" />} Start task <ArrowUpRight size={15} /></button></div>
+            <textarea id="goal-input" ref={goalInputRef} value={activeTab?.goal || ""} onChange={(event) => activeTab && patchTab(activeTab.id, { goal: event.target.value })} placeholder="Draft a project brief, audit these figures, prepare a polished report…" rows={3} disabled={activeTab?.status === "running"} />
+            <div className="goal-form-bottom">
+              <span><CircleHelp size={14} /> {settings.defaultModel ? `Model: ${settings.defaultModel}` : "Your mounted folders define the workspace boundary."}</span>
+              <button className="primary-action" type="submit" disabled={busy || activeTab?.status === "running" || !activeTab?.goal.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={15} fill="currentColor" />} Start task <ArrowUpRight size={15} /></button>
+            </div>
           </form>
 
-          {notice && <div className="info-banner" role="status"><Sparkles size={15} /><span>{notice}</span><button className="icon-button" aria-label="Dismiss notice" onClick={() => setNotice("")}><X size={14} /></button></div>}
-          {error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => setError("")}><X size={15} /></button></div>}
+          {activeTab?.notice && <div className="info-banner" role="status"><Sparkles size={15} /><span>{activeTab.notice}</span><button className="icon-button" aria-label="Dismiss notice" onClick={() => patchTab(activeTab.id, { notice: "" })}><X size={14} /></button></div>}
+          {activeTab?.error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{activeTab.error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => patchTab(activeTab.id, { error: "" })}><X size={15} /></button></div>}
 
-          <div className="feed-heading"><div><span className="feed-kicker">LIVE SESSION</span><h2>{taskStatus === "running" ? "Work in motion" : taskStatus === "completed" ? "Session complete" : taskStatus === "stopped" ? "Session stopped" : "Session"}</h2></div><div className="feed-actions">{taskStatus === "running" && <button className="stop-action" onClick={stopTask}><StopCircle size={15} /> Stop task</button>}<span className={`task-badge ${taskStatus}`}>{taskStatus === "running" ? <><i className="pulse-dot" /> In progress</> : taskStatus === "completed" ? "Completed" : taskStatus === "stopped" ? "Stopped" : "Waiting"}</span></div></div>
+          <div className="feed-heading"><div><span className="feed-kicker">LIVE SESSION</span><h2>{activeTab?.status === "running" ? "Work in motion" : activeTab?.status === "completed" ? "Session complete" : activeTab?.status === "stopped" || activeTab?.status === "failed" ? "Session stopped" : "Session"}</h2></div><div className="feed-actions">{activeTab?.status === "running" && <button className="stop-action" onClick={stopTask}><StopCircle size={15} /> Stop task</button>}<span className={`task-badge ${activeTab?.status || "idle"}`}>{activeTab?.status === "running" ? <><i className="pulse-dot" /> In progress</> : activeTab?.status === "completed" ? "Completed" : activeTab?.status === "stopped" ? "Stopped" : activeTab?.status === "failed" ? "Failed" : "Waiting"}</span></div></div>
 
           <div className="feed-list">
-            {feed.map((entry) => <FeedCard key={entry.key} entry={entry} handled={handledApprovals} onAnswer={answerApproval} />)}
-            {!feed.length && <div className="feed-empty"><div className="empty-orbit"><ArrowDown size={19} /></div><strong>{taskStatus === "running" ? "Connecting to your task…" : "The next step starts with you"}</strong><span>When work begins, agents, tool activity, and approval requests will appear here.</span></div>}
+            {activeTab?.feed.map((entry) => <FeedCard key={entry.key} entry={entry} handled={activeTab.handledApprovals} onAnswer={(id, approved) => answerApproval(activeTab.id, id, approved)} />)}
+            {activeTab && !activeTab.feed.length && <div className="feed-empty"><div className="empty-orbit"><ArrowDown size={19} /></div><strong>{activeTab.status === "running" ? "Connecting to your task…" : "The next step starts with you"}</strong><span>When work begins, agents, tool activity, and approval requests will appear here.</span></div>}
           </div>
-          {feed.length > 0 && <div className="feed-end"><span /> Session activity <span /></div>}
+          {Boolean(activeTab?.feed.length) && <div className="feed-end"><span /> Session activity <span /></div>}
         </div>
       </section>
 
       <aside className={`artifact-panel ${previewOpen ? "open" : "closed"}`}>
-        <div className="artifact-header"><div><span className="feed-kicker">DELIVERABLES</span><h2>Artifacts <span>{artifacts.length.toString().padStart(2, "0")}</span></h2></div><button className="icon-button" aria-label="Close artifact panel" title="Close panel" onClick={() => setPreviewOpen(false)}><PanelRightClose size={17} /></button></div>
+        <div className="artifact-header"><div><span className="feed-kicker">DELIVERABLES</span><h2>Artifacts <span>{(activeTab?.artifacts.length || 0).toString().padStart(2, "0")}</span></h2></div><button className="icon-button" aria-label="Close artifact panel" title="Close panel" onClick={() => setPreviewOpen(false)}><PanelRightClose size={17} /></button></div>
         {!previewOpen ? <button className="reopen-preview" onClick={() => setPreviewOpen(true)}>Show artifacts <ChevronDown size={15} /></button> : (
           <>
-            {artifacts.length > 0 && <div className="artifact-tabs">{artifacts.map((artifact) => <button key={artifact.path} className={`artifact-tab ${selectedArtifact?.path === artifact.path ? "active" : ""}`} title={artifact.path} onClick={() => setSelectedArtifact(artifact)}>{iconForArtifact(artifact.path)}<span>{folderName(artifact.path)}</span></button>)}</div>}
-            <ArtifactPreview artifact={selectedArtifact} />
+            {Boolean(activeTab?.artifacts.length) && <div className="artifact-tabs">{activeTab?.artifacts.map((artifact) => <button key={artifact.path} className={`artifact-tab ${activeTab.selectedArtifact?.path === artifact.path ? "active" : ""}`} title={artifact.path} onClick={() => patchTab(activeTab.id, { selectedArtifact: artifact })}>{iconForArtifact(artifact.path)}<span>{folderName(artifact.path)}</span></button>)}</div>}
+            <ArtifactPreview artifact={activeTab?.selectedArtifact || null} />
           </>
         )}
         <div className="artifact-footnote"><ShieldCheck size={14} /><span>Previews read only from mounted folders</span></div>
       </aside>
 
       {pendingApprovals.length > 0 && <div className="approval-counter"><span className="pulse-dot" /> {pendingApprovals.length} decision{pendingApprovals.length === 1 ? "" : "s"} needed</div>}
+
+      {settingsOpen && <SettingsDialog
+        settings={settings}
+        models={models}
+        daemonInfo={daemonInfo}
+        daemonStatus={daemonStatus}
+        onChange={updateSetting}
+        onClose={() => setSettingsOpen(false)}
+      />}
     </main>
   </ErrorBoundary>);
+}
+
+function SettingsDialog({ settings, models, daemonInfo, daemonStatus, onChange, onClose }: {
+  settings: Settings;
+  models: ModelRoute[];
+  daemonInfo: DaemonInfo | null;
+  daemonStatus: "connecting" | "connected" | "offline";
+  onChange: <K extends keyof Settings>(key: K, value: Settings[K]) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="settings-overlay" onClick={onClose} role="presentation">
+      <div className="settings-dialog" role="dialog" aria-modal="true" aria-label="Settings" onClick={(event) => event.stopPropagation()}>
+        <header className="settings-header">
+          <div><span className="feed-kicker">PREFERENCES</span><h2>Settings</h2></div>
+          <button className="icon-button" aria-label="Close settings" onClick={onClose}><X size={17} /></button>
+        </header>
+
+        <section className="settings-section">
+          <h3>Workspace</h3>
+          <label className="settings-row">
+            <span className="settings-toggle"><input type="checkbox" checked={settings.reopenFolders} onChange={(event) => onChange("reopenFolders", event.target.checked)} /><i /></span>
+            <span className="settings-copy"><strong>Reopen mounted folders on launch</strong><small>Folders from your last session are remounted automatically. Nothing is sent anywhere — mounts only define the workspace boundary.</small></span>
+          </label>
+        </section>
+
+        <section className="settings-section">
+          <h3>Sessions</h3>
+          <label className="settings-row">
+            <span className="settings-toggle"><input type="checkbox" checked={settings.autoOpenArtifacts} onChange={(event) => onChange("autoOpenArtifacts", event.target.checked)} /><i /></span>
+            <span className="settings-copy"><strong>Open the artifact panel on new deliverables</strong><small>Brings the preview forward whenever a task creates a file.</small></span>
+          </label>
+          <div className="settings-row static">
+            <span className="settings-copy"><strong>Default model</strong><small>Used for every new task. Pick from the MODELS list or here — tasks start on this model without touching the terminal.</small></span>
+            <select
+              className="settings-select"
+              value={settings.defaultModel}
+              aria-label="Default model"
+              onChange={(event) => onChange("defaultModel", event.target.value)}
+            >
+              <option value="">Provider default</option>
+              {models.filter((route) => route.available).map((route) => (
+                <option key={`${route.provider}:${route.model}`} value={route.model}>{route.model} · {route.provider}</option>
+              ))}
+            </select>
+          </div>
+        </section>
+
+        <section className="settings-section">
+          <h3>Connection</h3>
+          <div className="settings-facts">
+            <div><span>Daemon</span><strong>{daemonInfo ? `${daemonInfo.name} · v${String(daemonInfo.version)}` : daemonStatus === "connected" ? "connected" : daemonStatus}</strong></div>
+            <div><span>Transport</span><strong>Named pipe · capability token</strong></div>
+            <div><span>Daemon log</span><code>{daemonInfo?.log_path || "%TEMP%\\jcode-cowork-daemon.log"}</code></div>
+            <div><span>Storage</span><strong>History and settings stay on this device</strong></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  );
 }
 
 function iconForArtifact(path: string) {

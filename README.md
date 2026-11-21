@@ -27,7 +27,7 @@
 Cworkspace bundles two applications built from this repository:
 
 - **jcode** — a Rust coding-agent CLI: parallel multi-model agent sessions, swarm coordination, memory, MCP tool servers, and a self-development mode where the agent can rebuild and reload its own binary. Providers include Claude (OAuth and API key), OpenAI / Codex (OAuth and API key), Gemini, Copilot, Bedrock, Cursor, OpenRouter, and any OpenAI-compatible endpoint.
-- **Cworkspace** — a Tauri desktop GUI (`gui/`) that talks to a locally-running `jcode --cowork-daemon` over a capability-token-authenticated Windows named pipe. It surfaces running tasks, folder mounts, approvals, and artifacts.
+- **Cworkspace** — a Tauri desktop GUI (`gui/`) that talks to a locally-running `jcode --cowork-daemon` over a capability-token-authenticated Windows named pipe. It surfaces running tasks, folder mounts, approvals, and artifacts. Since v0.1.2 it supports parallel task tabs (every daemon event is tagged with its task id), a Settings panel (folder persistence across launches, default-model selection that threads through `start_task` into the provider, daemon diagnostics), and deliverable history that survives restarts.
 
 This fork carries a security-hardening series on top of upstream jcode: authenticated daemon IPC, a human-in-the-loop approval gate for tool calls, computer-use gating with rate limits, PathJail sandboxing, and Windows job objects that kill runaway child processes. `docs/SAFETY_SYSTEM.md` is the reference.
 

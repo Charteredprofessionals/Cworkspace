@@ -2666,6 +2666,7 @@ pub async fn run_single_message_command(
 pub async fn run_cowork_task(
     goal: String,
     allowed_roots: Vec<PathBuf>,
+    model: Option<String>,
     task_id: String,
     rpc: crate::cli::cowork_rpc::CoworkRpc,
 ) -> Result<String> {
@@ -2673,7 +2674,12 @@ pub async fn run_cowork_task(
     let working_dir = roots[0].clone();
 
     let choice = super::provider_init::ProviderChoice::Auto;
-    let provider = super::provider_init::init_provider_for_run(&choice, None, false).await?;
+    let provider = super::provider_init::init_provider_for_run(
+        &choice,
+        model.as_deref().filter(|model| !model.trim().is_empty()),
+        false,
+    )
+    .await?;
     if provider.model_capabilities_need_refresh()
         && let Err(error) = provider.prefetch_models().await
     {
@@ -2696,7 +2702,9 @@ pub async fn run_cowork_task(
     let mut agent = crate::agent::Agent::new(provider, registry);
     agent.set_working_dir(&working_dir.display().to_string());
     let session_id = agent.session_id().to_owned();
-    let _registrations = rpc.register_agent_session(&session_id, roots).await?;
+    let _registrations = rpc
+        .register_agent_session(&session_id, &task_id, roots)
+        .await?;
     let base_prompt = crate::prompt::load_base_system_prompt(Some(&working_dir));
     agent.set_system_prompt(&format!(
         "{}\n\n{}",

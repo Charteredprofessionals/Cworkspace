@@ -61,15 +61,18 @@ pub enum CoworkEvent {
     ToolInvoked {
         tool_call_id: String,
         tool_name: String,
+        task_id: String,
     },
     ArtifactCreated {
         path: String,
         mime_type: String,
+        task_id: String,
     },
     ApprovalRequired {
         id: String,
         tool_name: String,
         description: String,
+        task_id: String,
     },
     TaskCompleted {
         task_id: String,
@@ -185,6 +188,7 @@ impl CoworkRpc {
     pub async fn register_agent_session(
         &self,
         session_id: &str,
+        task_id: &str,
         roots: Vec<PathBuf>,
     ) -> Result<(
         crate::tool::SessionPathValidatorRegistration,
@@ -194,6 +198,7 @@ impl CoworkRpc {
     )> {
         let jail_roots = validate_workspace_roots(roots).await?;
         let session_id = session_id.to_owned();
+        let task_id = task_id.to_owned();
         let registration_session_id = session_id.clone();
         let path_registration = tokio::task::spawn_blocking(move || {
             crate::sandbox::register_session_jail(registration_session_id, jail_roots)
@@ -201,27 +206,31 @@ impl CoworkRpc {
         .await
         .context("failed to initialize Cowork path jail")??;
         let weak = Arc::downgrade(&self.inner);
+        let approval_task_id = task_id.clone();
         let approval_registration = crate::tool::register_session_approval_requester(
             session_id.clone(),
             move |id, tool_name, description| {
                 let weak = weak.clone();
+                let task_id = approval_task_id.clone();
                 async move {
                     let inner = weak
                         .upgrade()
                         .ok_or_else(|| "Cowork daemon disconnected".to_owned())?;
                     CoworkRpc { inner }
-                        .request_tool_approval(id, tool_name, description)
+                        .request_tool_approval(id, tool_name, description, task_id)
                         .await
                         .map_err(|error| error.to_string())
                 }
             },
         );
         let weak = Arc::downgrade(&self.inner);
+        let artifact_task_id = task_id.clone();
         let artifact_registration =
             crate::tool::register_session_artifact_created_notifier(
                 session_id.clone(),
                 move |artifact| {
                 let weak = weak.clone();
+                let task_id = artifact_task_id.clone();
                 async move {
                     let inner = weak
                         .upgrade()
@@ -230,16 +239,19 @@ impl CoworkRpc {
                         .emit_event(CoworkEvent::ArtifactCreated {
                             path: artifact.path.display().to_string(),
                             mime_type: artifact.mime_type,
+                            task_id,
                         })
                         .map(|_| ())
                         .map_err(|error| error.to_string())
                 }
             });
         let weak = Arc::downgrade(&self.inner);
+        let tool_invoked_task_id = task_id.clone();
         let tool_invoked_registration = crate::tool::register_session_tool_invoked_notifier(
             session_id,
             move |invoked| {
                 let weak = weak.clone();
+                let task_id = tool_invoked_task_id.clone();
                 async move {
                     let inner = weak
                         .upgrade()
@@ -248,6 +260,7 @@ impl CoworkRpc {
                         .emit_event(CoworkEvent::ToolInvoked {
                             tool_call_id: invoked.tool_call_id,
                             tool_name: invoked.tool_name,
+                            task_id,
                         })
                         .map(|_| ())
                         .map_err(|error| error.to_string())
@@ -262,12 +275,18 @@ impl CoworkRpc {
         ))
     }
 
-    pub async fn start_task(&self, goal: String, allowed_roots: Vec<PathBuf>) -> Result<String> {
+    pub async fn start_task(
+        &self,
+        goal: String,
+        allowed_roots: Vec<PathBuf>,
+        model: Option<String>,
+    ) -> Result<String> {
         self.start_task_with(
             goal,
             allowed_roots,
-            |goal, roots, task_id, rpc| async move {
-                crate::cli::commands::run_cowork_task(goal, roots, task_id, rpc).await
+            model,
+            |goal, roots, model, task_id, rpc| async move {
+                crate::cli::commands::run_cowork_task(goal, roots, model, task_id, rpc).await
             },
         )
         .await
@@ -277,10 +296,11 @@ impl CoworkRpc {
         &self,
         goal: String,
         allowed_roots: Vec<PathBuf>,
+        model: Option<String>,
         run: F,
     ) -> Result<String>
     where
-        F: FnOnce(String, Vec<PathBuf>, String, CoworkRpc) -> Fut,
+        F: FnOnce(String, Vec<PathBuf>, Option<String>, String, CoworkRpc) -> Fut,
         Fut: Future<Output = Result<String>> + Send + 'static,
     {
         anyhow::ensure!(!goal.trim().is_empty(), "task goal cannot be empty");
@@ -289,7 +309,7 @@ impl CoworkRpc {
         let (start, started) = oneshot::channel();
         let rpc = self.clone();
         let run_task_id = task_id.clone();
-        let work = run(goal, allowed_roots, run_task_id.clone(), rpc.clone());
+        let work = run(goal, allowed_roots, model, run_task_id.clone(), rpc.clone());
         let handle = tokio::spawn(async move {
             if started.await.is_err() {
                 return;
@@ -399,7 +419,7 @@ impl CoworkRpc {
                         .upgrade()
                         .ok_or_else(|| "Cowork daemon disconnected".to_owned())?;
                     CoworkRpc { inner }
-                        .request_tool_approval(id, tool_name, description)
+                        .request_tool_approval(id, tool_name, description, String::new())
                         .await
                         .map_err(|error| error.to_string())
                 }
@@ -418,6 +438,10 @@ impl CoworkRpc {
                         .emit_event(CoworkEvent::ToolInvoked {
                             tool_call_id: invoked.tool_call_id,
                             tool_name: invoked.tool_name,
+                            // Mount-time registrations are not task-scoped;
+                            // consumers route these by their single running
+                            // task.
+                            task_id: String::new(),
                         })
                         .map(|_| ())
                         .map_err(|error| error.to_string())
@@ -459,6 +483,7 @@ impl CoworkRpc {
         id: impl Into<String>,
         tool_name: impl Into<String>,
         description: impl Into<String>,
+        task_id: impl Into<String>,
     ) -> Result<bool> {
         if self.inner.events.receiver_count() == 0 {
             return Err(anyhow!(
@@ -481,6 +506,7 @@ impl CoworkRpc {
                 id: id.clone(),
                 tool_name: tool_name.into(),
                 description: description.into(),
+                task_id: task_id.into(),
             })
             .is_err()
         {
@@ -631,7 +657,16 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                 });
             match (goal, allowed_roots) {
                 (Some(goal), Some(roots)) => rpc
-                    .start_task(goal.to_owned(), roots)
+                    .start_task(
+                goal.to_owned(),
+                roots,
+                request
+                    .params
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .filter(|model| !model.trim().is_empty()),
+            )
                     .await
                     .map(|task_id| json!({ "task_id": task_id }))
                     .map_err(|error| (-32000, error.to_string())),
@@ -913,7 +948,7 @@ mod tests {
         let request_rpc = rpc.clone();
         let request = tokio::spawn(async move {
             request_rpc
-                .request_tool_approval("call-1", "delete_file", "Remove report.docx")
+                .request_tool_approval("call-1", "delete_file", "Remove report.docx", "task-1")
                 .await
         });
 
@@ -924,6 +959,7 @@ mod tests {
                 id: "call-1".to_string(),
                 tool_name: "delete_file".to_string(),
                 description: "Remove report.docx".to_string(),
+                task_id: "task-1".to_string(),
             }
         );
         assert!(!request.is_finished());
@@ -994,7 +1030,8 @@ mod tests {
             .start_task_with(
                 "Review these files".to_string(),
                 vec![directory.path().to_path_buf()],
-                |_, _, _, _| async { std::future::pending::<Result<String>>().await },
+                None,
+                |_, _, _, _, _| async { std::future::pending::<Result<String>>().await },
             )
             .await
             .unwrap();
@@ -1026,7 +1063,8 @@ mod tests {
             .start_task_with(
                 "Review these files".to_string(),
                 vec![directory.path().to_path_buf()],
-                |_, _, _, _| async { Ok("Reviewed the workspace".to_string()) },
+                None,
+                |_, _, _, _, _| async { Ok("Reviewed the workspace".to_string()) },
             )
             .await
             .unwrap();

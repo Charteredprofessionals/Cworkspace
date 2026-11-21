@@ -501,6 +501,7 @@ async fn start_cowork_task(
     bridge: State<'_, Bridge>,
     goal: String,
     allowed_roots: Vec<String>,
+    model: Option<String>,
 ) -> Result<String, String> {
     let goal = goal.trim();
     if goal.is_empty() {
@@ -518,6 +519,9 @@ async fn start_cowork_task(
     if allowed.is_empty() || allowed.iter().any(|path| !mounted.contains(path)) {
         return Err("Tasks can use only folders mounted in this session".to_owned());
     }
+    let model = model
+        .map(|model| model.trim().to_owned())
+        .filter(|model| !model.is_empty());
     let response = tokio::task::block_in_place(|| {
         let connection = ensure_connection(&app, &bridge)?;
         connection.request(
@@ -528,6 +532,7 @@ async fn start_cowork_task(
                     .iter()
                     .map(|path| path.to_string_lossy())
                     .collect::<Vec<_>>(),
+                "model": model,
             }),
         )
     })?;
@@ -572,6 +577,32 @@ async fn list_models(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value,
     tokio::task::block_in_place(|| {
         let connection = ensure_connection(&app, &bridge)?;
         connection.request("list_models", json!({}))
+    })
+}
+
+#[derive(Serialize)]
+struct DaemonInfo {
+    name: String,
+    version: Value,
+    log_path: String,
+}
+
+/// Identity + diagnostics for the Settings panel: what the ping handshake
+/// reports and where a failed daemon start leaves its stderr log.
+#[tauri::command]
+async fn daemon_info(app: AppHandle, bridge: State<'_, Bridge>) -> Result<DaemonInfo, String> {
+    let response = tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("ping", json!({}))
+    })?;
+    Ok(DaemonInfo {
+        name: response
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("jcode-cowork")
+            .to_owned(),
+        version: response.get("version").cloned().unwrap_or(Value::Null),
+        log_path: daemon_log_path().to_string_lossy().into_owned(),
     })
 }
 
@@ -652,6 +683,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             connect_daemon,
             list_models,
+            daemon_info,
             mount_folder,
             unmount_folder,
             start_cowork_task,
