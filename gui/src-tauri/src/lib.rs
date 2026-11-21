@@ -54,6 +54,13 @@ fn daemon_log_path() -> PathBuf {
 struct Bridge {
     connection: Mutex<Option<Arc<RpcConnection>>>,
     child: Mutex<Option<Child>>,
+    /// Windows job object wrapping the daemon child. Its kill-on-close flag
+    /// terminates the daemon whenever the GUI process exits — even on a
+    /// crash or a forced kill from an installer — so an orphaned daemon can
+    /// never keep the install directory's files in use and block
+    /// uninstallation or upgrades. Raw handle stored as `isize` to keep
+    /// `Bridge` Send + Sync.
+    job: Mutex<Option<isize>>,
     mounted_roots: Mutex<Vec<PathBuf>>,
     session_id: String,
 }
@@ -64,6 +71,16 @@ impl Bridge {
     }
 
     fn shutdown(&self) {
+        // Closing the job handle terminates the daemon (kill-on-close), so
+        // this is also the cleanup path if child.kill() were to fail.
+        #[cfg(windows)]
+        if let Ok(job) = self.job.lock() {
+            if let Some(handle) = job.as_ref() {
+                unsafe {
+                    windows_sys::Win32::Foundation::CloseHandle(*handle);
+                }
+            }
+        }
         if let Ok(mut child) = self.child.lock() {
             if let Some(mut child) = child.take() {
                 if child.try_wait().ok().flatten().is_none() {
@@ -85,6 +102,7 @@ impl Default for Bridge {
         Self {
             connection: Mutex::new(None),
             child: Mutex::new(None),
+            job: Mutex::new(None),
             mounted_roots: Mutex::new(Vec::new()),
             session_id: Uuid::new_v4().to_string(),
         }
@@ -286,12 +304,63 @@ fn launch_daemon(bridge: &Bridge) -> Result<(), String> {
         *child_slot = Some(command.spawn().map_err(|error| {
             format!("Could not start jcode --cowork-daemon: {error}")
         })?);
+        // Tie the daemon to the GUI's lifetime with a kill-on-close job
+        // object: whatever ends the GUI (clean exit, crash, a forced
+        // termination from an uninstaller or the task manager) also ends
+        // the daemon, so it can never outlive the app and keep the install
+        // directory's files in use.
+        if let Some(child) = child_slot.as_mut() {
+            unsafe { attach_kill_on_close_job(&bridge.job, child) };
+        }
         Ok(())
     }
     #[cfg(not(windows))]
     {
         let _ = bridge;
         Err("Starting the Cowork daemon is supported only on Windows".to_owned())
+    }
+}
+
+/// Put `child` into a fresh kill-on-close job object and remember the job
+/// handle in `slot` so `Bridge::shutdown` can close it explicitly.
+/// Best-effort: if job creation or assignment fails the daemon still runs,
+/// just without the lifetime tie (e.g. hosts too old for nested jobs).
+#[cfg(windows)]
+unsafe fn attach_kill_on_close_job(slot: &Mutex<Option<isize>>, child: &mut Child) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+    if job == 0 {
+        return;
+    }
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if SetInformationJobObject(
+        job,
+        JobObjectExtendedLimitInformation,
+        &limits as *const _ as *const core::ffi::c_void,
+        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+    ) == 0
+    {
+        CloseHandle(job);
+        return;
+    }
+    // HANDLE is an isize in windows-sys 0.52; the child's raw handle is a
+    // pointer, so cast through the pointer's numeric value.
+    if AssignProcessToJobObject(job, child.as_raw_handle() as isize) == 0 {
+        CloseHandle(job);
+        return;
+    }
+    if let Ok(mut slot) = slot.lock() {
+        *slot = Some(job);
+    } else {
+        CloseHandle(job);
     }
 }
 

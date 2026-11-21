@@ -21,4 +21,14 @@ tokio = { version = "1", default-features = false, features = ["rt"] }
 tauri-plugin-dialog = "2"
 uuid = { version = "1", features = ["v4"] }
 
+[target.'cfg(windows)'.dependencies]
+# Kill-on-close job object ties the daemon's lifetime to the GUI process
+# (see attach_kill_on_close_job in lib.rs); an orphaned daemon would keep
+# the install directory's files in use and block uninstallers and upgrades.
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+] }
+
 [workspace]

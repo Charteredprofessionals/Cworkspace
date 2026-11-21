@@ -30,6 +30,11 @@
     "externalBin": ["binaries/jcode"],
     "shortDescription": "A desktop workspace for knowledge work with jcode",
     "category": "Productivity",
+    "windows": {
+      "nsis": {
+        "installerHooks": "./installer-hooks.nsh"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/64x64.png",
