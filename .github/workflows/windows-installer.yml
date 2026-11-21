@@ -55,7 +55,17 @@ jobs:
           cache-dependency-path: gui/package-lock.json
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version ^2.5
+        # Idempotent: the cargo cache includes ~/.cargo/bin, so after any
+        # successful run `cargo install` would abort with "binary
+        # cargo-tauri.exe already exists in destination" (run 11). Install
+        # only when the binary is absent — also saves the ~10 min compile
+        # on warm runs.
+        run: |
+          if (Test-Path "$env:USERPROFILE\.cargo\bin\cargo-tauri.exe") {
+            Write-Host "tauri-cli already cached: $(cargo tauri --version)"
+          } else {
+            cargo install tauri-cli --version ^2.5
+          }
 
       - name: Build main binary (release-lto)
         run: cargo build --profile release-lto
