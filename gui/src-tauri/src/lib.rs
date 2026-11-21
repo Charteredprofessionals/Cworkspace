@@ -335,8 +335,8 @@ fn ensure_connection(app: &AppHandle, bridge: &Bridge) -> Result<Arc<RpcConnecti
         // pointless — report why it died instead of a timeout-shaped error.
         // try_lock avoids inverting the child/connection lock order used by
         // Bridge::shutdown; skipping the check on contention is harmless.
-        if let Ok(child_slot) = bridge.child.try_lock() {
-            if let Some(child) = child_slot.as_ref() {
+        if let Ok(mut child_slot) = bridge.child.try_lock() {
+            if let Some(child) = child_slot.as_mut() {
                 if let Ok(Some(status)) = child.try_wait() {
                     let exit = status
                         .code()
