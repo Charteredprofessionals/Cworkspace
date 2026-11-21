@@ -228,34 +228,52 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #728772; outli
   .artifact-panel.closed { display: none; }
   .approval-counter { right: 12px; bottom: 12px; }
 }
-/* models */
+/* models — uses the same design language as folder/history items:
+   4px radius, ink/muted text on the light sidebar (was styled for a dark
+   theme and rendered nearly invisible: #e8e8ea on #eae9e2). */
 .models-section .model-list {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  margin-top: 6px;
 }
 
 .model-item {
   display: flex;
   flex-direction: column;
-  padding: 5px 10px;
-  border-radius: 8px;
+  gap: 1px;
+  padding: 5px 8px;
+  border-radius: 4px;
   min-width: 0;
 }
 
+.model-item:hover { background: #e3e2da; }
+
 .model-item .model-name {
-  font-size: 12px;
-  font-weight: 550;
-  color: #e8e8ea;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .model-item .model-provider {
-  font-size: 10px;
-  color: #9a9aa2;
+  font-size: 9px;
+  color: #8a8b81;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* neutral companion to .error-banner for informational messages
+   (history restore, hints) — errors keep role="alert" and the warm style */
+.info-banner { max-width: 650px; margin: 12px auto 0; display: flex; gap: 9px; align-items: flex-start; padding: 10px 11px; border: 1px solid #d9e2d3; border-radius: 4px; background: #f4f7f1; color: #526b54; font-size: 10px; line-height: 1.5; }
+.info-banner > span { flex: 1; }
+.info-banner .icon-button { color: #526b54; padding: 1px; }
+
+.approval-actions button:disabled { opacity: .5; cursor: default; }
+
+@media (prefers-reduced-motion: reduce) {
+  .spin, .pulse-dot, .status-light.working { animation: none; }
 }

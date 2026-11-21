@@ -125,7 +125,7 @@ impl RpcConnection {
         }
         if let Ok(mut waiting) = self.pending.lock() {
             for (_, sender) in waiting.drain() {
-                let _ = sender.send(Err("The Cowork desktop app is closing".to_owned()));
+                let _ = sender.send(Err("The Cworkspace desktop app is closing".to_owned()));
             }
         }
     }
@@ -179,7 +179,7 @@ impl RpcConnection {
             connection_alive.alive.store(false, Ordering::Release);
             if let Ok(mut waiting) = pending.lock() {
                 for (_, sender) in waiting.drain() {
-                    let _ = sender.send(Err("The jcode Cowork daemon disconnected".to_owned()));
+                    let _ = sender.send(Err("The Cworkspace daemon disconnected".to_owned()));
                 }
             }
         });
@@ -253,7 +253,7 @@ fn open_named_pipe() -> Result<File, String> {
     #[cfg(not(windows))]
     {
         let _ = PIPE_NAME;
-        Err("The jcode Cowork named-pipe bridge is available only on Windows".to_owned())
+        Err("The Cworkspace named-pipe bridge is available only on Windows".to_owned())
     }
 }
 
@@ -317,7 +317,7 @@ fn launch_daemon(bridge: &Bridge) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let _ = bridge;
-        Err("Starting the Cowork daemon is supported only on Windows".to_owned())
+        Err("Starting the Cworkspace daemon is supported only on Windows".to_owned())
     }
 }
 
@@ -422,7 +422,7 @@ fn ensure_connection(app: &AppHandle, bridge: &Bridge) -> Result<Arc<RpcConnecti
         thread::sleep(Duration::from_millis(100));
     }
     Err(if last_error.is_empty() {
-        "Could not connect to the jcode Cowork daemon".to_owned()
+        "Could not connect to the Cworkspace daemon".to_owned()
     } else {
         last_error
     })
@@ -660,7 +660,7 @@ pub fn run() {
             read_artifact
         ])
         .build(tauri::generate_context!())
-        .expect("error while building jcode Cowork")
+        .expect("error while building Cworkspace")
         .run(|app, event| {
             if matches!(event, RunEvent::Exit) {
                 if let Some(bridge) = app.try_state::<Bridge>() {

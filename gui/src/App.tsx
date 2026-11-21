@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
@@ -121,6 +121,8 @@ type PreviewState =
 
 const HISTORY_KEY = "jcode-cowork-history-v1";
 
+const IS_MAC = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || "");
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -173,6 +175,8 @@ function App() {
   const [error, setError] = useState("");
   const [handledApprovals, setHandledApprovals] = useState<Record<string, boolean>>({});
   const [models, setModels] = useState<ModelRoute[]>([]);
+  const [notice, setNotice] = useState("");
+  const goalInputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 30)));
@@ -185,7 +189,7 @@ function App() {
       .catch((reason: unknown) => {
         if (!cancelled) {
           setDaemonStatus("offline");
-          setError(`Could not connect to jcode: ${errorMessage(reason)}`);
+          setError(`Could not connect to the Cworkspace daemon: ${errorMessage(reason)}`);
         }
       });
     return () => { cancelled = true; };
@@ -205,6 +209,29 @@ function App() {
       });
     return () => { cancelled = true; };
   }, [daemonStatus]);
+
+  function startNewSession() {
+    setGoal("");
+    setFeed([]);
+    setArtifacts([]);
+    setSelectedArtifact(null);
+    setTaskStatus("idle");
+    setError("");
+    setNotice("");
+    requestAnimationFrame(() => goalInputRef.current?.focus());
+  }
+
+  // The "New task" button advertises Ctrl+N (⌘N on macOS); make it real.
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        startNewSession();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -251,6 +278,7 @@ function App() {
 
   async function mountFolder() {
     setError("");
+    setNotice("");
     try {
       const selected = await open({ directory: true, multiple: false, title: "Choose a workspace folder" });
       if (typeof selected !== "string") return;
@@ -279,6 +307,7 @@ function App() {
     event.preventDefault();
     if (!goal.trim()) return;
     setError("");
+    setNotice("");
     if (!folders.length) {
       setError("Mount a workspace folder before starting a task.");
       return;
@@ -293,7 +322,7 @@ function App() {
       setDaemonStatus("connected");
       setActiveTaskId(taskId);
       setTaskStatus("running");
-      setHistory((current) => [{ taskId, goal: goal.trim(), status: "running" as const, updatedAt: Date.now(), feed, artifacts, selectedArtifact, handledApprovals, activeTaskId: taskId, taskStatus: "running" as const } as HistoryEntry, ...current.filter((item) => item.taskId !== taskId)].slice(0, 30));
+      setHistory((current) => [{ taskId, goal: goal.trim(), status: "running" as const, updatedAt: Date.now() } as HistoryEntry, ...current.filter((item) => item.taskId !== taskId)].slice(0, 30));
     } catch (reason) {
       setError(`Could not start task: ${errorMessage(reason)}`);
     } finally {
@@ -325,12 +354,14 @@ function App() {
 
   function restoreHistory(item: HistoryEntry) {
     setGoal(item.goal);
-    setActiveTaskId(item.taskId);
-    setTaskStatus(item.status === "running" ? "running" : item.status === "completed" ? "completed" : "stopped");
+    setActiveTaskId("");
+    setTaskStatus("idle");
     setFeed([]);
     setArtifacts([]);
     setSelectedArtifact(null);
-    setError("History stores task summaries only; daemon events are available for the current connection.");
+    setError("");
+    setNotice(`Loaded “${item.goal}” into the composer — review it, then start a fresh task. History keeps task summaries only.`);
+    requestAnimationFrame(() => goalInputRef.current?.focus());
   }
 
   return (
@@ -338,12 +369,12 @@ function App() {
     <main className="app-shell">
       <aside className="sidebar">
         <div className="brand-lockup">
-          <div className="brand-mark"><span>j</span><i /></div>
-          <div><div className="brand-name">jcode <span>cowork</span></div><div className="brand-subtitle">A space for the work ahead</div></div>
+          <div className="brand-mark"><span>C</span><i /></div>
+          <div><div className="brand-name">C<span>workspace</span></div><div className="brand-subtitle">A space for the work ahead</div></div>
         </div>
 
-        <button className="new-session" onClick={() => { setGoal(""); setFeed([]); setArtifacts([]); setSelectedArtifact(null); setTaskStatus("idle"); setError(""); }}>
-          <Plus size={16} strokeWidth={2.2} /> New task <span>⌘ N</span>
+        <button className="new-session" onClick={startNewSession}>
+          <Plus size={16} strokeWidth={2.2} /> New task <span>{IS_MAC ? "⌘ N" : "Ctrl N"}</span>
         </button>
 
         <section className="sidebar-section">
@@ -371,6 +402,7 @@ function App() {
               </div>
             ))}
             {!models.length && <p className="sidebar-empty">Model catalogs load automatically once signed in.</p>}
+            {models.length > 0 && !models.some((route) => route.available) && <p className="sidebar-empty">No models available yet — sign in to a provider to fill this list.</p>}
           </div>
         </section>
 
@@ -394,25 +426,26 @@ function App() {
       <section className="work-area">
         <header className="topbar">
           <div className="breadcrumb"><span>Workspace</span><ChevronRight size={13} /><strong>{activeTaskId ? "Active task" : "New session"}</strong></div>
-          <div className="connection-state"><span className={`status-light ${taskStatus === "running" ? "working" : daemonStatus === "connected" ? "online" : ""}`} />{taskStatus === "running" ? "Working" : daemonStatus === "connecting" ? "Connecting to jcode…" : daemonStatus === "offline" ? <button className="reconnect-button" onClick={() => { setDaemonStatus("connecting"); invoke("connect_daemon").then(() => setDaemonStatus("connected")).catch((reason: unknown) => { setDaemonStatus("offline"); setError(`Could not connect to jcode: ${errorMessage(reason)}`); }); }}>Reconnect</button> : "Connected to jcode"}</div>
+          <div className="connection-state"><span className={`status-light ${taskStatus === "running" ? "working" : daemonStatus === "connected" ? "online" : ""}`} />{taskStatus === "running" ? "Working" : daemonStatus === "connecting" ? "Connecting…" : daemonStatus === "offline" ? <button className="reconnect-button" onClick={() => { setDaemonStatus("connecting"); invoke("connect_daemon").then(() => setDaemonStatus("connected")).catch((reason: unknown) => { setDaemonStatus("offline"); setError(`Could not reach the Cworkspace daemon: ${errorMessage(reason)}`); }); }}>Reconnect</button> : "Connected"}</div>
         </header>
 
         <div className="center-scroll">
           <div className="welcome-block">
             <div className="eyebrow"><span className="eyebrow-line" /> YOUR DESK, REIMAGINED</div>
             <h1>Make room for<br /><em>good work.</em></h1>
-            <p>Bring a goal. jcode will organize the steps, keep you in the loop, and place every deliverable right here.</p>
+            <p>Bring a goal. Cworkspace will organize the steps, keep you in the loop, and place every deliverable right here.</p>
           </div>
 
           <form className="goal-form" onSubmit={startTask}>
             <div className="goal-form-top"><Sparkles size={16} /><label htmlFor="goal-input">What would you like to get done?</label>{folders.length > 0 && <span className="root-count">{folders.length} {folders.length === 1 ? "folder" : "folders"} in scope</span>}</div>
-            <textarea id="goal-input" value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="Draft a project brief, audit these figures, prepare a polished report…" rows={3} disabled={taskStatus === "running"} />
+            <textarea id="goal-input" ref={goalInputRef} value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="Draft a project brief, audit these figures, prepare a polished report…" rows={3} disabled={taskStatus === "running"} />
             <div className="goal-form-bottom"><span><CircleHelp size={14} /> Your mounted folders define the workspace boundary.</span><button className="primary-action" type="submit" disabled={busy || taskStatus === "running" || !goal.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={15} fill="currentColor" />} Start task <ArrowUpRight size={15} /></button></div>
           </form>
 
+          {notice && <div className="info-banner" role="status"><Sparkles size={15} /><span>{notice}</span><button className="icon-button" aria-label="Dismiss notice" onClick={() => setNotice("")}><X size={14} /></button></div>}
           {error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => setError("")}><X size={15} /></button></div>}
 
-          <div className="feed-heading"><div><span className="feed-kicker">LIVE SESSION</span><h2>Work in motion</h2></div><div className="feed-actions">{taskStatus === "running" && <button className="stop-action" onClick={stopTask}><StopCircle size={15} /> Stop task</button>}<span className={`task-badge ${taskStatus}`}>{taskStatus === "running" ? <><i className="pulse-dot" /> In progress</> : taskStatus === "completed" ? "Completed" : taskStatus === "stopped" ? "Stopped" : "Waiting"}</span></div></div>
+          <div className="feed-heading"><div><span className="feed-kicker">LIVE SESSION</span><h2>{taskStatus === "running" ? "Work in motion" : taskStatus === "completed" ? "Session complete" : taskStatus === "stopped" ? "Session stopped" : "Session"}</h2></div><div className="feed-actions">{taskStatus === "running" && <button className="stop-action" onClick={stopTask}><StopCircle size={15} /> Stop task</button>}<span className={`task-badge ${taskStatus}`}>{taskStatus === "running" ? <><i className="pulse-dot" /> In progress</> : taskStatus === "completed" ? "Completed" : taskStatus === "stopped" ? "Stopped" : "Waiting"}</span></div></div>
 
           <div className="feed-list">
             {feed.map((entry) => <FeedCard key={entry.key} entry={entry} handled={handledApprovals} onAnswer={answerApproval} />)}
@@ -449,18 +482,19 @@ function FeedCard({ entry, handled, onAnswer }: { entry: FeedEntry; handled: Rec
   const approvalId = entry.data.id;
   const approvalKey = identifier(entry.data, "id");
   const approvalHandled = approvalKey in handled;
-  const agentName = text(entry.data, "agent", "agent_name", "name") || "Cowork agent";
+  const agentName = text(entry.data, "agent", "agent_name", "name") || "Cworkspace agent";
   const toolName = text(entry.data, "tool", "tool_name", "name") || "Tool";
   const description = text(entry.data, "description", "summary", "message", "input", "arguments");
   const artifactPath = text(entry.data, "path");
+  const approvalReady = typeof approvalId === "string" || typeof approvalId === "number";
 
   return (
     <article className={`feed-entry ${entry.event.toLowerCase()}`}>
       <div className="timeline-rail"><span className={`event-symbol ${entry.event.toLowerCase()}`}>{entry.event === "AgentSpawned" ? <Sparkles size={14} /> : entry.event === "ToolInvoked" ? <ChevronRight size={14} /> : entry.event === "ArtifactCreated" ? <FileText size={14} /> : entry.event === "ApprovalRequired" ? <ShieldCheck size={14} /> : <Check size={14} />}</span><span className="rail-line" /></div>
       <div className="event-body">
-        <button className="event-title-row" onClick={() => setExpanded((value) => !value)}><div><span className="event-label">{label}</span><strong>{entry.event === "AgentSpawned" ? agentName : entry.event === "ToolInvoked" ? toolName : entry.event === "ArtifactCreated" ? folderName(artifactPath || "New file") : entry.event === "ApprovalRequired" ? text(entry.data, "tool", "tool_name") || "Action needs your approval" : "This task is complete"}</strong></div><span className="event-time"><Clock3 size={12} /> {new Date(entry.createdAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span></button>
+        <button className="event-title-row" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><div><span className="event-label">{label}</span><strong>{entry.event === "AgentSpawned" ? agentName : entry.event === "ToolInvoked" ? toolName : entry.event === "ArtifactCreated" ? folderName(artifactPath || "New file") : entry.event === "ApprovalRequired" ? text(entry.data, "tool", "tool_name") || "Action needs your approval" : "This task is complete"}</strong></div><span className="event-time"><Clock3 size={12} /> {new Date(entry.createdAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span></button>
         {expanded && <div className="event-detail">
-          {entry.event === "ApprovalRequired" ? <div className={`approval-card ${approvalHandled ? "answered" : ""}`}><div className="approval-copy"><span className="approval-eyebrow"><ShieldCheck size={13} /> YOUR DECISION</span><p>{description || "An agent is requesting permission to continue with this action."}</p>{text(entry.data, "tool", "tool_name") && <code>{text(entry.data, "tool", "tool_name")}</code>}</div>{approvalHandled ? <div className="approval-result"><Check size={14} /> {handled[approvalKey] ? "Allowed" : "Rejected"}</div> : <div className="approval-actions"><button className="reject-button" onClick={() => typeof approvalId === "string" || typeof approvalId === "number" ? onAnswer(approvalId, false) : undefined}><X size={14} /> Reject</button><button className="allow-button" onClick={() => typeof approvalId === "string" || typeof approvalId === "number" ? onAnswer(approvalId, true) : undefined}><Check size={14} /> Allow</button></div>}</div>
+          {entry.event === "ApprovalRequired" ? <div className={`approval-card ${approvalHandled ? "answered" : ""}`}><div className="approval-copy"><span className="approval-eyebrow"><ShieldCheck size={13} /> YOUR DECISION</span><p>{description || "An agent is requesting permission to continue with this action."}</p>{text(entry.data, "tool", "tool_name") && <code>{text(entry.data, "tool", "tool_name")}</code>}</div>{approvalHandled ? <div className="approval-result"><Check size={14} /> {handled[approvalKey] ? "Allowed" : "Rejected"}</div> : <div className="approval-actions"><button className="reject-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, false)}><X size={14} /> Reject</button><button className="allow-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, true)}><Check size={14} /> Allow</button></div>}</div>
           : entry.event === "ArtifactCreated" ? <p className="event-description">{artifactPath || description || "A new deliverable is ready to preview."}</p>
           : <p className="event-description">{description || (entry.event === "AgentSpawned" ? "Preparing a focused workstream." : entry.event === "ToolInvoked" ? "Working through the requested step." : "The requested work has finished.")}</p>}
         </div>}

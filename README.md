@@ -10,7 +10,7 @@
 # Cworkspace
 
 <p>
-  <strong>A hardened fork of the jcode coding-agent CLI, shipped with the Cowork desktop companion.</strong><br>
+  <strong>A hardened fork of the jcode coding-agent CLI, shipped with the Cworkspace desktop companion.</strong><br>
   Run dozens of agents in parallel without melting your machine. More agents, less RAM, no lag.
 </p>
 
@@ -27,7 +27,7 @@
 Cworkspace bundles two applications built from this repository:
 
 - **jcode** — a Rust coding-agent CLI: parallel multi-model agent sessions, swarm coordination, memory, MCP tool servers, and a self-development mode where the agent can rebuild and reload its own binary. Providers include Claude (OAuth and API key), OpenAI / Codex (OAuth and API key), Gemini, Copilot, Bedrock, Cursor, OpenRouter, and any OpenAI-compatible endpoint.
-- **jcode Cowork** — a Tauri desktop GUI (`gui/`) that talks to a locally-running `jcode --cowork-daemon` over a capability-token-authenticated Windows named pipe. It surfaces running tasks, folder mounts, approvals, and artifacts.
+- **Cworkspace** — a Tauri desktop GUI (`gui/`) that talks to a locally-running `jcode --cowork-daemon` over a capability-token-authenticated Windows named pipe. It surfaces running tasks, folder mounts, approvals, and artifacts.
 
 This fork carries a security-hardening series on top of upstream jcode: authenticated daemon IPC, a human-in-the-loop approval gate for tool calls, computer-use gating with rate limits, PathJail sandboxing, and Windows job objects that kill runaway child processes. `docs/SAFETY_SYSTEM.md` is the reference.
 
@@ -53,7 +53,7 @@ Prebuilt Windows installers (MSI/EXE) are built by the [Windows Installer workfl
 # CLI (Rust workspace, ~90 crates; root package `jcode`)
 cargo build
 
-# Cowork GUI (Tauri v2 + React)
+# Cworkspace GUI (Tauri v2 + React)
 cd gui
 npm ci
 npm run tauri dev     # dev
@@ -68,7 +68,7 @@ A Nix dev shell is available (`nix develop`, see [CONTRIBUTING.md](CONTRIBUTING.
 |---|---|
 | `src/` | CLI binary and command layer (`jcode`, `jcode --cowork-daemon`) |
 | `crates/` | Rust workspace: providers, agent runtime, tools, TUI, IPC, security |
-| `gui/` | Cowork desktop app (React + Tauri v2) |
+| `gui/` | Cworkspace desktop app (React + Tauri v2) |
 | `scripts/` | Installers, release tooling, CI budget gates, dev helpers |
 | `docs/` | Reference documentation (`docs/README.md` is the index) |
 | `changelog/` | Structured per-version release notes consumed by release tooling |

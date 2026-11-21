@@ -1,8 +1,8 @@
 [package]
 name = "jcode-cowork-gui"
 version = "0.1.0"
-description = "jcode Cowork desktop interface"
-authors = ["jcode"]
+description = "Cworkspace desktop interface"
+authors = ["Cworkspace"]
 edition = "2021"
 
 [lib]
