@@ -879,7 +879,11 @@ async fn mcp_add(
         if let Some(env) = env.filter(|env| !env.is_empty()) {
             spec["env"] = json!(env);
         }
-        connection.request("mcp.add", json!({ "name": name, ..spec }))
+        // `json!` has no struct-update spread, so the name is inserted into
+        // the spec object directly.
+        let mut params = spec;
+        params["name"] = json!(name);
+        connection.request("mcp.add", params)
     })
 }
 
