@@ -51,6 +51,34 @@ fn daemon_log_path() -> PathBuf {
     std::env::temp_dir().join("jcode-cowork-daemon.log")
 }
 
+/// Rebuild the union of project mount roots from the daemon's project list.
+/// Best-effort: on failure the previous list stays (previews degrade, they
+/// never break).
+fn refresh_project_roots(connection: &RpcConnection, bridge: &Bridge) {
+    let Ok(Ok(list)) = connection.request("project.list", json!({})) else {
+        return;
+    };
+    let Some(projects) = list.get("projects").and_then(Value::as_array) else {
+        return;
+    };
+    let mut roots = Vec::new();
+    for project in projects {
+        if let Some(mounts) = project.get("mounts").and_then(Value::as_array) {
+            for mount in mounts {
+                if let Some(path) = mount.get("path").and_then(Value::as_str) {
+                    let path = PathBuf::from(path);
+                    if !roots.contains(&path) {
+                        roots.push(path);
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(mut slot) = bridge.project_roots.lock() {
+        *slot = roots;
+    }
+}
+
 struct Bridge {
     connection: Mutex<Option<Arc<RpcConnection>>>,
     child: Mutex<Option<Child>>,
@@ -62,6 +90,10 @@ struct Bridge {
     /// `Bridge` Send + Sync.
     job: Mutex<Option<isize>>,
     mounted_roots: Mutex<Vec<PathBuf>>,
+    /// Union of every project's mount roots (daemon-side). Project-scoped
+    /// tasks never session-mount, so artifact previews must also accept
+    /// files living inside project mounts.
+    project_roots: Mutex<Vec<PathBuf>>,
     session_id: String,
 }
 
@@ -104,6 +136,7 @@ impl Default for Bridge {
             child: Mutex::new(None),
             job: Mutex::new(None),
             mounted_roots: Mutex::new(Vec::new()),
+            project_roots: Mutex::new(Vec::new()),
             session_id: Uuid::new_v4().to_string(),
         }
     }
@@ -503,6 +536,7 @@ async fn start_cowork_task(
     project_id: Option<String>,
     allowed_roots: Vec<String>,
     model: Option<String>,
+    instructions: Option<String>,
 ) -> Result<String, String> {
     let goal = goal.trim();
     if goal.is_empty() {
@@ -511,6 +545,9 @@ async fn start_cowork_task(
     let model = model
         .map(|model| model.trim().to_owned())
         .filter(|model| !model.is_empty());
+    let instructions = instructions
+        .map(|instructions| instructions.trim().to_owned())
+        .filter(|instructions| !instructions.is_empty());
     let project_id = project_id
         .map(|project_id| project_id.trim().to_owned())
         .filter(|project_id| !project_id.is_empty());
@@ -542,6 +579,7 @@ async fn start_cowork_task(
                 .map(|path| path.to_string_lossy())
                 .collect::<Vec<_>>(),
             "model": model,
+            "instructions": instructions,
         })
     };
     let response = tokio::task::block_in_place(|| {
@@ -677,14 +715,16 @@ async fn mount_add(
     let canonical = canonical_folder(&path)?;
     tokio::task::block_in_place(|| {
         let connection = ensure_connection(&app, &bridge)?;
-        connection.request(
+        let response = connection.request(
             "mount.add",
             json!({
                 "project_id": project_id,
                 "path": canonical.to_string_lossy(),
                 "access": access,
             }),
-        )
+        );
+        refresh_project_roots(&connection, &bridge);
+        response
     })
 }
 
@@ -698,13 +738,15 @@ async fn mount_revoke(
     let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
     tokio::task::block_in_place(|| {
         let connection = ensure_connection(&app, &bridge)?;
-        connection.request(
+        let response = connection.request(
             "mount.revoke",
             json!({
                 "project_id": project_id,
                 "path": canonical.to_string_lossy(),
             }),
-        )
+        );
+        refresh_project_roots(&connection, &bridge);
+        response
     })
 }
 
@@ -728,6 +770,171 @@ async fn settings_update(
             "settings.update",
             json!({ "approval_mode": approval_mode }),
         )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Protocol v3 parity surfaces: every remaining jcode capability the desktop
+// was missing, bridged as thin, named pass-throughs.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn task_transcript(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    task_id: String,
+    limit: Option<u32>,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request(
+            "task.transcript",
+            json!({ "task_id": task_id, "limit": limit }),
+        )
+    })
+}
+
+#[tauri::command]
+async fn tools_list(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("tools.list", json!({}))
+    })
+}
+
+#[tauri::command]
+async fn usage_report(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("usage.report", json!({}))
+    })
+}
+
+#[tauri::command]
+async fn auth_status(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("auth.status", json!({}))
+    })
+}
+
+#[tauri::command]
+async fn auth_set_api_key(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    provider: String,
+    api_key: String,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request(
+            "auth.set_api_key",
+            json!({ "provider": provider, "api_key": api_key }),
+        )
+    })
+}
+
+#[tauri::command]
+async fn auth_clear(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    provider: String,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("auth.clear", json!({ "provider": provider }))
+    })
+}
+
+#[tauri::command]
+async fn mcp_list(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("mcp.list", json!({}))
+    })
+}
+
+#[tauri::command]
+async fn mcp_add(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    name: String,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    url: Option<String>,
+    env: Option<std::collections::HashMap<String, String>>,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        let mut spec = json!({});
+        if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
+            spec["command"] = json!(command);
+        }
+        if let Some(args) = args.filter(|args| !args.is_empty()) {
+            spec["args"] = json!(args);
+        }
+        if let Some(url) = url.filter(|url| !url.trim().is_empty()) {
+            spec["url"] = json!(url);
+        }
+        if let Some(env) = env.filter(|env| !env.is_empty()) {
+            spec["env"] = json!(env);
+        }
+        connection.request("mcp.add", json!({ "name": name, ..spec }))
+    })
+}
+
+#[tauri::command]
+async fn mcp_remove(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    name: String,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("mcp.remove", json!({ "name": name }))
+    })
+}
+
+#[tauri::command]
+async fn schedule_create(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    project_id: String,
+    goal: String,
+    run_at_unix_secs: u64,
+    model: Option<String>,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request(
+            "schedule.create",
+            json!({
+                "project_id": project_id,
+                "goal": goal,
+                "run_at_unix_secs": run_at_unix_secs,
+                "model": model,
+            }),
+        )
+    })
+}
+
+#[tauri::command]
+async fn schedule_list(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("schedule.list", json!({}))
+    })
+}
+
+#[tauri::command]
+async fn schedule_cancel(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    id: String,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("schedule.cancel", json!({ "id": id }))
     })
 }
 
@@ -777,8 +984,13 @@ async fn read_artifact(
         .lock()
         .map_err(|_| "Mounted folder state is unavailable".to_owned())?
         .clone();
+    let project_roots = bridge
+        .project_roots
+        .lock()
+        .map_err(|_| "Project mount state is unavailable".to_owned())?
+        .clone();
     tauri::async_runtime::spawn_blocking(move || {
-        read_artifact_blocking(mounted_roots, path)
+        read_artifact_blocking(mounted_roots, project_roots, path)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -786,14 +998,20 @@ async fn read_artifact(
 
 fn read_artifact_blocking(
     mounted_roots: Vec<PathBuf>,
+    project_roots: Vec<PathBuf>,
     path: String,
 ) -> Result<ArtifactPayload, String> {
     let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
-    if !mounted_roots
+    let inside_mounted = mounted_roots
         .iter()
-        .any(|root| canonical.starts_with(root))
-    {
-        return Err("Artifact is outside the mounted workspace folders".to_owned());
+        .any(|root| canonical.starts_with(root));
+    let inside_project = project_roots
+        .iter()
+        .any(|root| canonical.starts_with(root));
+    if !inside_mounted && !inside_project {
+        return Err(
+            "Artifact is outside the mounted workspace folders and project mounts".to_owned(),
+        );
     }
     let metadata = fs::metadata(&canonical).map_err(|error| error.to_string())?;
     if !metadata.is_file() || metadata.len() > 30 * 1024 * 1024 {
@@ -804,12 +1022,17 @@ fn read_artifact_blocking(
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    // Inline-preview types carry their real mime; everything else streams as
+    // a download so no artifact type is a dead end in the desktop app.
     let mime_type = match extension.as_str() {
         "md" | "markdown" => "text/markdown",
         "pdf" => "application/pdf",
         "xlsx" | "xls" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        _ => return Err("Preview supports Markdown, PDF, XLSX, and DOCX files".to_owned()),
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "txt" | "log" | "json" | "csv" | "toml" | "yaml" | "yml" | "rs" | "py" | "js" | "ts"
+        | "tsx" | "jsx" | "html" | "css" | "xml" | "svg" => "text/plain",
+        _ => "application/octet-stream",
     };
     let bytes = fs::read(&canonical).map_err(|error| error.to_string())?;
     Ok(ArtifactPayload {
@@ -848,7 +1071,19 @@ pub fn run() {
             mount_add,
             mount_revoke,
             settings_get,
-            settings_update
+            settings_update,
+            task_transcript,
+            tools_list,
+            usage_report,
+            auth_status,
+            auth_set_api_key,
+            auth_clear,
+            mcp_list,
+            mcp_add,
+            mcp_remove,
+            schedule_create,
+            schedule_list,
+            schedule_cancel
         ])
         .build(tauri::generate_context!())
         .expect("error while building Cworkspace")

@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
+use crate::cli::cowork_schedule::{now_unix_secs, ScheduleStore};
 use crate::cli::cowork_projects::MountAccess;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
@@ -14,7 +15,10 @@ pub const PIPE_NAME: &str = r"\\.\pipe\jcode-cowork";
 
 /// Wire protocol version. Bump on any breaking RPC contract change; the GUI
 /// compares this at connect time via `ping` and refuses mismatched majors.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3: parity surfaces for every jcode capability the desktop was missing —
+/// tool catalog, task transcripts, usage reports, auth status/keys,
+/// MCP server management, and scheduled tasks.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Tool names considered read-only for the auto-allow policy. They cannot
 /// mutate the workspace: reads list files, grep searches content, webfetch
@@ -225,6 +229,9 @@ struct CoworkRpcInner {
     tool_invoked_registrations:
         Mutex<HashMap<String, crate::tool::SessionToolInvokedRegistration>>,
     tasks: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// task_id -> jcode session_id, most recent last. Lets `task.transcript`
+    /// read a task's persisted conversation even after the task completes.
+    task_sessions: Mutex<VecDeque<(String, String)>>,
     /// Lazily bootstrapped provider used to answer `list_models` without
     /// waiting for a task. Each runtime auto-fetches its model catalog from
     /// the provider's own endpoint (TTL-cached, static fallback offline).
@@ -273,6 +280,7 @@ impl CoworkRpc {
                 approval_registrations: Mutex::new(HashMap::new()),
                 tool_invoked_registrations: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(HashMap::new()),
+                task_sessions: Mutex::new(VecDeque::new()),
                 models_provider: tokio::sync::OnceCell::new(),
                 approval_policy: std::sync::Mutex::new(load_policy()),
                 project_store: std::sync::OnceLock::new(),
@@ -785,6 +793,31 @@ pub async fn list_tasks(&self) -> Vec<(String, bool)> {
             .is_some_and(|sender| sender.send(approved).is_ok())
     }
 
+    /// Associate a task with its jcode session so `task.transcript` can read
+    /// the persisted conversation later, even after the task completes.
+    /// Called from `run_cowork_task` right after the agent session exists.
+    pub async fn note_task_session(&self, task_id: &str, session_id: &str) {
+        let mut sessions = self.inner.task_sessions.lock().await;
+        sessions.retain(|(existing, _)| existing != task_id);
+        sessions.push_back((task_id.to_owned(), session_id.to_owned()));
+        // Bound the map: transcripts of long-finished tasks are still
+        // reachable on disk via the session store if ever needed again.
+        while sessions.len() > 200 {
+            sessions.pop_front();
+        }
+    }
+
+    pub async fn task_session_id(&self, task_id: &str) -> Option<String> {
+        self.inner
+            .task_sessions
+            .lock()
+            .await
+            .iter()
+            .rev()
+            .find(|(existing, _)| existing == task_id)
+            .map(|(_, session_id)| session_id.clone())
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<CoworkEvent> {
         self.inner.events.subscribe()
     }
@@ -811,6 +844,526 @@ pub(crate) async fn validate_workspace_roots(roots: Vec<PathBuf>) -> Result<Vec<
         }
     }
     Ok(canonical_roots)
+}
+
+/// Cowork-facing catalog of the agent tools desktop tasks can use. Mirrors
+/// the base registry (`Registry::new`) plus the notes that matter to the GUI:
+/// which tools are read-only under the auto-allow policy, and that configured
+/// MCP servers add `mcp__<server>__<tool>` entries dynamically. Kept as data
+/// on purpose — the registry itself has no name iteration to reuse.
+pub const TOOL_CATALOG: &[(&str, &str, bool)] = &[
+    ("read", "Read a file from a mounted folder", true),
+    ("ls", "List directory contents", true),
+    ("agentgrep", "Search file contents across the workspace", true),
+    ("glob", "Find files by glob pattern", true),
+    ("webfetch", "Fetch a URL into the transcript", true),
+    ("websearch", "Search the web", true),
+    ("write", "Create or overwrite a file", false),
+    ("edit", "Edit an existing file", false),
+    ("replace", "Replace text in a file (alias: multiedit)", false),
+    ("apply_patch", "Apply a structured patch across files", false),
+    ("bash", "Run a shell command inside the workspace", false),
+    ("office_docs", "Author xlsx / docx / pptx / pdf documents", false),
+    ("browser", "Control a browser session", false),
+    ("open", "Open a file or URL in the OS default app", false),
+    ("computer_use", "Drive the Windows UI (mouse, keyboard, screenshots)", false),
+    ("macos_computer_use", "Drive the macOS UI (macOS builds)", false),
+    ("compile_remote", "Compile on the remote build service", false),
+    ("bg", "Run a background job and collect it later", false),
+    ("todo", "Maintain the task's own todo list", false),
+    ("memory", "Read and write the persistent memory store", false),
+    ("session_search", "Semantic search over past sessions", true),
+    ("schedule", "Queue a scheduled follow-up task", false),
+    ("gmail", "Read and search Gmail (when connected)", false),
+    ("calendar", "Read Google Calendar (when connected)", false),
+    ("batch", "Run multiple tool calls in parallel (opt-in)", false),
+    ("swarm", "Coordinate sub-agents (per-session)", false),
+    ("codemode", "Compose tools into scripts (opt-in)", false),
+    ("selfdev", "jcode self-development tasks (opt-in)", false),
+    (
+        "mcp__*",
+        "One entry per tool exposed by each configured MCP server (see mcp.list)",
+        false,
+    ),
+];
+
+fn tools_list_result() -> Value {
+    json!({
+        "tools": TOOL_CATALOG
+            .iter()
+            .map(|(name, description, read_only)| {
+                json!({
+                    "name": name,
+                    "description": description,
+                    "read_only": read_only,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "read_only_policy": json!({
+            "auto_allowed": READ_ONLY_TOOLS,
+        }),
+    })
+}
+
+const TRANSCRIPT_MESSAGE_LIMIT: usize = 500;
+const TRANSCRIPT_TEXT_CAP: usize = 4_000;
+const TRANSCRIPT_TOOL_RESULT_CAP: usize = 800;
+
+/// Load a task transcript from the persisted session store. Only visible
+/// conversation material is returned: internal `<system-reminder>` blocks,
+/// display-role wrappers, and hidden reasoning traces are excluded.
+fn load_transcript(session_id: &str, limit: usize) -> Result<Value> {
+    let session = crate::session::Session::load(session_id)?;
+    let messages: Vec<Value> = session
+        .messages
+        .iter()
+        .filter_map(transcript_message)
+        .collect();
+    let total = messages.len();
+    let start = total.saturating_sub(limit);
+    Ok(json!({
+        "session_id": session_id,
+        "title": session.title,
+        "model": session.model,
+        "total_messages": total,
+        "messages": &messages[start..],
+    }))
+}
+
+fn transcript_message(message: &crate::session::StoredMessage) -> Option<Value> {
+    if message.display_role.is_some() {
+        return None;
+    }
+    let role = match message.role {
+        crate::message::Role::User => "user",
+        crate::message::Role::Assistant => "assistant",
+    };
+    let mut text = String::new();
+    let mut events: Vec<Value> = Vec::new();
+    for block in &message.content {
+        match block {
+            crate::message::ContentBlock::Text { text: block_text, .. } => {
+                let trimmed = block_text.trim_start();
+                if trimmed.starts_with("<system-reminder>") || block_text.trim().is_empty() {
+                    continue;
+                }
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(block_text);
+            }
+            crate::message::ContentBlock::ToolUse { name, input, .. } => events.push(json!({
+                "type": "tool_use",
+                "tool": name,
+                "input": truncate_chars(&input.to_string(), 400),
+            })),
+            crate::message::ContentBlock::ToolResult {
+                content,
+                is_error,
+                ..
+            } => events.push(json!({
+                "type": "tool_result",
+                "text": truncate_chars(content, TRANSCRIPT_TOOL_RESULT_CAP),
+                "is_error": is_error.unwrap_or(false),
+            })),
+            // Reasoning traces, signatures, provider-internal items stay out
+            // of the desktop transcript.
+            _ => {}
+        }
+    }
+    if text.is_empty() && events.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "role": role,
+        "text": truncate_chars(&text, TRANSCRIPT_TEXT_CAP),
+        "events": events,
+    }))
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\u{2026} [truncated]", &text[..end])
+}
+
+/// Fire any due scheduled tasks. Runs inside the daemon's scheduler loop.
+async fn run_due_schedule_entries(rpc: &CoworkRpc) -> Result<()> {
+    let mut store = ScheduleStore::open_default()?;
+    for entry in store.due_pending(now_unix_secs()) {
+        let project = match rpc.project_store().get(&entry.project_id) {
+            Ok(project) => project,
+            Err(error) => {
+                store
+                    .mark_failed(&entry.id, format!("project unavailable: {error}"))?;
+                continue;
+            }
+        };
+        if project.mounts.is_empty() {
+            store.mark_failed(&entry.id, "project has no mounted folders")?;
+            continue;
+        }
+        let launch = TaskLaunch {
+            goal: entry.goal.clone(),
+            mounts: project
+                .mounts
+                .iter()
+                .map(|mount| CoworkMount {
+                    path: mount.path.clone(),
+                    access: mount.access,
+                })
+                .collect(),
+            model: entry.model.clone().or_else(|| project.model_default.clone()),
+            instructions: if project.instructions.trim().is_empty() {
+                None
+            } else {
+                Some(project.instructions.clone())
+            },
+            project_id: Some(entry.project_id.clone()),
+        };
+        match rpc.start_task(launch).await {
+            Ok(task_id) => store.mark_fired(&entry.id, &task_id)?,
+            Err(error) => store.mark_failed(&entry.id, error.to_string())?,
+        }
+    }
+    Ok(())
+}
+
+/// Start the scheduler loop for the desktop daemon: every 30 seconds, fire
+/// any due `schedule.create` entries as project-scoped cowork tasks.
+pub fn spawn_scheduler(rpc: CoworkRpc) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = run_due_schedule_entries(&rpc).await {
+                tracing::warn!("scheduled-task runner: {error:#}");
+            }
+        }
+    });
+}
+
+fn mcp_config_path() -> Result<PathBuf> {
+    Ok(crate::storage::jcode_dir()?.join("mcp.json"))
+}
+
+/// Read the global MCP config as a raw JSON object map so unknown fields are
+/// preserved exactly for other tools that share the file.
+fn read_mcp_servers(path: &Path) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn write_mcp_servers(path: &Path, servers: &serde_json::Map<String, Value>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, serde_json::to_vec_pretty(servers)?)?;
+    std::fs::rename(&temp, path)?;
+    Ok(())
+}
+
+fn mcp_list_result(path: &Path) -> Value {
+    let servers = read_mcp_servers(path);
+    let list = servers
+        .iter()
+        .map(|(name, spec)| {
+            let enabled = spec
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+                && !spec
+                    .get("disabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            json!({
+                "name": name,
+                "command": spec.get("command").and_then(Value::as_str).unwrap_or(""),
+                "args": spec.get("args").cloned().unwrap_or_else(|| json!([])),
+                "url": spec.get("url").and_then(Value::as_str).unwrap_or(""),
+                "transport": spec.get("type").and_then(Value::as_str).unwrap_or("stdio"),
+                "enabled": enabled,
+                "shared": spec.get("shared").and_then(Value::as_bool).unwrap_or(true),
+                "timeout_secs": spec.get("timeout_secs").and_then(Value::as_u64),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "servers": list,
+        "config_path": path.display().to_string(),
+    })
+}
+
+fn valid_mcp_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+fn mcp_add_server(path: &Path, name: &str, spec: &Value) -> Result<Value> {
+    let name = name.trim();
+    anyhow::ensure!(
+        valid_mcp_server_name(name),
+        "server name must be 1-64 chars of letters, digits, '-', '_', '.'"
+    );
+    let command = spec
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let url = spec.get("url").and_then(Value::as_str).unwrap_or("").trim();
+    anyhow::ensure!(
+        (command.is_empty() && !url.is_empty()) || (!command.is_empty() && url.is_empty()),
+        "provide exactly one of command (stdio server) or url (http/sse server)"
+    );
+    let mut entry = serde_json::Map::new();
+    if !command.is_empty() {
+        entry.insert("command".to_owned(), json!(command));
+        if let Some(args) = spec.get("args").and_then(Value::as_array) {
+            entry.insert("args".to_owned(), json!(args));
+        }
+    } else {
+        entry.insert("url".to_owned(), json!(url));
+        entry.insert("type".to_owned(), json!("http"));
+    }
+    if let Some(env) = spec
+        .get("env")
+        .and_then(Value::as_object)
+        .filter(|env| !env.is_empty())
+    {
+        entry.insert("env".to_owned(), Value::Object(env.clone()));
+    }
+    if let Some(timeout) = spec.get("timeout_secs").and_then(Value::as_u64) {
+        entry.insert("timeout_secs".to_owned(), json!(timeout));
+    }
+    let mut servers = read_mcp_servers(path);
+    servers.insert(name.to_owned(), Value::Object(entry));
+    write_mcp_servers(path, &servers)?;
+    Ok(mcp_list_result(path))
+}
+
+fn mcp_remove_server(path: &Path, name: &str) -> Result<Value> {
+    let name = name.trim();
+    let mut servers = read_mcp_servers(path);
+    anyhow::ensure!(
+        servers.remove(name).is_some(),
+        "no MCP server named {name} is configured"
+    );
+    write_mcp_servers(path, &servers)?;
+    Ok(mcp_list_result(path))
+}
+
+/// How a provider's API key is stored, derived from its login descriptor.
+enum ApiKeyTarget {
+    /// Upsert `KEY=value` inside the named file under the app config dir.
+    EnvFile(&'static str, &'static str),
+    /// Gemini stores through its own module (gemini.env, dual env names).
+    Gemini,
+    /// Cursor stores through its own module (CLI keychain or key file).
+    Cursor,
+}
+
+fn api_key_target_for(
+    provider: &crate::provider_catalog::LoginProviderDescriptor,
+) -> Option<ApiKeyTarget> {
+    use crate::provider_catalog::LoginProviderTarget;
+    match provider.target {
+        LoginProviderTarget::OpenAiApiKey => {
+            Some(ApiKeyTarget::EnvFile("openai.env", "OPENAI_API_KEY"))
+        }
+        LoginProviderTarget::ClaudeApiKey => {
+            Some(ApiKeyTarget::EnvFile("anthropic.env", "ANTHROPIC_API_KEY"))
+        }
+        LoginProviderTarget::OpenRouter => {
+            Some(ApiKeyTarget::EnvFile("openrouter.env", "OPENROUTER_API_KEY"))
+        }
+        LoginProviderTarget::Bedrock => Some(ApiKeyTarget::EnvFile(
+            crate::provider::bedrock::ENV_FILE,
+            crate::provider::bedrock::API_KEY_ENV,
+        )),
+        LoginProviderTarget::Azure => Some(ApiKeyTarget::EnvFile(
+            crate::auth::azure::ENV_FILE,
+            crate::auth::azure::API_KEY_ENV,
+        )),
+        // OpenAI-compatible profiles carry their own env file + key name
+        // (groq, cerebras, deepseek, ollama, ...), so API keys are settable
+        // for every one of them.
+        LoginProviderTarget::OpenAiCompatible(profile) => {
+            Some(ApiKeyTarget::EnvFile(profile.env_file, profile.api_key_env))
+        }
+        LoginProviderTarget::Gemini => Some(ApiKeyTarget::Gemini),
+        LoginProviderTarget::Cursor => Some(ApiKeyTarget::Cursor),
+        _ => None,
+    }
+}
+
+/// Full auth assessment across every login provider. Uses the same cached
+/// probe the CLI and TUI use, so the desktop sees identical truth.
+fn auth_status_report() -> Result<Value> {
+    let status = crate::auth::AuthStatus::check();
+    let providers = crate::provider_catalog::login_providers()
+        .iter()
+        .copied()
+        .map(|provider| {
+            let assessment = status.assessment_for_provider(provider);
+            json!({
+                "id": provider.id,
+                "display_name": provider.display_name,
+                "menu_detail": provider.menu_detail,
+                "state": assessment.state.label(),
+                "method_detail": assessment.method_detail,
+                "credential_source_detail": assessment.credential_source_detail,
+                "health_summary": assessment.health_summary(),
+                "api_key_settable": api_key_target_for(&provider).is_some(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({ "providers": providers }))
+}
+
+fn validate_api_key(key: &str) -> Result<&str> {
+    let key = key.trim();
+    anyhow::ensure!(!key.is_empty(), "API key cannot be empty");
+    anyhow::ensure!(
+        !key.chars().any(|c| c == '\n' || c == '\r' || c == '\0'),
+        "API key contains control characters"
+    );
+    anyhow::ensure!(key.len() <= 4096, "API key is unreasonably long");
+    Ok(key)
+}
+
+fn find_login_provider(provider_id: &str) -> Result<crate::provider_catalog::LoginProviderDescriptor> {
+    crate::provider_catalog::login_providers()
+        .iter()
+        .copied()
+        .find(|provider| {
+            provider.id == provider_id || provider.aliases.contains(&provider_id)
+        })
+        .with_context(|| {
+            format!(
+                "unknown provider {provider_id:?}; see auth.status for the list"
+            )
+        })
+}
+
+fn auth_set_api_key(provider_id: &str, api_key: &str) -> Result<Value> {
+    let key = validate_api_key(api_key)?;
+    let provider = find_login_provider(provider_id)?;
+    match api_key_target_for(&provider) {
+        Some(ApiKeyTarget::EnvFile(file, env_key)) => {
+            let path = crate::storage::app_config_dir()?.join(file);
+            crate::storage::upsert_env_file_value(&path, env_key, Some(key))?;
+        }
+        Some(ApiKeyTarget::Gemini) => crate::auth::gemini::save_api_key(key)?,
+        Some(ApiKeyTarget::Cursor) => crate::auth::cursor::save_api_key(key)?,
+        None => anyhow::bail!(
+            "provider {} uses an interactive login ({}); run `jcode login {}` in a terminal",
+            provider.id,
+            provider.menu_detail,
+            provider.id
+        ),
+    }
+    crate::auth::AuthStatus::invalidate_cache();
+    Ok(json!({
+        "provider": provider.id,
+        "display_name": provider.display_name,
+        "saved": true,
+    }))
+}
+
+fn auth_clear_key(provider_id: &str) -> Result<Value> {
+    let provider = find_login_provider(provider_id)?;
+    match api_key_target_for(&provider) {
+        Some(ApiKeyTarget::EnvFile(file, env_key)) => {
+            let path = crate::storage::app_config_dir()?.join(file);
+            crate::storage::upsert_env_file_value(&path, env_key, None)?;
+        }
+        Some(ApiKeyTarget::Cursor) => crate::auth::cursor::clear_api_key()?,
+        Some(ApiKeyTarget::Gemini) => {
+            let path = crate::storage::app_config_dir()?
+                .join(crate::auth::gemini::GEMINI_API_KEY_ENV_FILE);
+            crate::storage::upsert_env_file_value(
+                &path,
+                crate::auth::gemini::GEMINI_API_KEY_ENV_VARS[0],
+                None,
+            )?;
+        }
+        None => anyhow::bail!(
+            "provider {} has no API key to clear; manage its login with `jcode login {}`",
+            provider.id,
+            provider.id
+        ),
+    }
+    crate::auth::AuthStatus::invalidate_cache();
+    Ok(json!({
+        "provider": provider.id,
+        "display_name": provider.display_name,
+        "cleared": true,
+    }))
+}
+
+/// Serialize provider usage rows; `ProviderUsage` is not `Serialize`.
+fn usage_providers_json(providers: &[crate::usage::ProviderUsage]) -> Value {
+    Value::Array(
+        providers
+            .iter()
+            .map(|provider| {
+                json!({
+                    "provider_name": provider.provider_name,
+                    "limits": provider
+                        .limits
+                        .iter()
+                        .map(|limit| {
+                            json!({
+                                "name": limit.name,
+                                "usage_percent": limit.usage_percent,
+                                "resets_at": limit.resets_at,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    "hard_limit_reached": provider.hard_limit_reached,
+                    "error": provider.error,
+                    "last_used_unix_secs": provider.last_used_unix_secs,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Serialize the Claude usage windows; `UsageData` itself is not `Serialize`.
+fn claude_usage_windows(claude: &crate::usage::UsageData) -> Value {
+    json!({
+        "five_hour": claude.five_hour,
+        "five_hour_resets_at": claude.five_hour_resets_at,
+        "seven_day": claude.seven_day,
+        "seven_day_resets_at": claude.seven_day_resets_at,
+        "seven_day_opus": claude.seven_day_opus,
+        "model_scoped": claude
+            .model_scoped
+            .iter()
+            .map(|window| {
+                json!({
+                    "model_name": window.model_name,
+                    "utilization": window.utilization,
+                    "resets_at": window.resets_at,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "extra_usage_enabled": claude.extra_usage_enabled,
+        "last_error": claude.last_error,
+    })
 }
 
 impl Default for CoworkRpc {
@@ -1151,7 +1704,19 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                     });
                 match (goal, allowed_roots) {
                     (Some(goal), Some(roots)) => {
-                        TaskLaunch::new(goal.to_owned(), roots.into_iter().map(CoworkMount::read_write).collect())
+                        let mut launch = TaskLaunch::new(
+                            goal.to_owned(),
+                            roots.into_iter().map(CoworkMount::read_write).collect(),
+                        );
+                        // Ad-hoc tasks can carry standing instructions too
+                        // (the composer's optional instructions field).
+                        launch.instructions = request
+                            .params
+                            .get("instructions")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .filter(|instructions| !instructions.trim().is_empty());
+                        launch
                     }
                     _ => {
                         return Some(rpc_error(
@@ -1193,6 +1758,207 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                     -32602,
                     "params require string id and boolean approved".to_string(),
                 )),
+            }
+        }
+        "tools.list" => Ok(tools_list_result()),
+        "task.transcript" => {
+            let task_id = request.params.get("task_id").and_then(Value::as_str);
+            let Some(task_id) = task_id else {
+                return Some(rpc_error(Some(id), -32602, "params require string task_id"));
+            };
+            let limit = request
+                .params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(200)
+                .clamp(1, TRANSCRIPT_MESSAGE_LIMIT as u64)
+                as usize;
+            let Some(session_id) = rpc.task_session_id(task_id).await else {
+                return Some(rpc_error(
+                    Some(id),
+                    -32000,
+                    format!("no session recorded for task {task_id}"),
+                ));
+            };
+            match tokio::task::spawn_blocking(move || load_transcript(&session_id, limit)).await {
+                Ok(Ok(transcript)) => Ok(transcript),
+                Ok(Err(error)) => Err((-32000, error.to_string())),
+                Err(error) => Err((-32000, format!("transcript task failed: {error}"))),
+            }
+        }
+        "usage.report" => {
+            let providers = crate::usage::fetch_all_provider_usage().await;
+            let claude = crate::usage::get().await;
+            Ok(json!({
+                "providers": usage_providers_json(&providers),
+                "claude_windows": claude_usage_windows(&claude),
+            }))
+        }
+        "auth.status" => match tokio::task::spawn_blocking(auth_status_report).await {
+            Ok(Ok(report)) => Ok(report),
+            Ok(Err(error)) => Err((-32000, error.to_string())),
+            Err(error) => Err((-32000, format!("auth probe failed: {error}"))),
+        },
+        "auth.set_api_key" => {
+            let provider_id = request.params.get("provider").and_then(Value::as_str);
+            let api_key = request.params.get("api_key").and_then(Value::as_str);
+            match (provider_id, api_key) {
+                (Some(provider_id), Some(api_key)) => {
+                    let provider_id = provider_id.to_owned();
+                    let api_key = api_key.to_owned();
+                    match tokio::task::spawn_blocking(move || {
+                        auth_set_api_key(&provider_id, &api_key)
+                    })
+                    .await
+                    {
+                        Ok(Ok(result)) => Ok(result),
+                        Ok(Err(error)) => Err((-32000, error.to_string())),
+                        Err(error) => Err((-32000, format!("auth task failed: {error}"))),
+                    }
+                }
+                _ => Err((
+                    -32602,
+                    "params require string provider and string api_key".to_string(),
+                )),
+            }
+        }
+        "auth.clear" => {
+            let provider_id = request.params.get("provider").and_then(Value::as_str);
+            match provider_id {
+                Some(provider_id) => {
+                    let provider_id = provider_id.to_owned();
+                    match tokio::task::spawn_blocking(move || auth_clear_key(&provider_id)).await {
+                        Ok(Ok(result)) => Ok(result),
+                        Ok(Err(error)) => Err((-32000, error.to_string())),
+                        Err(error) => Err((-32000, format!("auth task failed: {error}"))),
+                    }
+                }
+                _ => Err((-32602, "params require string provider".to_string())),
+            }
+        }
+        "mcp.list" => match mcp_config_path() {
+            Ok(path) => Ok(mcp_list_result(&path)),
+            Err(error) => Err((-32000, error.to_string())),
+        },
+        "mcp.add" => {
+            let name = request.params.get("name").and_then(Value::as_str);
+            let Some(name) = name else {
+                return Some(rpc_error(
+                    Some(id),
+                    -32602,
+                    "params require string name and either command or url",
+                ));
+            };
+            let path = match mcp_config_path() {
+                Ok(path) => path,
+                Err(error) => return Some(rpc_error(Some(id), -32000, error.to_string())),
+            };
+            let name = name.to_owned();
+            let spec = request.params.clone();
+            match tokio::task::spawn_blocking(move || mcp_add_server(&path, &name, &spec)).await {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(error)) => Err((-32000, error.to_string())),
+                Err(error) => Err((-32000, format!("mcp task failed: {error}"))),
+            }
+        }
+        "mcp.remove" => {
+            let name = request.params.get("name").and_then(Value::as_str);
+            let Some(name) = name else {
+                return Some(rpc_error(Some(id), -32602, "params require string name"));
+            };
+            let path = match mcp_config_path() {
+                Ok(path) => path,
+                Err(error) => return Some(rpc_error(Some(id), -32000, error.to_string())),
+            };
+            let name = name.to_owned();
+            match tokio::task::spawn_blocking(move || mcp_remove_server(&path, &name)).await {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(error)) => Err((-32000, error.to_string())),
+                Err(error) => Err((-32000, format!("mcp task failed: {error}"))),
+            }
+        }
+        "schedule.create" => {
+            let project_id = request.params.get("project_id").and_then(Value::as_str);
+            let goal = request.params.get("goal").and_then(Value::as_str);
+            let run_at_unix_secs = request
+                .params
+                .get("run_at_unix_secs")
+                .and_then(Value::as_u64);
+            let model = request
+                .params
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|model| !model.trim().is_empty());
+            let Some(project_id) = project_id else {
+                return Some(rpc_error(
+                    Some(id),
+                    -32602,
+                    "params require string project_id, string goal, and run_at_unix_secs",
+                ));
+            };
+            let Some(goal) = goal else {
+                return Some(rpc_error(
+                    Some(id),
+                    -32602,
+                    "params require string project_id, string goal, and run_at_unix_secs",
+                ));
+            };
+            let Some(run_at_unix_secs) = run_at_unix_secs else {
+                return Some(rpc_error(
+                    Some(id),
+                    -32602,
+                    "run_at_unix_secs must be a unix timestamp in seconds",
+                ));
+            };
+            if let Err(error) = rpc.project_store().get(project_id) {
+                return Some(rpc_error(Some(id), -32000, error.to_string()));
+            }
+            let now = now_unix_secs();
+            if run_at_unix_secs + 60 < now {
+                return Some(rpc_error(
+                    Some(id),
+                    -32602,
+                    "run_at_unix_secs is too far in the past",
+                ));
+            }
+            // Cheap file IO on a small JSON store; keep it off the reactor.
+            let project_id = project_id.to_owned();
+            let goal = goal.to_owned();
+            match tokio::task::spawn_blocking(move || {
+                ScheduleStore::open_default()
+                    .and_then(|mut store| store.add(project_id, goal, model, run_at_unix_secs))
+            })
+            .await
+            {
+                Ok(Ok(entry)) => Ok(json!({ "entry": entry })),
+                Ok(Err(error)) => Err((-32000, error.to_string())),
+                Err(error) => Err((-32000, format!("schedule task failed: {error}"))),
+            }
+        }
+        "schedule.list" => match tokio::task::spawn_blocking(|| {
+            ScheduleStore::open_default().map(|store| store.list())
+        })
+        .await
+        {
+            Ok(Ok(entries)) => Ok(json!({ "entries": entries })),
+            Ok(Err(error)) => Err((-32000, error.to_string())),
+            Err(error) => Err((-32000, format!("schedule task failed: {error}"))),
+        },
+        "schedule.cancel" => {
+            let entry_id = request.params.get("id").and_then(Value::as_str);
+            let Some(entry_id) = entry_id else {
+                return Some(rpc_error(Some(id), -32602, "params require string id"));
+            };
+            let entry_id = entry_id.to_owned();
+            match tokio::task::spawn_blocking(move || {
+                ScheduleStore::open_default().and_then(|mut store| store.cancel(&entry_id))
+            })
+            .await
+            {
+                Ok(Ok(cancelled)) => Ok(json!({ "cancelled": cancelled })),
+                Ok(Err(error)) => Err((-32000, error.to_string())),
+                Err(error) => Err((-32000, format!("schedule task failed: {error}"))),
             }
         }
         _ => Err((-32601, format!("Method not found: {}", request.method))),
@@ -1253,6 +2019,7 @@ pub async fn run_server() -> Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let rpc = global().clone();
+    spawn_scheduler(rpc.clone());
     let token_path = rpc.publish_capability_token().await?;
     tracing::info!(
         "Cowork IPC capability token published at {}",
@@ -1338,6 +2105,7 @@ pub async fn run_server() -> Result<()> {
         .with_context(|| format!("failed to bind WebSocket server to {}", addr))?;
 
     let rpc = global().clone();
+    spawn_scheduler(rpc.clone());
     let token_path = rpc.publish_capability_token().await?;
     tracing::info!(
         "Cowork WebSocket IPC server listening on ws://{}; capability token published at {}",
@@ -1968,5 +2736,249 @@ mod tests {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit())
         );
+    }
+
+    #[test]
+    fn tools_list_includes_every_read_only_tool() {
+        let response = tools_list_result();
+        let tools = response["tools"].as_array().unwrap();
+        for read_only_tool in READ_ONLY_TOOLS {
+            let entry = tools
+                .iter()
+                .find(|tool| tool["name"] == *read_only_tool)
+                .unwrap_or_else(|| panic!("tool catalog missing {read_only_tool}"));
+            assert_eq!(entry["read_only"], true, "{read_only_tool} must be read-only");
+        }
+        assert!(tools.iter().any(|tool| tool["name"] == "mcp__*"));
+    }
+
+    #[test]
+    fn mcp_add_list_remove_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+
+        let result = mcp_add_server(
+            &path,
+            "todoist",
+            &json!({ "command": "npx", "args": ["-y", "todoist-mcp"] }),
+        )
+        .unwrap();
+        assert_eq!(result["servers"].as_array().unwrap().len(), 1);
+        assert_eq!(result["servers"][0]["name"], "todoist");
+        assert_eq!(result["servers"][0]["command"], "npx");
+        assert_eq!(result["servers"][0]["enabled"], true);
+        // File on disk stays parseable and preserves the entry.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("todoist-mcp"));
+
+        // Overwrite works; remove works; unknown remove errors.
+        mcp_add_server(
+            &path,
+            "todoist",
+            &json!({ "command": "node", "args": ["other.js"] }),
+        )
+        .unwrap();
+        let result = mcp_remove_server(&path, "todoist").unwrap();
+        assert_eq!(result["servers"].as_array().unwrap().len(), 0);
+        assert!(mcp_remove_server(&path, "todoist").is_err());
+
+        // Validation: both command and url is rejected; bad names rejected.
+        assert!(mcp_add_server(&path, "x", &json!({"command": "a", "url": "http://b"})).is_err());
+        assert!(mcp_add_server(&path, "bad name!", &json!({"command": "a"})).is_err());
+        assert!(mcp_add_server(&path, "", &json!({"command": "a"})).is_err());
+    }
+
+    #[test]
+    fn mcp_remove_preserves_unknown_fields_of_other_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"keepme":{"command":"npx","custom_future_field":42},"dropme":{"command":"x"}}"#,
+        )
+        .unwrap();
+        mcp_remove_server(&path, "dropme").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("custom_future_field"), "unknown fields survive: {raw}");
+        assert!(!raw.contains("dropme"));
+    }
+
+    #[test]
+    fn transcript_message_maps_visible_blocks_only() {
+        let message = crate::session::StoredMessage {
+            id: "m1".to_owned(),
+            role: crate::message::Role::User,
+            content: vec![
+                crate::message::ContentBlock::Text {
+                    text: "<system-reminder>internal</system-reminder>".to_owned(),
+                    cache_control: None,
+                },
+                crate::message::ContentBlock::Text {
+                    text: "Please review the report".to_owned(),
+                    cache_control: None,
+                },
+                crate::message::ContentBlock::ToolUse {
+                    id: "t1".to_owned(),
+                    name: "bash".to_owned(),
+                    input: json!({ "command": "ls" }),
+                    thought_signature: None,
+                },
+            ],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        };
+        let entry = transcript_message(&message).unwrap();
+        assert_eq!(entry["role"], "user");
+        assert_eq!(entry["text"], "Please review the report");
+        assert_eq!(entry["events"].as_array().unwrap().len(), 1);
+        assert_eq!(entry["events"][0]["type"], "tool_use");
+        assert_eq!(entry["events"][0]["tool"], "bash");
+
+        // Display-role wrappers (system injections) never surface.
+        let mut hidden = message;
+        hidden.display_role = Some(crate::session::StoredDisplayRole::System);
+        assert!(transcript_message(&hidden).is_none());
+    }
+
+    #[tokio::test]
+    async fn task_transcript_unknown_task_errors_cleanly() {
+        let rpc = CoworkRpc::new();
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                60,
+                "task.transcript",
+                json!({ "task_id": "cowork-missing" }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no session recorded"));
+    }
+
+    #[tokio::test]
+    async fn schedule_create_list_cancel_via_dispatch() {
+        let _env = lock_store_env();
+        let store_dir = tempfile::tempdir().unwrap();
+        // SAFETY: the STORE_ENV_LOCK is held, so no other thread reads the
+        // environment while it mutates.
+        unsafe { std::env::set_var("JCODE_COWORK_STORE_DIR", store_dir.path()) };
+        let rpc = CoworkRpc::new();
+
+        let response = dispatch_request(
+            authed_request(&rpc, 70, "project.create", json!({ "name": "Planned" })),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        let project_id = response["result"]["project"]["id"].as_str().unwrap().to_owned();
+
+        let run_at = now_unix_secs() + 3_600;
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                71,
+                "schedule.create",
+                json!({
+                    "project_id": project_id,
+                    "goal": "Triage the inbox",
+                    "run_at_unix_secs": run_at,
+                }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["result"]["entry"]["status"], "pending");
+        let entry_id = response["result"]["entry"]["id"].as_str().unwrap().to_owned();
+
+        let response = dispatch_request(authed_request(&rpc, 72, "schedule.list", json!({})), &rpc)
+            .await
+            .unwrap();
+        let entries = response["result"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["goal"], "Triage the inbox");
+
+        // Not due yet, so the runner must not fire it.
+        let fired = run_due_schedule_entries(&rpc).await.unwrap();
+        let _ = fired;
+        let response = dispatch_request(authed_request(&rpc, 73, "schedule.list", json!({})), &rpc)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["entries"][0]["status"], "pending");
+
+        let response = dispatch_request(
+            authed_request(&rpc, 74, "schedule.cancel", json!({ "id": entry_id })),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["result"]["cancelled"], true);
+
+        // Scheduling for a missing project is rejected.
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                75,
+                "schedule.create",
+                json!({
+                    "project_id": "proj-nope",
+                    "goal": "g",
+                    "run_at_unix_secs": run_at,
+                }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32000);
+        // SAFETY: same lock discipline as the set above.
+        unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
+    }
+
+    #[tokio::test]
+    async fn auth_unknown_provider_is_rejected_without_writes() {
+        let rpc = CoworkRpc::new();
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                80,
+                "auth.set_api_key",
+                json!({ "provider": "definitely-not-a-provider", "api_key": "sk-test" }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown provider"));
+    }
+
+    #[tokio::test]
+    async fn task_sessions_note_and_lookup() {
+        let rpc = CoworkRpc::new();
+        rpc.note_task_session("task-a", "sess-a").await;
+        rpc.note_task_session("task-b", "sess-b").await;
+        assert_eq!(
+            rpc.task_session_id("task-a").await.as_deref(),
+            Some("sess-a")
+        );
+        // Re-noting the same task replaces the mapping.
+        rpc.note_task_session("task-a", "sess-a2").await;
+        assert_eq!(
+            rpc.task_session_id("task-a").await.as_deref(),
+            Some("sess-a2")
+        );
+        assert_eq!(rpc.task_session_id("task-missing").await, None);
     }
 }

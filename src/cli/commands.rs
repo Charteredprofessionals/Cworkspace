@@ -2700,9 +2700,18 @@ pub async fn run_cowork_task(
         }
     });
     let registry = crate::tool::Registry::new(provider.clone()).await;
+    // Register MCP servers from ~/.jcode/mcp.json so desktop tasks get the
+    // same `mcp__*` tools as interactive and headless sessions. Advertise
+    // cached schemas synchronously, connect on first call; a cold cache waits
+    // briefly for the first connection (same contract as `jcode run`).
+    if run_command_mcp_enabled() {
+        registry.register_mcp_tools(None, None, None).await;
+        wait_for_cold_cache_mcp_tools(&registry).await;
+    }
     let mut agent = crate::agent::Agent::new(provider, registry);
     agent.set_working_dir(&working_dir.display().to_string());
     let session_id = agent.session_id().to_owned();
+    rpc.note_task_session(&task_id, &session_id).await;
     let _registrations = rpc
         .register_agent_session(
             &session_id,

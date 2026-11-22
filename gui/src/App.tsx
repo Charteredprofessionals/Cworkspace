@@ -6,24 +6,31 @@ import {
   AlertCircle,
   ArrowDown,
   ArrowUpRight,
+  BarChart3,
+  CalendarClock,
   Check,
   ChevronDown,
   ChevronRight,
   CircleHelp,
   Clock3,
+  FileDown,
   FileSpreadsheet,
   FileText,
   Folder,
   FolderPlus,
   History,
+  KeyRound,
   LoaderCircle,
   PanelRightClose,
+  Pencil,
   Play,
   Plus,
   Settings,
   ShieldCheck,
   Sparkles,
   StopCircle,
+  Trash2,
+  Wrench,
   X,
 } from "lucide-react";
 import DOMPurify from "dompurify";
@@ -128,6 +135,11 @@ type SessionTab = {
   id: string;
   title: string;
   goal: string;
+  /// Optional standing instructions for ad-hoc tasks (project tasks inherit
+  /// the project's own instructions instead).
+  instructions: string;
+  /// Per-task model override; empty = use the default model.
+  modelOverride: string;
   status: TabStatus;
   taskId: string;
   feed: FeedEntry[];
@@ -171,9 +183,87 @@ type Project = {
 
 type ApprovalMode = "always_ask" | "auto_allow_readonly";
 
+type AuthProvider = {
+  id: string;
+  display_name: string;
+  menu_detail: string;
+  state: "available" | "expired" | "not_configured";
+  method_detail: string;
+  credential_source_detail: string;
+  health_summary: string;
+  api_key_settable: boolean;
+};
+
+type McpServerInfo = {
+  name: string;
+  command: string;
+  args?: string[];
+  url: string;
+  transport: string;
+  enabled: boolean;
+  shared: boolean;
+  timeout_secs?: number | null;
+};
+
+type ScheduleEntryInfo = {
+  id: string;
+  project_id: string;
+  goal: string;
+  model: string | null;
+  run_at_unix_secs: number;
+  created_at_unix_secs: number;
+  status: "pending" | "done" | "failed" | "cancelled";
+  task_id: string | null;
+  fired_at_unix_secs: number | null;
+  error: string | null;
+};
+
+type ToolInfo = {
+  name: string;
+  description: string;
+  read_only: boolean;
+};
+
+type UsageLimitInfo = {
+  name: string;
+  usage_percent: number;
+  resets_at: string | null;
+};
+
+type UsageReport = {
+  providers: {
+    provider_name: string;
+    limits: UsageLimitInfo[];
+    hard_limit_reached: boolean;
+    error: string | null;
+    last_used_unix_secs: number | null;
+  }[];
+  claude_windows: {
+    five_hour: number;
+    five_hour_resets_at: string | null;
+    seven_day: number;
+    seven_day_resets_at: string | null;
+    seven_day_opus: number | null;
+    model_scoped: { model_name: string; utilization: number; resets_at: string | null }[];
+    extra_usage_enabled: boolean;
+    last_error: string | null;
+  };
+};
+
+type TranscriptEntry = {
+  role: "user" | "assistant";
+  text: string;
+  events: { type: string; tool?: string; text?: string; is_error?: boolean }[];
+};
+
+type TranscriptView = {
+  taskId: string;
+  goal: string;
+};
+
 /// Must match `cowork_rpc::PROTOCOL_VERSION`. The daemon bumps it on breaking
 /// RPC changes; the GUI warns instead of failing mysteriously on a mismatch.
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 
 const HISTORY_KEY = "jcode-cowork-history-v1";
 const SETTINGS_KEY = "cworkspace-settings-v1";
@@ -222,6 +312,8 @@ function newTab(): SessionTab {
     id: `tab-${tabCounter}-${Date.now().toString(16)}`,
     title: "New session",
     goal: "",
+    instructions: "",
+    modelOverride: "",
     status: "idle",
     taskId: "",
     feed: [],
@@ -290,6 +382,11 @@ function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProjectId, setActiveProjectId] = useState("");
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
+  /// Project being edited (null = create mode).
+  const [editingProject, setEditingProject] = useState<Project | null>(null);
+  const [scheduleEntries, setScheduleEntries] = useState<ScheduleEntryInfo[]>([]);
+  const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
+  const [transcriptView, setTranscriptView] = useState<TranscriptView | null>(null);
   const [protocolWarning, setProtocolWarning] = useState("");
   const [editingTitle, setEditingTitle] = useState<{ tabId: string; value: string } | null>(null);
   const goalInputRef = useRef<HTMLTextAreaElement>(null);
@@ -304,6 +401,19 @@ function App() {
       .then((result) => setProjects(Array.isArray(result?.projects) ? result.projects : []))
       .catch(() => setProjects([]));
   }
+
+  function refreshSchedule() {
+    invoke<{ entries?: ScheduleEntryInfo[] }>("schedule_list")
+      .then((result) => setScheduleEntries(Array.isArray(result?.entries) ? result.entries : []))
+      .catch(() => setScheduleEntries([]));
+  }
+
+  // Scheduled tasks live daemon-side per project; refresh when the project
+  // changes, the daemon reconnects, and after create/cancel flows.
+  useEffect(() => {
+    if (daemonStatus === "connected" && activeProject) refreshSchedule();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProject?.id, daemonStatus]);
 
   const activeTab = useMemo(
     () => tabs.find((tab) => tab.id === activeTabId) ?? tabs[0],
@@ -599,6 +709,55 @@ function App() {
     setProjectDialogOpen(false);
   }
 
+  /// Persist edits from the project dialog (edit mode), including the
+  /// per-project default model the daemon already supports.
+  async function saveProjectEdits(projectId: string, values: {
+    name: string;
+    purpose: string;
+    instructions: string;
+    model_default: string;
+  }) {
+    await invoke("project_update", {
+      projectId,
+      name: values.name,
+      purpose: values.purpose,
+      instructions: values.instructions,
+      modelDefault: values.model_default || undefined,
+    });
+    refreshProjects();
+    setProjectDialogOpen(false);
+    setEditingProject(null);
+  }
+
+  async function deleteProject(project: Project) {
+    const confirmed = window.confirm(
+      `Delete project “${project.name}”? Its folders, instructions, and task history are removed (files on disk are untouched).`,
+    );
+    if (!confirmed) return;
+    try {
+      await invoke("project_delete", { projectId: project.id });
+      if (activeProjectId === project.id) setActiveProjectId("");
+      refreshProjects();
+    } catch (reason) {
+      if (activeTab) patchTab(activeTab.id, { error: `Could not delete project: ${errorMessage(reason)}` });
+    }
+  }
+
+  async function scheduleTask(projectId: string, goal: string, runAtUnixSecs: number, model?: string) {
+    await invoke("schedule_create", { projectId, goal, runAtUnixSecs, model: model || undefined });
+    setScheduleDialogOpen(false);
+    refreshSchedule();
+  }
+
+  async function cancelSchedule(id: string) {
+    try {
+      await invoke("schedule_cancel", { id });
+      refreshSchedule();
+    } catch (reason) {
+      if (activeTab) patchTab(activeTab.id, { error: `Could not cancel the scheduled task: ${errorMessage(reason)}` });
+    }
+  }
+
   async function startTask(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const tab = activeTab;
@@ -623,11 +782,15 @@ function App() {
       title: tabTitle(goal),
     });
     try {
+      // Model precedence: this tab's override → the app default → the
+      // project's default (applied daemon-side) → the provider default.
+      const model = tab.modelOverride || settings.defaultModel || undefined;
       const taskId = await invoke<string>("start_cowork_task", {
         goal,
         projectId: activeProject ? activeProject.id : undefined,
         allowedRoots: activeProject ? [] : folders,
-        model: settings.defaultModel || undefined,
+        model,
+        instructions: activeProject ? undefined : tab.instructions || undefined,
       });
       patchTab(tab.id, {
         taskId,
@@ -639,7 +802,7 @@ function App() {
         goal,
         status: "running" as const,
         updatedAt: Date.now(),
-        model: settings.defaultModel || undefined,
+        model: model || undefined,
       }, ...current.filter((item) => item.taskId !== taskId)].slice(0, 30));
     } catch (reason) {
       patchTab(tab.id, { error: `Could not start task: ${errorMessage(reason)}` });
@@ -743,7 +906,13 @@ function App() {
 
         {activeProject ? (
           <section className="sidebar-section">
-            <div className="section-heading"><span>PROJECT FOLDERS</span><FolderPlus size={14} /></div>
+            <div className="section-heading">
+              <span>PROJECT FOLDERS</span>
+              <span className="heading-actions">
+                <button className="icon-button small" aria-label="Edit project" title="Edit project (name, purpose, instructions, default model)" onClick={() => { setEditingProject(activeProject); setProjectDialogOpen(true); }}><Pencil size={14} /></button>
+                <button className="icon-button small" aria-label="Delete project" title="Delete project" onClick={() => deleteProject(activeProject)}><Trash2 size={14} /></button>
+              </span>
+            </div>
             <div className="mount-choices">
               <button className="mount-choice" onClick={() => mountProjectFolder("read_write")} disabled={busy}><Folder size={15} /><span>Mount folder — read &amp; write</span></button>
               <button className="mount-choice" onClick={() => mountProjectFolder("read_only")} disabled={busy}><Folder size={15} /><span>Mount folder — read only</span></button>
@@ -760,6 +929,24 @@ function App() {
               {!activeProject.mounts.length && <p className="sidebar-empty">Mount a folder to give this project a workspace.</p>}
             </div>
             <p className="sidebar-hint">Tasks in “{activeProject.name}” run only inside these folders — writes stay out of read-only mounts.</p>
+            <div className="section-heading schedule-heading"><span>SCHEDULED</span><button className="icon-button small" aria-label="Schedule a task" title="Schedule a task for this project" onClick={() => setScheduleDialogOpen(true)}><CalendarClock size={14} /></button></div>
+            <div className="schedule-list">
+              {scheduleEntries.filter((entry) => entry.project_id === activeProject.id && entry.status !== "cancelled").map((entry) => (
+                <div className="schedule-item" key={entry.id} title={entry.error || entry.goal}>
+                  <span className={`schedule-dot ${entry.status}`} />
+                  <span className="schedule-copy">
+                    <strong>{entry.goal}</strong>
+                    <small>{entry.status === "pending"
+                      ? `runs ${new Date(entry.run_at_unix_secs * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`
+                      : entry.status === "done"
+                        ? `ran · task ${entry.task_id?.slice(0, 14) || ""}`
+                        : `failed — ${entry.error || "unknown error"}`}</small>
+                  </span>
+                  {entry.status === "pending" && <button className="icon-button folder-remove" aria-label="Cancel scheduled task" title="Cancel" onClick={() => cancelSchedule(entry.id)}><X size={13} /></button>}
+                </div>
+              ))}
+              {!scheduleEntries.some((entry) => entry.project_id === activeProject.id && entry.status !== "cancelled") && <p className="sidebar-empty">No scheduled tasks. Use the clock icon to run a goal later.</p>}
+            </div>
           </section>
         ) : (
           <section className="sidebar-section">
@@ -879,8 +1066,31 @@ function App() {
           <form className="goal-form" onSubmit={startTask}>
             <div className="goal-form-top"><Sparkles size={16} /><label htmlFor="goal-input">What would you like to get done?</label>{(activeProject ? activeProject.mounts.length : folders.length) > 0 && <span className="root-count">{activeProject ? `${activeProject.name} · ${activeProject.mounts.length} ${activeProject.mounts.length === 1 ? "folder" : "folders"}` : `${folders.length} ${folders.length === 1 ? "folder" : "folders"} in scope`}</span>}</div>
             <textarea id="goal-input" ref={goalInputRef} value={activeTab?.goal || ""} onChange={(event) => activeTab && patchTab(activeTab.id, { goal: event.target.value })} placeholder="Draft a project brief, audit these figures, prepare a polished report…" rows={3} disabled={activeTab?.status === "running"} />
+            {!activeProject && <textarea
+              id="instructions-input"
+              className="composer-instructions"
+              value={activeTab?.instructions || ""}
+              onChange={(event) => activeTab && patchTab(activeTab.id, { instructions: event.target.value })}
+              placeholder="Optional standing instructions for this session — tone, format, guardrails…"
+              rows={1}
+              disabled={activeTab?.status === "running"}
+            />}
             <div className="goal-form-bottom">
-              <span><CircleHelp size={14} /> {settings.defaultModel ? `Model: ${settings.defaultModel}` : activeProject ? `Runs inside “${activeProject.name}” with its instructions and folders.` : "Your mounted folders define the workspace boundary."}</span>
+              <div className="composer-context">
+                <select
+                  className="settings-select model-override"
+                  value={activeTab?.modelOverride || ""}
+                  aria-label="Model for this task"
+                  disabled={activeTab?.status === "running"}
+                  onChange={(event) => activeTab && patchTab(activeTab.id, { modelOverride: event.target.value })}
+                >
+                  <option value="">{settings.defaultModel ? `Default · ${settings.defaultModel}` : "Provider default model"}</option>
+                  {availableModels.map((route) => (
+                    <option key={`${route.provider}:${route.model}`} value={route.model}>{route.model} · {route.provider}</option>
+                  ))}
+                </select>
+                <span><CircleHelp size={14} /> {activeProject ? `Runs inside “${activeProject.name}” with its instructions and folders.` : activeTab?.instructions ? "Custom instructions will apply to this task." : "Your mounted folders define the workspace boundary."}</span>
+              </div>
               <button className="primary-action" type="submit" disabled={busy || activeTab?.status === "running" || !activeTab?.goal.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={15} fill="currentColor" />} Start task <ArrowUpRight size={15} /></button>
             </div>
           </form>
@@ -889,7 +1099,7 @@ function App() {
           {activeTab?.notice && <div className="info-banner" role="status"><Sparkles size={15} /><span>{activeTab.notice}</span><button className="icon-button" aria-label="Dismiss notice" onClick={() => patchTab(activeTab.id, { notice: "" })}><X size={14} /></button></div>}
           {activeTab?.error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{activeTab.error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => patchTab(activeTab.id, { error: "" })}><X size={15} /></button></div>}
 
-          <div className="feed-heading"><div><span className="feed-kicker">LIVE SESSION</span><h2>{activeTab?.status === "running" ? "Work in motion" : activeTab?.status === "completed" ? "Session complete" : activeTab?.status === "stopped" || activeTab?.status === "failed" ? "Session stopped" : "Session"}</h2></div><div className="feed-actions">{activeTab?.status === "running" && <button className="stop-action" onClick={stopTask}><StopCircle size={15} /> Stop task</button>}<span className={`task-badge ${activeTab?.status || "idle"}`}>{activeTab?.status === "running" ? <><i className="pulse-dot" /> In progress</> : activeTab?.status === "completed" ? "Completed" : activeTab?.status === "stopped" ? "Stopped" : activeTab?.status === "failed" ? "Failed" : "Waiting"}</span></div></div>
+          <div className="feed-heading"><div><span className="feed-kicker">LIVE SESSION</span><h2>{activeTab?.status === "running" ? "Work in motion" : activeTab?.status === "completed" ? "Session complete" : activeTab?.status === "stopped" || activeTab?.status === "failed" ? "Session stopped" : "Session"}</h2></div><div className="feed-actions">{activeTab?.status === "running" && <button className="stop-action" onClick={stopTask}><StopCircle size={15} /> Stop task</button>}{activeTab && activeTab.status !== "running" && activeTab.status !== "idle" && activeTab.taskId && <button className="transcript-action" onClick={() => setTranscriptView({ taskId: activeTab.taskId, goal: activeTab.title })}><FileText size={15} /> View transcript</button>}<span className={`task-badge ${activeTab?.status || "idle"}`}>{activeTab?.status === "running" ? <><i className="pulse-dot" /> In progress</> : activeTab?.status === "completed" ? "Completed" : activeTab?.status === "stopped" ? "Stopped" : activeTab?.status === "failed" ? "Failed" : "Waiting"}</span></div></div>
 
           <div className="feed-list">
             {activeTab?.feed.map((entry) => <FeedCard key={entry.key} entry={entry} handled={activeTab.handledApprovals} onAnswer={(id, approved) => answerApproval(activeTab.id, id, approved)} />)}
@@ -910,7 +1120,7 @@ function App() {
         <div className="artifact-footnote"><ShieldCheck size={14} /><span>Previews read only from mounted folders</span></div>
       </aside>
 
-      {pendingApprovals.length > 0 && <div className="approval-counter"><span className="pulse-dot" /> {pendingApprovals.length} decision{pendingApprovals.length === 1 ? "" : "s"} needed</div>}
+      {pendingApprovals.length > 0 && <button className="approval-counter" onClick={() => { setActiveTabId(pendingApprovals[0].tabId); }} title="Show the session that needs a decision"><span className="pulse-dot" /> {pendingApprovals.length} decision{pendingApprovals.length === 1 ? "" : "s"} needed</button>}
 
       {settingsOpen && <SettingsDialog
         settings={settings}
@@ -922,20 +1132,40 @@ function App() {
       />}
 
       {projectDialogOpen && <ProjectDialog
-        onClose={() => setProjectDialogOpen(false)}
+        project={editingProject}
+        models={models}
+        defaultModel={settings.defaultModel}
+        onClose={() => { setProjectDialogOpen(false); setEditingProject(null); }}
         onCreate={createProject}
+        onUpdate={saveProjectEdits}
       />}
+
+      {scheduleDialogOpen && activeProject && <ScheduleDialog
+        projectId={activeProject.id}
+        projectName={activeProject.name}
+        defaultModel={activeProject.model_default || settings.defaultModel}
+        onClose={() => setScheduleDialogOpen(false)}
+        onSchedule={scheduleTask}
+      />}
+
+      {transcriptView && <TranscriptDialog view={transcriptView} onClose={() => setTranscriptView(null)} />}
     </main>
   </ErrorBoundary>);
 }
 
-function ProjectDialog({ onClose, onCreate }: {
+function ProjectDialog({ project, models, defaultModel, onClose, onCreate, onUpdate }: {
+  project?: Project | null;
+  models: ModelRoute[];
+  defaultModel: string;
   onClose: () => void;
   onCreate: (name: string, purpose: string, instructions: string) => Promise<void>;
+  onUpdate: (projectId: string, values: { name: string; purpose: string; instructions: string; model_default: string }) => Promise<void>;
 }) {
-  const [name, setName] = useState("");
-  const [purpose, setPurpose] = useState("");
-  const [instructions, setInstructions] = useState("");
+  const editing = Boolean(project);
+  const [name, setName] = useState(project?.name || "");
+  const [purpose, setPurpose] = useState(project?.purpose || "");
+  const [instructions, setInstructions] = useState(project?.instructions || "");
+  const [modelDefault, setModelDefault] = useState(project?.model_default || "");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -948,7 +1178,16 @@ function ProjectDialog({ onClose, onCreate }: {
     setBusy(true);
     setError("");
     try {
-      await onCreate(name.trim(), purpose.trim(), instructions);
+      if (editing && project) {
+        await onUpdate(project.id, {
+          name: name.trim(),
+          purpose: purpose.trim(),
+          instructions,
+          model_default: modelDefault,
+        });
+      } else {
+        await onCreate(name.trim(), purpose.trim(), instructions);
+      }
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -958,9 +1197,9 @@ function ProjectDialog({ onClose, onCreate }: {
 
   return (
     <div className="settings-overlay" onClick={onClose} role="presentation">
-      <form className="settings-dialog" role="dialog" aria-modal="true" aria-label="New project" onSubmit={submit} onClick={(event) => event.stopPropagation()}>
+      <form className="settings-dialog" role="dialog" aria-modal="true" aria-label={editing ? "Edit project" : "New project"} onSubmit={submit} onClick={(event) => event.stopPropagation()}>
         <header className="settings-header">
-          <div><span className="feed-kicker">NEW PROJECT</span><h2>Create a project</h2></div>
+          <div><span className="feed-kicker">{editing ? "EDIT PROJECT" : "NEW PROJECT"}</span><h2>{editing ? `Edit “${project?.name}”` : "Create a project"}</h2></div>
           <button type="button" className="icon-button" aria-label="Close project dialog" onClick={onClose}><X size={17} /></button>
         </header>
         <section className="settings-section">
@@ -984,12 +1223,24 @@ function ProjectDialog({ onClose, onCreate }: {
             rows={5}
             onChange={(event) => setInstructions(event.target.value)}
           />
-          <p className="sidebar-hint">Injected into every task the project starts. You can change it later in project settings.</p>
+          <p className="sidebar-hint">Injected into every task the project starts.</p>
+        </section>
+        <section className="settings-section">
+          <h3>Default model</h3>
+          <div className="settings-row static">
+            <span className="settings-copy"><strong>Model for project tasks</strong><small>Tasks in this project start on this model unless overridden in the composer.</small></span>
+            <select className="settings-select" value={modelDefault} aria-label="Project default model" onChange={(event) => setModelDefault(event.target.value)}>
+              <option value="">{defaultModel ? `App default · ${defaultModel}` : "Provider default"}</option>
+              {models.filter((route) => route.available).map((route) => (
+                <option key={`${route.provider}:${route.model}`} value={route.model}>{route.model} · {route.provider}</option>
+              ))}
+            </select>
+          </div>
         </section>
         {error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{error}</span></div>}
         <footer className="settings-footer">
           <button type="button" className="secondary-action" onClick={onClose}>Cancel</button>
-          <button type="submit" className="primary-action" disabled={busy || !name.trim()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />} Create project</button>
+          <button type="submit" className="primary-action" disabled={busy || !name.trim()}>{busy ? <LoaderCircle className="spin" size={15} /> : editing ? <Check size={15} /> : <Plus size={15} />} {editing ? "Save changes" : "Create project"}</button>
         </footer>
       </form>
     </div>
@@ -1045,6 +1296,7 @@ function SettingsDialog({ settings, models, daemonInfo, daemonStatus, onChange, 
         <section className="settings-section">
           <h3>Capabilities</h3>
           <ApprovalModeRow />
+          <ToolsSection />
           <div className="settings-row static">
             <span className="settings-copy"><strong>Folder access</strong><small>Tasks read and write only inside folders you mount — per project, with explicit read-only or read/write access. Revoking a mount takes effect immediately.</small></span>
           </div>
@@ -1052,6 +1304,10 @@ function SettingsDialog({ settings, models, daemonInfo, daemonStatus, onChange, 
             <span className="settings-copy"><strong>Destructive actions</strong><small>Shell commands, file edits, office document creation, and computer control always wait for your approval, regardless of the mode above.</small></span>
           </div>
         </section>
+
+        <AccountsSection />
+        <McpSection />
+        <UsageSection />
 
         <section className="settings-section">
           <h3>Connection</h3>
@@ -1104,6 +1360,429 @@ function ApprovalModeRow() {
         <button type="button" className={`approval-option ${mode === "auto_allow_readonly" ? "selected" : ""}`} disabled={!loaded} onClick={() => choose("auto_allow_readonly")}><Sparkles size={14} /> Auto-allow read-only</button>
       </div>
       {error && <small className="settings-error">{error}</small>}
+    </div>
+  );
+}
+
+/// Live tool catalog from the daemon (tools.list): what desktop tasks can
+/// use, and which entries are read-only under the auto-allow policy.
+function ToolsSection() {
+  const [tools, setTools] = useState<ToolInfo[]>([]);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<{ tools?: ToolInfo[] }>("tools_list")
+      .then((result) => { if (!cancelled) setTools(Array.isArray(result?.tools) ? result.tools : []); })
+      .catch((reason) => { if (!cancelled) setError(errorMessage(reason)); });
+    return () => { cancelled = true; };
+  }, []);
+
+  return (
+    <div className="settings-row static">
+      <span className="settings-copy"><strong>Tools available to tasks</strong><small><Wrench size={11} style={{ verticalAlign: "-1px" }} /> Every desktop task runs with the full jcode tool registry. Read-only tools run without prompting in auto-allow mode; configured MCP servers add their own tools dynamically.</small></span>
+      <div className="tools-chips">
+        {tools.map((tool) => (
+          <span className={`tool-chip ${tool.read_only ? "readonly" : ""}`} key={tool.name} title={tool.description}>
+            {tool.name}{tool.read_only ? <em>read-only</em> : null}
+          </span>
+        ))}
+        {!tools.length && !error && <small>Loading…</small>}
+        {error && <small className="settings-error">{error}</small>}
+      </div>
+    </div>
+  );
+}
+
+/// Provider sign-in surface backed by auth.status / auth.set_api_key /
+/// auth.clear — the same credential truth the CLI reports, with API keys
+/// editable in place and interactive logins pointed at `jcode login`.
+function AccountsSection() {
+  const [providers, setProviders] = useState<AuthProvider[]>([]);
+  const [error, setError] = useState("");
+  const [expanded, setExpanded] = useState("");
+  const [keyDraft, setKeyDraft] = useState("");
+  const [busyProvider, setBusyProvider] = useState("");
+
+  function reload() {
+    invoke<{ providers?: AuthProvider[] }>("auth_status")
+      .then((result) => { setProviders(Array.isArray(result?.providers) ? result.providers : []); setError(""); })
+      .catch((reason) => setError(errorMessage(reason)));
+  }
+
+  useEffect(reload, []);
+
+  async function saveKey(provider: AuthProvider) {
+    setBusyProvider(provider.id);
+    try {
+      await invoke("auth_set_api_key", { provider: provider.id, apiKey: keyDraft.trim() });
+      setExpanded("");
+      setKeyDraft("");
+      reload();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusyProvider("");
+    }
+  }
+
+  async function clearKey(provider: AuthProvider) {
+    setBusyProvider(provider.id);
+    try {
+      await invoke("auth_clear", { provider: provider.id });
+      reload();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusyProvider("");
+    }
+  }
+
+  const stateLabel: Record<AuthProvider["state"], string> = {
+    available: "ready",
+    expired: "expired",
+    not_configured: "not set up",
+  };
+
+  return (
+    <section className="settings-section">
+      <h3>Accounts</h3>
+      <p className="sidebar-hint">Sign in to providers here or with the jcode CLI — both read the same credentials. API keys can be set and cleared in place; OAuth/device logins run in a terminal with <code>jcode login &lt;provider&gt;</code>.</p>
+      <div className="accounts-list">
+        {providers.map((provider) => (
+          <div className="account-row" key={provider.id}>
+            <div className="account-line">
+              <span className={`account-state ${provider.state}`} />
+              <span className="account-name">{provider.display_name}</span>
+              <span className="account-detail" title={provider.health_summary}>{provider.method_detail}</span>
+              <span className={`account-badge ${provider.state}`}>{stateLabel[provider.state]}</span>
+              {provider.api_key_settable && (
+                <span className="account-actions">
+                  {expanded === provider.id ? (
+                    <button className="icon-button small" aria-label="Cancel key entry" onClick={() => { setExpanded(""); setKeyDraft(""); }}><X size={13} /></button>
+                  ) : (
+                    <button className="icon-button small" aria-label={`Set API key for ${provider.display_name}`} title="Set API key" onClick={() => { setExpanded(provider.id); setKeyDraft(""); }}><KeyRound size={13} /></button>
+                  )}
+                  <button className="icon-button small" aria-label={`Clear credentials for ${provider.display_name}`} title="Clear stored key" disabled={busyProvider === provider.id} onClick={() => clearKey(provider)}><Trash2 size={13} /></button>
+                </span>
+              )}
+            </div>
+            {expanded === provider.id && (
+              <div className="account-key-row">
+                <input
+                  type="password"
+                  className="settings-input"
+                  placeholder={`${provider.display_name} API key`}
+                  aria-label={`${provider.display_name} API key`}
+                  value={keyDraft}
+                  autoFocus
+                  onChange={(event) => setKeyDraft(event.target.value)}
+                  onKeyDown={(event) => { if (event.key === "Enter" && keyDraft.trim()) saveKey(provider); }}
+                />
+                <button className="primary-action small" disabled={!keyDraft.trim() || busyProvider === provider.id} onClick={() => saveKey(provider)}>{busyProvider === provider.id ? <LoaderCircle className="spin" size={13} /> : <KeyRound size={13} />} Save key</button>
+              </div>
+            )}
+          </div>
+        ))}
+        {!providers.length && !error && <p className="sidebar-empty">Reading credentials…</p>}
+        {error && <p className="sidebar-empty settings-error">{error}</p>}
+      </div>
+    </section>
+  );
+}
+
+/// MCP server manager backed by mcp.list / mcp.add / mcp.remove on the global
+/// ~/.jcode/mcp.json. Tasks pick these up as mcp__server__tool entries.
+function McpSection() {
+  const [servers, setServers] = useState<McpServerInfo[]>([]);
+  const [configPath, setConfigPath] = useState("");
+  const [name, setName] = useState("");
+  const [command, setCommand] = useState("");
+  const [args, setArgs] = useState("");
+  const [url, setUrl] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  function reload() {
+    invoke<{ servers?: McpServerInfo[]; config_path?: string }>("mcp_list")
+      .then((result) => {
+        setServers(Array.isArray(result?.servers) ? result.servers : []);
+        if (result?.config_path) setConfigPath(result.config_path);
+      })
+      .catch((reason) => setError(errorMessage(reason)));
+  }
+
+  useEffect(reload, []);
+
+  async function addServer(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const trimmedArgs = args.trim() ? args.trim().split(/\s+/) : undefined;
+      await invoke("mcp_add", {
+        name: name.trim(),
+        command: command.trim() || undefined,
+        args: trimmedArgs,
+        url: url.trim() || undefined,
+      });
+      setName(""); setCommand(""); setArgs(""); setUrl("");
+      reload();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeServer(server: McpServerInfo) {
+    if (!window.confirm(`Remove MCP server “${server.name}” from ${configPath}?`)) return;
+    try {
+      await invoke("mcp_remove", { name: server.name });
+      reload();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }
+
+  return (
+    <section className="settings-section">
+      <h3>MCP servers</h3>
+      <p className="sidebar-hint">Model Context Protocol servers give tasks extra tools. Stored in <code>{configPath || "~/.jcode/mcp.json"}</code>; every new task registers them automatically.</p>
+      <div className="mcp-list">
+        {servers.map((server) => (
+          <div className="mcp-row" key={server.name}>
+            <span className={`mcp-state ${server.enabled ? "on" : "off"}`} />
+            <span className="mcp-name">{server.name}</span>
+            <span className="mcp-target" title={server.command || server.url}>{server.command ? `${server.command} ${(server.args || []).join(" ")}` : server.url}</span>
+            <span className="mcp-transport">{server.transport}</span>
+            <button className="icon-button folder-remove" aria-label={`Remove ${server.name}`} title="Remove server" onClick={() => removeServer(server)}><X size={13} /></button>
+          </div>
+        ))}
+        {!servers.length && <p className="sidebar-empty">No MCP servers configured yet.</p>}
+      </div>
+      <form className="mcp-add" onSubmit={addServer}>
+        <div className="mcp-add-grid">
+          <input className="settings-input" value={name} aria-label="Server name" placeholder="name (letters, digits, - _ .)" onChange={(event) => setName(event.target.value)} />
+          <input className="settings-input" value={command} aria-label="Command for a stdio server" placeholder="command (stdio), e.g. npx -y some-mcp" onChange={(event) => { setCommand(event.target.value); setUrl(""); }} />
+          <input className="settings-input" value={url} aria-label="URL for a remote server" placeholder="or https://… (remote http/sse)" onChange={(event) => { setUrl(event.target.value); setCommand(""); }} />
+          <input className="settings-input" value={args} aria-label="Command arguments" placeholder="args (space-separated)" onChange={(event) => setArgs(event.target.value)} />
+        </div>
+        {error && <small className="settings-error">{error}</small>}
+        <button type="submit" className="secondary-action" disabled={busy || !name.trim() || (!command.trim() && !url.trim())}>{busy ? <LoaderCircle className="spin" size={13} /> : <Plus size={13} />} Add server</button>
+      </form>
+    </section>
+  );
+}
+
+/// Provider usage limits (usage.report): live windows per provider account
+/// plus the Anthropic five-hour / seven-day utilizations.
+function UsageSection() {
+  const [report, setReport] = useState<UsageReport | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<UsageReport>("usage_report")
+      .then((result) => { if (!cancelled) setReport(result); })
+      .catch((reason) => { if (!cancelled) setError(errorMessage(reason)); });
+    return () => { cancelled = true; };
+  }, []);
+
+  if (error) {
+    return (
+      <section className="settings-section">
+        <h3>Usage</h3>
+        <p className="sidebar-empty settings-error">{error}</p>
+      </section>
+    );
+  }
+  if (!report) {
+    return (
+      <section className="settings-section">
+        <h3>Usage</h3>
+        <p className="sidebar-empty">Reading provider usage…</p>
+      </section>
+    );
+  }
+
+  const claude = report.claude_windows;
+  const providersWithLimits = report.providers.filter((provider) => provider.limits.length);
+
+  return (
+    <section className="settings-section">
+      <h3>Usage</h3>
+      {providersWithLimits.length ? (
+        <div className="usage-list">
+          {providersWithLimits.map((provider) => (
+            <div className="usage-provider" key={provider.provider_name}>
+              <div className="usage-provider-name">{provider.provider_name}</div>
+              {provider.limits.map((limit) => (
+                <div className="usage-limit" key={`${provider.provider_name}:${limit.name}`}>
+                  <span className="usage-label">{limit.name}{limit.resets_at ? ` · resets ${limit.resets_at}` : ""}</span>
+                  <span className="usage-bar"><i style={{ width: `${Math.min(100, Math.max(2, limit.usage_percent))}%`, background: limit.usage_percent >= 99 ? "var(--clay)" : "var(--moss)" }} /></span>
+                  <span className="usage-value">{Math.round(limit.usage_percent)}%</span>
+                </div>
+              ))}
+              {provider.error && <small className="settings-error">{provider.error}</small>}
+            </div>
+          ))}
+        </div>
+      ) : <p className="sidebar-empty">No provider reports usage windows yet — they appear once a subscription provider is signed in.</p>}
+      {claude && (claude.five_hour > 0 || claude.seven_day > 0) && (
+        <div className="usage-provider">
+          <div className="usage-provider-name">Anthropic subscription windows</div>
+          <div className="usage-limit">
+            <span className="usage-label">Five-hour{claude.five_hour_resets_at ? ` · resets ${claude.five_hour_resets_at}` : ""}</span>
+            <span className="usage-bar"><i style={{ width: `${Math.min(100, Math.max(2, claude.five_hour * 100))}%`, background: claude.five_hour >= 0.99 ? "var(--clay)" : "var(--moss)" }} /></span>
+            <span className="usage-value">{Math.round(claude.five_hour * 100)}%</span>
+          </div>
+          <div className="usage-limit">
+            <span className="usage-label">Seven-day{claude.seven_day_resets_at ? ` · resets ${claude.seven_day_resets_at}` : ""}</span>
+            <span className="usage-bar"><i style={{ width: `${Math.min(100, Math.max(2, claude.seven_day * 100))}%`, background: claude.seven_day >= 0.99 ? "var(--clay)" : "var(--moss)" }} /></span>
+            <span className="usage-value">{Math.round(claude.seven_day * 100)}%</span>
+          </div>
+        </div>
+      )}
+      <p className="sidebar-hint"><BarChart3 size={11} style={{ verticalAlign: "-1px" }} /> Same data as <code>jcode usage</code>, cached by the daemon.</p>
+    </section>
+  );
+}
+
+/// Schedule a project-scoped task for later; the daemon fires it via its
+/// 30-second scheduler loop with the project's mounts and instructions.
+function ScheduleDialog({ projectId, projectName, defaultModel, onClose, onSchedule }: {
+  projectId: string;
+  projectName: string;
+  defaultModel: string;
+  onClose: () => void;
+  onSchedule: (projectId: string, goal: string, runAtUnixSecs: number, model?: string) => Promise<void>;
+}) {
+  const [goal, setGoal] = useState("");
+  const [when, setWhen] = useState("");
+  const [model, setModel] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!goal.trim() || !when) return;
+    const runAt = Math.floor(new Date(when).getTime() / 1000);
+    if (!Number.isFinite(runAt)) {
+      setError("Pick a valid date and time.");
+      return;
+    }
+    if (runAt * 1000 < Date.now()) {
+      setError("Pick a time in the future.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await onSchedule(projectId, goal.trim(), runAt, model || undefined);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="settings-overlay" onClick={onClose} role="presentation">
+      <form className="settings-dialog" role="dialog" aria-modal="true" aria-label="Schedule a task" onSubmit={submit} onClick={(event) => event.stopPropagation()}>
+        <header className="settings-header">
+          <div><span className="feed-kicker">SCHEDULED TASK</span><h2>Run a goal later in “{projectName}”</h2></div>
+          <button type="button" className="icon-button" aria-label="Close schedule dialog" onClick={onClose}><X size={17} /></button>
+        </header>
+        <section className="settings-section">
+          <h3>Goal</h3>
+          <textarea
+            className="settings-textarea"
+            value={goal}
+            rows={3}
+            autoFocus
+            aria-label="Scheduled goal"
+            placeholder="What should run when the time comes?"
+            onChange={(event) => setGoal(event.target.value)}
+          />
+        </section>
+        <section className="settings-section">
+          <h3>When</h3>
+          <div className="settings-row static">
+            <span className="settings-copy"><strong>Run at</strong><small>The desktop daemon fires the task within 30 seconds of this time, using the project's mounted folders and instructions.</small></span>
+            <input className="settings-input" type="datetime-local" value={when} aria-label="Run at" onChange={(event) => setWhen(event.target.value)} />
+          </div>
+          <div className="settings-row static">
+            <span className="settings-copy"><strong>Model</strong><small>Optional override; the project's default model applies otherwise.</small></span>
+            <select className="settings-select" value={model} aria-label="Scheduled task model" onChange={(event) => setModel(event.target.value)}>
+              <option value="">{defaultModel ? `Project default · ${defaultModel}` : "Project default"}</option>
+            </select>
+          </div>
+        </section>
+        {error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{error}</span></div>}
+        <footer className="settings-footer">
+          <button type="button" className="secondary-action" onClick={onClose}>Cancel</button>
+          <button type="submit" className="primary-action" disabled={busy || !goal.trim() || !when}>{busy ? <LoaderCircle className="spin" size={15} /> : <CalendarClock size={15} />} Schedule</button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+/// Full conversation transcript for a finished or running task, read from the
+/// daemon's persisted session store (task.transcript).
+function TranscriptDialog({ view, onClose }: { view: TranscriptView; onClose: () => void }) {
+  const [entries, setEntries] = useState<TranscriptEntry[] | null>(null);
+  const [total, setTotal] = useState(0);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<{ messages?: TranscriptEntry[]; total_messages?: number }>("task_transcript", { taskId: view.taskId, limit: 400 })
+      .then((result) => {
+        if (cancelled) return;
+        setEntries(Array.isArray(result?.messages) ? result.messages : []);
+        setTotal(typeof result?.total_messages === "number" ? result.total_messages : 0);
+      })
+      .catch((reason) => { if (!cancelled) setError(errorMessage(reason)); });
+    return () => { cancelled = true; };
+  }, [view.taskId]);
+
+  return (
+    <div className="settings-overlay" onClick={onClose} role="presentation">
+      <div className="settings-dialog transcript-dialog" role="dialog" aria-modal="true" aria-label="Task transcript" onClick={(event) => event.stopPropagation()}>
+        <header className="settings-header">
+          <div><span className="feed-kicker">TRANSCRIPT</span><h2>{view.goal}</h2></div>
+          <button className="icon-button" aria-label="Close transcript" onClick={onClose}><X size={17} /></button>
+        </header>
+        <div className="transcript-body">
+          {error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{error}</span></div>}
+          {!error && !entries && <div className="preview-message"><LoaderCircle className="spin" size={19} /><span>Loading transcript…</span></div>}
+          {entries && !entries.length && <p className="sidebar-empty">The session has no visible conversation yet — try again once the task has produced output.</p>}
+          {entries && entries.length > 0 && (
+            <>
+              {total > entries.length && <p className="sidebar-hint">Showing the last {entries.length} of {total} conversation messages.</p>}
+              <div className="transcript-list">
+                {entries.map((entry, index) => (
+                  <article className={`transcript-entry ${entry.role}`} key={index}>
+                    <span className="transcript-role">{entry.role === "user" ? "You" : "Agent"}</span>
+                    <div className="transcript-content">
+                      {entry.text && <p>{entry.text}</p>}
+                      {entry.events.map((event, eventIndex) => (
+                        <div className={`transcript-event ${event.is_error ? "error" : ""}`} key={eventIndex}>
+                          {event.type === "tool_use"
+                            ? <><ChevronRight size={12} /> used <code>{event.tool}</code></>
+                            : <><FileText size={12} /> {event.type === "tool_result" ? `result${event.is_error ? " (error)" : ""}` : event.type}: {event.text}</>}
+                        </div>
+                      ))}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -1168,7 +1847,9 @@ function ArtifactPreview({ artifact }: { artifact: Artifact | null }) {
           const result = await mammoth.convertToHtml({ arrayBuffer: buffer });
           if (!cancelled) setPreview({ status: "ready", payload, docxHtml: DOMPurify.sanitize(result.value) });
         } else {
-          setPreview({ status: "error", message: "This file type does not have a preview." });
+          // No inline renderer for this type (pptx, text/code, anything the
+          // task produced) — offer a real download instead of a dead end.
+          setPreview({ status: "ready", payload });
         }
       })
       .catch((reason: unknown) => {
@@ -1183,6 +1864,7 @@ function ArtifactPreview({ artifact }: { artifact: Artifact | null }) {
   if (preview.status === "pdf") return <div className="pdf-preview"><div className="preview-file-title"><FileText size={15} /><span>{preview.payload.name}</span></div><iframe title={`Preview of ${preview.payload.name}`} src={preview.url} /></div>;
   if (preview.rows) return <div className="spreadsheet-preview"><div className="preview-file-title"><FileSpreadsheet size={15} /><span>{preview.payload.name}</span></div>{preview.rows.length ? <div className="sheet-scroll"><table><tbody>{preview.rows.map((row, rowIndex) => <tr key={rowIndex}>{Array.from({ length: preview.columns || 1 }, (_, columnIndex) => { const Cell = rowIndex === 0 ? "th" : "td"; return <Cell key={columnIndex}>{String(row[columnIndex] ?? "")}</Cell>; })}</tr>)}</tbody></table></div> : <div className="preview-message">This workbook has no visible rows.</div>}</div>;
   if (preview.docxHtml) return <div className="document-preview"><div className="preview-file-title"><FileText size={15} /><span>{preview.payload.name}</span></div><article className="docx-content" dangerouslySetInnerHTML={{ __html: preview.docxHtml }} /></div>;
+  if (!preview.markdown && !preview.rows) return <div className="download-preview"><div className="preview-file-title"><FileText size={15} /><span>{preview.payload.name}</span></div><p className="sidebar-hint">No inline preview for this file type — download it to open in the app it was made for.</p><a className="primary-action" download={preview.payload.name} href={`data:${preview.payload.mime_type || "application/octet-stream"};base64,${preview.payload.content_base64}`}><FileDown size={15} /> Download {preview.payload.name}</a></div>;
   return <div className="markdown-preview"><div className="preview-file-title"><FileText size={15} /><span>{preview.payload.name}</span></div><article className="markdown-content"><ReactMarkdown>{preview.markdown || ""}</ReactMarkdown></article></div>;
 }
 
