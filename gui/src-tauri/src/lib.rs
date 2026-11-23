@@ -55,7 +55,9 @@ fn daemon_log_path() -> PathBuf {
 /// Best-effort: on failure the previous list stays (previews degrade, they
 /// never break).
 fn refresh_project_roots(connection: &RpcConnection, bridge: &Bridge) {
-    let Ok(Ok(list)) = connection.request("project.list", json!({})) else {
+    // `request` returns Result<Value, String>; a failed call keeps the
+    // previous root list (previews degrade, they never break).
+    let Ok(list) = connection.request("project.list", json!({})) else {
         return;
     };
     let Some(projects) = list.get("projects").and_then(Value::as_array) else {
