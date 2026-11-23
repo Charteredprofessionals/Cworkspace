@@ -902,6 +902,23 @@ async fn mcp_remove(
 }
 
 #[tauri::command]
+async fn task_followup(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    task_id: String,
+    message: String,
+    model: Option<String>,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request(
+            "task.followup",
+            json!({ "task_id": task_id, "message": message, "model": model }),
+        )
+    })
+}
+
+#[tauri::command]
 async fn schedule_create(
     app: AppHandle,
     bridge: State<'_, Bridge>,
@@ -1079,6 +1096,7 @@ pub fn run() {
             settings_get,
             settings_update,
             task_transcript,
+            task_followup,
             tools_list,
             usage_report,
             auth_status,

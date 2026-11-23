@@ -232,6 +232,10 @@ struct CoworkRpcInner {
     /// task_id -> jcode session_id, most recent last. Lets `task.transcript`
     /// read a task's persisted conversation even after the task completes.
     task_sessions: Mutex<VecDeque<(String, String)>>,
+    /// task_id -> recorded launch context (mounts, project, model), most
+    /// recent last. Lets `task.followup` resume a finished task with the
+    /// same workspace and settings.
+    task_contexts: Mutex<VecDeque<(String, TaskContext)>>,
     /// Lazily bootstrapped provider used to answer `list_models` without
     /// waiting for a task. Each runtime auto-fetches its model catalog from
     /// the provider's own endpoint (TTL-cached, static fallback offline).
@@ -253,6 +257,12 @@ pub struct TaskLaunch {
     pub instructions: Option<String>,
     /// When set, the finished launch is recorded in the project's task history.
     pub project_id: Option<String>,
+    /// Resume an existing session — a follow-up turn on a finished task
+    /// keeps the earlier conversation context.
+    pub resume_session: Option<String>,
+    /// Reuse an existing task id so follow-up events keep flowing to the
+    /// same desktop tab.
+    pub reuse_task_id: Option<String>,
 }
 
 impl TaskLaunch {
@@ -263,8 +273,19 @@ impl TaskLaunch {
             model: None,
             instructions: None,
             project_id: None,
+            resume_session: None,
+            reuse_task_id: None,
         }
     }
+}
+
+/// Recorded per finished launch so a follow-up can resume with identical
+/// mounts, project, and model. Bounded like the task-session map.
+#[derive(Clone)]
+pub struct TaskContext {
+    pub mounts: Vec<CoworkMount>,
+    pub project_id: Option<String>,
+    pub model: Option<String>,
 }
 
 impl CoworkRpc {
@@ -281,6 +302,7 @@ impl CoworkRpc {
                 tool_invoked_registrations: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(HashMap::new()),
                 task_sessions: Mutex::new(VecDeque::new()),
+                task_contexts: Mutex::new(VecDeque::new()),
                 models_provider: tokio::sync::OnceCell::new(),
                 approval_policy: std::sync::Mutex::new(load_policy()),
                 project_store: std::sync::OnceLock::new(),
@@ -488,9 +510,9 @@ impl CoworkRpc {
 pub async fn start_task(&self, launch: TaskLaunch) -> Result<String> {
     self.start_task_with(
         launch,
-        |goal, roots, model, task_id, instructions, rpc| async move {
+        |goal, roots, model, task_id, instructions, resume_session, rpc| async move {
             crate::cli::commands::run_cowork_task(
-                goal, roots, model, task_id, instructions, rpc,
+                goal, roots, model, task_id, instructions, resume_session, rpc,
             )
             .await
         },
@@ -510,6 +532,7 @@ where
             Option<String>,
             String,
             Option<String>,
+            Option<String>,
             CoworkRpc,
         ) -> Fut
         + Send
@@ -517,20 +540,45 @@ where
     Fut: Future<Output = Result<String>> + Send + 'static,
 {
     anyhow::ensure!(!launch.goal.trim().is_empty(), "task goal cannot be empty");
+    anyhow::ensure!(
+        launch.reuse_task_id.is_none() || launch.resume_session.is_some(),
+        "reusing a task id requires the session to resume"
+    );
     let allowed_roots = validate_workspace_roots(
         launch.mounts.iter().map(|mount| mount.path.clone()).collect(),
     )
     .await?;
-    let task_id = crate::id::new_id("cowork");
+    let task_id = launch
+        .reuse_task_id
+        .clone()
+        .unwrap_or_else(|| crate::id::new_id("cowork"));
+    if launch.resume_session.is_some() {
+        let running = self.inner.tasks.lock().await.contains_key(&task_id);
+        anyhow::ensure!(
+            !running,
+            "task {task_id} is still running; wait for it to finish before sending a follow-up"
+        );
+        let known = self.task_session_id(&task_id).await.is_some();
+        anyhow::ensure!(
+            known,
+            "no session recorded for task {task_id}; it cannot be resumed"
+        );
+    }
     let (start, started) = oneshot::channel();
     let rpc = self.clone();
     let run_task_id = task_id.clone();
+    let context = TaskContext {
+        mounts: launch.mounts.clone(),
+        project_id: launch.project_id.clone(),
+        model: launch.model.clone(),
+    };
     let work = run(
         launch.goal,
         allowed_roots,
         launch.model,
         run_task_id.clone(),
         launch.instructions,
+        launch.resume_session,
         rpc.clone(),
     );
     let handle = tokio::spawn(async move {
@@ -555,10 +603,37 @@ where
         .await
         .insert(task_id.clone(), handle);
     let _ = start.send(());
+    // Record the launch context so a later follow-up can resume with the
+    // same workspace, project, and model (bounded, most recent kept).
+    {
+        let mut contexts = self.inner.task_contexts.lock().await;
+        contexts.retain(|(existing, _)| existing != &task_id);
+        contexts.push_back((task_id.clone(), context));
+        while contexts.len() > 200 {
+            contexts.pop_front();
+        }
+    }
     if let Some(project_id) = &launch.project_id {
         let _ = self.project_store().record_task(project_id, &task_id);
     }
     Ok(task_id)
+}
+
+/// Recorded launch context for a task, if any (survives completion).
+pub async fn task_context(&self, task_id: &str) -> Option<TaskContext> {
+    self.inner
+        .task_contexts
+        .lock()
+        .await
+        .iter()
+        .rev()
+        .find(|(existing, _)| existing == task_id)
+        .map(|(_, context)| context.clone())
+}
+
+/// Whether a task's work is currently running.
+pub async fn task_is_running(&self, task_id: &str) -> bool {
+    self.inner.tasks.lock().await.contains_key(task_id)
 }
 
 /// Task ids currently registered and whether their work is still running.
@@ -992,6 +1067,30 @@ fn truncate_chars(text: &str, max: usize) -> String {
     format!("{}\u{2026} [truncated]", &text[..end])
 }
 
+/// Build the follow-up launch for a finished task. Pure so tests can assert
+/// on it without spawning a real runner.
+fn build_followup_launch(
+    task_id: &str,
+    session_id: String,
+    context: TaskContext,
+    message: &str,
+    model_override: Option<String>,
+    project_instructions: Option<String>,
+) -> TaskLaunch {
+    // Model precedence: explicit override → the original launch's model →
+    // the project's default → provider default (empty override = original).
+    let model = model_override.or(context.model);
+    TaskLaunch {
+        goal: message.trim().to_owned(),
+        mounts: context.mounts,
+        model,
+        instructions: project_instructions,
+        project_id: context.project_id,
+        resume_session: Some(session_id),
+        reuse_task_id: Some(task_id.to_owned()),
+    }
+}
+
 /// Fire any due scheduled tasks. Runs inside the daemon's scheduler loop.
 async fn run_due_schedule_entries(rpc: &CoworkRpc) -> Result<()> {
     let mut store = ScheduleStore::open_default()?;
@@ -1025,6 +1124,8 @@ async fn run_due_schedule_entries(rpc: &CoworkRpc) -> Result<()> {
                 Some(project.instructions.clone())
             },
             project_id: Some(entry.project_id.clone()),
+            resume_session: None,
+            reuse_task_id: None,
         };
         match rpc.start_task(launch).await {
             Ok(task_id) => store.mark_fired(&entry.id, &task_id)?,
@@ -1690,6 +1791,8 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                         Some(project.instructions.clone())
                     },
                     project_id: Some(project_id.to_owned()),
+                    resume_session: None,
+                    reuse_task_id: None,
                 }
             } else {
                 let allowed_roots = request
@@ -1960,6 +2063,76 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                 Ok(Err(error)) => Err((-32000, error.to_string())),
                 Err(error) => Err((-32000, format!("schedule task failed: {error}"))),
             }
+        }
+        "task.followup" => {
+            let task_id = request.params.get("task_id").and_then(Value::as_str);
+            let message = request.params.get("message").and_then(Value::as_str);
+            let model_override = request
+                .params
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|model| !model.trim().is_empty());
+            let Some(task_id) = task_id else {
+                return Some(rpc_error(
+                    Some(id),
+                    -32602,
+                    "params require string task_id and string message",
+                ));
+            };
+            let Some(message) = message.filter(|message| !message.trim().is_empty()) else {
+                return Some(rpc_error(
+                    Some(id),
+                    -32602,
+                    "params require string task_id and string message",
+                ));
+            };
+            if rpc.task_is_running(task_id).await {
+                return Some(rpc_error(
+                    Some(id),
+                    -32000,
+                    format!("task {task_id} is still running; wait for it to finish before sending a follow-up"),
+                ));
+            }
+            let Some(session_id) = rpc.task_session_id(task_id).await else {
+                return Some(rpc_error(
+                    Some(id),
+                    -32000,
+                    format!("no session recorded for task {task_id}; it cannot be resumed"),
+                ));
+            };
+            let Some(context) = rpc.task_context(task_id).await else {
+                return Some(rpc_error(
+                    Some(id),
+                    -32000,
+                    format!("no workspace context recorded for task {task_id}"),
+                ));
+            };
+            // Instructions are re-applied from the project so the resumed
+            // turn keeps its brief.
+            let instructions = context
+                .project_id
+                .as_ref()
+                .and_then(|project_id| rpc.project_store().get(project_id).ok())
+                .and_then(|project| {
+                    if project.instructions.trim().is_empty() {
+                        None
+                    } else {
+                        Some(project.instructions.clone())
+                    }
+                });
+            let launch = build_followup_launch(
+                task_id,
+                session_id,
+                context,
+                message,
+                model_override,
+                instructions,
+            );
+            rpc.start_task(launch)
+                .await
+                .map(|task_id| json!({ "task_id": task_id }))
+                .map_err(|error| (-32000, error.to_string()))
         }
         _ => Err((-32601, format!("Method not found: {}", request.method))),
     };
@@ -2309,7 +2482,7 @@ mod tests {
                     "Review these files".to_string(),
                     vec![CoworkMount::read_write(directory.path())],
                 ),
-                |_, _, _, _, _, _| async { std::future::pending::<Result<String>>().await },
+                |_, _, _, _, _, _, _| async { std::future::pending::<Result<String>>().await },
             )
             .await
             .unwrap();
@@ -2343,7 +2516,7 @@ mod tests {
                     "Review these files".to_string(),
                     vec![CoworkMount::read_write(directory.path())],
                 ),
-                |_, _, _, _, _, _| async { Ok("Reviewed the workspace".to_string()) },
+                |_, _, _, _, _, _, _| async { Ok("Reviewed the workspace".to_string()) },
             )
             .await
             .unwrap();
@@ -2557,8 +2730,10 @@ mod tests {
                     model: None,
                     instructions: Some("Always cite the source workbook.".to_owned()),
                     project_id: Some(project_id.clone()),
+                    resume_session: None,
+                    reuse_task_id: None,
                 },
-                move |_goal, roots, _model, _task_id, instructions, _rpc| {
+                move |_goal, roots, _model, _task_id, instructions, _resume, _rpc| {
                     let captured = std::sync::Arc::clone(&captured_in_task);
                     async move {
                         *captured.lock().unwrap() = Some(instructions.clone());
@@ -2980,5 +3155,226 @@ mod tests {
             Some("sess-a2")
         );
         assert_eq!(rpc.task_session_id("task-missing").await, None);
+    }
+
+    #[tokio::test]
+    async fn task_followup_rejects_unknown_task() {
+        let rpc = CoworkRpc::new();
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                90,
+                "task.followup",
+                json!({ "task_id": "cowork-missing", "message": "continue please" }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no session recorded"));
+    }
+
+    #[tokio::test]
+    async fn task_followup_rejects_while_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let rpc = CoworkRpc::new();
+        let task_id = rpc
+            .start_task_with(
+                TaskLaunch::new(
+                    "Long task".to_string(),
+                    vec![CoworkMount::read_write(directory.path())],
+                ),
+                |_, _, _, _, _, _, _| async { std::future::pending::<Result<String>>().await },
+            )
+            .await
+            .unwrap();
+        rpc.note_task_session(&task_id, "sess-running").await;
+
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                91,
+                "task.followup",
+                json!({ "task_id": task_id, "message": "are you done yet?" }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("still running"));
+        let _ = rpc.stop_task(&task_id).await;
+    }
+
+    #[tokio::test]
+    async fn task_followup_resumes_with_reused_task_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let rpc = CoworkRpc::new();
+        let mut events = rpc.subscribe();
+        let calls: std::sync::Arc<
+            std::sync::Mutex<Vec<(Option<String>, String, Option<String>)>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_in_task = std::sync::Arc::clone(&calls);
+        let launch = TaskLaunch {
+            goal: "First turn".to_owned(),
+            mounts: vec![CoworkMount::read_write(directory.path())],
+            model: Some("test-model".to_owned()),
+            instructions: None,
+            project_id: None,
+            resume_session: None,
+            reuse_task_id: None,
+        };
+        let task_id = rpc
+            .start_task_with(
+                launch,
+                move |goal, _roots, model, _task_id, _instructions, resume, _rpc| {
+                    let calls = std::sync::Arc::clone(&calls_in_task);
+                    async move {
+                        calls
+                            .lock()
+                            .unwrap()
+                            .push((resume, goal, model));
+                        Ok("first done".to_owned())
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            events.recv().await.unwrap(),
+            CoworkEvent::TaskCompleted {
+                task_id: task_id.clone(),
+                success: true,
+                summary: Some("first done".to_string()),
+            }
+        );
+        // run_cowork_task records the session; simulate that here.
+        rpc.note_task_session(&task_id, "sess-original").await;
+        let context = rpc.task_context(&task_id).await.unwrap();
+        assert_eq!(context.model.as_deref(), Some("test-model"));
+
+        // The follow-up launch reuses the task id, resumes the session, and
+        // keeps the recorded model unless overridden.
+        let followup = build_followup_launch(
+            &task_id,
+            "sess-original".to_owned(),
+            context,
+            "Now expand on that",
+            None,
+            None,
+        );
+        assert_eq!(followup.reuse_task_id.as_deref(), Some(task_id.as_str()));
+        assert_eq!(followup.resume_session.as_deref(), Some("sess-original"));
+        assert_eq!(followup.goal, "Now expand on that");
+        assert_eq!(followup.model.as_deref(), Some("test-model"));
+
+        let calls_in_followup = std::sync::Arc::clone(&calls);
+        let followup_id = rpc
+            .start_task_with(
+                followup,
+                move |goal, _roots, model, _task_id, _instructions, resume, _rpc| {
+                    let calls = std::sync::Arc::clone(&calls_in_followup);
+                    async move {
+                        calls
+                            .lock()
+                            .unwrap()
+                            .push((resume, goal, model));
+                        Ok("follow-up done".to_owned())
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(followup_id, task_id, "follow-up must reuse the task id");
+        assert_eq!(
+            events.recv().await.unwrap(),
+            CoworkEvent::TaskCompleted {
+                task_id: task_id.clone(),
+                success: true,
+                summary: Some("follow-up done".to_string()),
+            }
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, None);
+        assert_eq!(calls[0].1, "First turn");
+        assert_eq!(calls[1].0.as_deref(), Some("sess-original"));
+        assert_eq!(calls[1].1, "Now expand on that");
+        assert_eq!(calls[1].2.as_deref(), Some("test-model"));
+    }
+
+    #[tokio::test]
+    async fn task_followup_launch_honors_overrides_and_trims_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = TaskContext {
+            mounts: vec![CoworkMount::read_write(directory.path())],
+            project_id: Some("proj-1".to_owned()),
+            model: Some("original-model".to_owned()),
+        };
+        // No override: keep the original model; project instructions carried.
+        let launch = build_followup_launch(
+            "task-1",
+            "sess-1".to_owned(),
+            context.clone(),
+            "  Do it again  ",
+            None,
+            Some("Always cite the source.".to_owned()),
+        );
+        assert_eq!(launch.goal, "Do it again");
+        assert_eq!(launch.model.as_deref(), Some("original-model"));
+        assert_eq!(launch.instructions.as_deref(), Some("Always cite the source."));
+        assert_eq!(launch.project_id.as_deref(), Some("proj-1"));
+        assert_eq!(launch.resume_session.as_deref(), Some("sess-1"));
+        assert_eq!(launch.reuse_task_id.as_deref(), Some("task-1"));
+
+        // Explicit override wins over the recorded model.
+        let launch = build_followup_launch(
+            "task-1",
+            "sess-1".to_owned(),
+            context,
+            "Do it again",
+            Some("override-model".to_owned()),
+            None,
+        );
+        assert_eq!(launch.model.as_deref(), Some("override-model"));
+        assert!(launch.instructions.is_none());
+    }
+
+    #[tokio::test]
+    async fn task_followup_requires_message() {
+        let rpc = CoworkRpc::new();
+        // Missing message entirely.
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                94,
+                "task.followup",
+                json!({ "task_id": "cowork-x" }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+        // Whitespace-only message is rejected too.
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                95,
+                "task.followup",
+                json!({ "task_id": "cowork-x", "message": "   " }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32602);
     }
 }

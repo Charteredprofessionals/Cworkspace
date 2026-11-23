@@ -7,6 +7,7 @@ import {
   ArrowDown,
   ArrowUpRight,
   BarChart3,
+  Briefcase,
   CalendarClock,
   Check,
   ChevronDown,
@@ -131,6 +132,11 @@ type PreviewState =
 
 type TabStatus = "idle" | "running" | "completed" | "stopped" | "failed";
 
+/// Interface Layout (Settings → General): the simplified Knowledge Work face
+/// for research/writing/everyday tasks, or the full Software Engineering
+/// interface for coding and agent management.
+type InterfaceLayout = "knowledge" | "software";
+
 type SessionTab = {
   id: string;
   title: string;
@@ -148,9 +154,14 @@ type SessionTab = {
   handledApprovals: Record<string, boolean>;
   error: string;
   notice: string;
+  /// Messages typed while the task runs, delivered as follow-up turns when
+  /// the current run finishes.
+  queued: string[];
 };
 
 type Settings = {
+  interfaceLayout: InterfaceLayout;
+  hasOnboarded: boolean;
   reopenFolders: boolean;
   autoOpenArtifacts: boolean;
   defaultModel: string;
@@ -270,6 +281,8 @@ const SETTINGS_KEY = "cworkspace-settings-v1";
 const FOLDERS_KEY = "cworkspace-folders-v1";
 
 const DEFAULT_SETTINGS: Settings = {
+  interfaceLayout: "software",
+  hasOnboarded: false,
   reopenFolders: true,
   autoOpenArtifacts: true,
   defaultModel: "",
@@ -305,6 +318,42 @@ function tabTitle(goal: string) {
   return words.length > 42 ? `${words.slice(0, 42)}…` : words;
 }
 
+/// Plain-language phrases for tool activity in Knowledge Work mode.
+const TOOL_PHRASES: Record<string, string> = {
+  read: "Looking through your files",
+  ls: "Listing a folder",
+  glob: "Finding files",
+  agentgrep: "Searching file contents",
+  webfetch: "Opening a web page",
+  websearch: "Searching the web",
+  write: "Writing files",
+  edit: "Editing files",
+  replace: "Editing files",
+  apply_patch: "Applying changes",
+  bash: "Running a command",
+  office_docs: "Creating a document",
+  browser: "Using the browser",
+  open: "Opening a file",
+  computer_use: "Controlling the computer",
+  macos_computer_use: "Controlling the computer",
+  compile_remote: "Compiling remotely",
+  bg: "Running a background job",
+  todo: "Updating its plan",
+  memory: "Remembering details",
+  session_search: "Searching past sessions",
+  schedule: "Scheduling a follow-up",
+  gmail: "Checking Gmail",
+  calendar: "Checking Calendar",
+};
+
+function toolPhrase(name: string) {
+  if (name.startsWith("mcp__")) {
+    const server = name.slice(5).split("__")[0] || "connected";
+    return `Using the ${server} extension`;
+  }
+  return TOOL_PHRASES[name] || `Using ${name}`;
+}
+
 let tabCounter = 0;
 function newTab(): SessionTab {
   tabCounter += 1;
@@ -322,6 +371,7 @@ function newTab(): SessionTab {
     handledApprovals: {},
     error: "",
     notice: "",
+    queued: [],
   };
 }
 
@@ -340,6 +390,10 @@ function loadSettings(): Settings {
     if (value && typeof value === "object") {
       const raw = value as Record<string, unknown>;
       return {
+        interfaceLayout: raw.interfaceLayout === "knowledge" || raw.interfaceLayout === "software"
+          ? raw.interfaceLayout
+          : DEFAULT_SETTINGS.interfaceLayout,
+        hasOnboarded: typeof raw.hasOnboarded === "boolean" ? raw.hasOnboarded : DEFAULT_SETTINGS.hasOnboarded,
         reopenFolders: typeof raw.reopenFolders === "boolean" ? raw.reopenFolders : DEFAULT_SETTINGS.reopenFolders,
         autoOpenArtifacts: typeof raw.autoOpenArtifacts === "boolean" ? raw.autoOpenArtifacts : DEFAULT_SETTINGS.autoOpenArtifacts,
         defaultModel: typeof raw.defaultModel === "string" ? raw.defaultModel : DEFAULT_SETTINGS.defaultModel,
@@ -764,6 +818,12 @@ function App() {
     if (!tab) return;
     const goal = tab.goal.trim();
     if (!goal) return;
+    // While a task runs, the composer delivers queued messages instead of
+    // starting anything new.
+    if (tab.status === "running") {
+      patchTab(tab.id, { queued: [...tab.queued, goal], goal: "" });
+      return;
+    }
     patchTab(tab.id, { error: "", notice: "" });
     if (activeProject && !activeProject.mounts.length) {
       patchTab(tab.id, { error: "Mount a folder into this project before starting a task." });
@@ -779,6 +839,7 @@ function App() {
       artifacts: [],
       selectedArtifact: null,
       handledApprovals: {},
+      queued: [],
       title: tabTitle(goal),
     });
     try {
@@ -868,6 +929,34 @@ function App() {
   }
 
   const availableModels = models.filter((route) => route.available);
+  const isKnowledge = settings.interfaceLayout === "knowledge";
+
+  function removeQueued(index: number) {
+    const tab = activeTab;
+    if (!tab) return;
+    patchTab(tab.id, { queued: tab.queued.filter((_, at) => at !== index) });
+  }
+
+  /// Deliver the first queued message as a follow-up turn on the finished
+  /// task — the daemon resumes its session under the same task id, so the
+  /// feed and transcript continue in this tab.
+  async function sendFollowUp(index: number) {
+    const tab = activeTab;
+    if (!tab?.taskId) return;
+    const message = tab.queued[index];
+    if (!message?.trim()) return;
+    patchTab(tab.id, { error: "", status: "running", queued: tab.queued.filter((_, at) => at !== index) });
+    try {
+      await invoke("task_followup", {
+        taskId: tab.taskId,
+        message: message.trim(),
+        model: tab.modelOverride || undefined,
+      });
+      setHistory((current) => current.map((item) => item.taskId === tab.taskId ? { ...item, status: "running" as const, updatedAt: Date.now() } : item));
+    } catch (reason) {
+      patchTab(tab.id, { error: `Could not send the follow-up: ${errorMessage(reason)}`, status: "failed" });
+    }
+  }
 
   return (
   <ErrorBoundary>
@@ -965,7 +1054,7 @@ function App() {
           </section>
         )}
 
-        <section className="sidebar-section models-section">
+        {!isKnowledge && <section className="sidebar-section models-section">
           <div className="section-heading"><span>MODELS</span><Sparkles size={14} /></div>
           <div className="model-list">
             {availableModels.slice(0, 10).map((route) => (
@@ -983,7 +1072,7 @@ function App() {
             {models.length > 0 && !availableModels.length && <p className="sidebar-empty">No models available yet — sign in to a provider to fill this list.</p>}
             {availableModels.length > 0 && <p className="sidebar-hint">Click a model to make it the default for new tasks.</p>}
           </div>
-        </section>
+        </section>}
 
         <section className="sidebar-section history-section">
           <div className="section-heading"><span>RECENT WORK</span><History size={14} /></div>
@@ -1064,9 +1153,9 @@ function App() {
           </div>
 
           <form className="goal-form" onSubmit={startTask}>
-            <div className="goal-form-top"><Sparkles size={16} /><label htmlFor="goal-input">What would you like to get done?</label>{(activeProject ? activeProject.mounts.length : folders.length) > 0 && <span className="root-count">{activeProject ? `${activeProject.name} · ${activeProject.mounts.length} ${activeProject.mounts.length === 1 ? "folder" : "folders"}` : `${folders.length} ${folders.length === 1 ? "folder" : "folders"} in scope`}</span>}</div>
-            <textarea id="goal-input" ref={goalInputRef} value={activeTab?.goal || ""} onChange={(event) => activeTab && patchTab(activeTab.id, { goal: event.target.value })} placeholder="Draft a project brief, audit these figures, prepare a polished report…" rows={3} disabled={activeTab?.status === "running"} />
-            {!activeProject && <textarea
+            <div className="goal-form-top"><Sparkles size={16} /><label htmlFor="goal-input">{activeTab?.status === "running" ? (isKnowledge ? "Add a message for the agent — it runs after the current step" : "Queue a message for the running task") : "What would you like to get done?"}</label>{(activeProject ? activeProject.mounts.length : folders.length) > 0 && <span className="root-count">{activeProject ? `${activeProject.name} · ${activeProject.mounts.length} ${activeProject.mounts.length === 1 ? "folder" : "folders"}` : `${folders.length} ${folders.length === 1 ? "folder" : "folders"} in scope`}</span>}</div>
+            <textarea id="goal-input" ref={goalInputRef} value={activeTab?.goal || ""} onChange={(event) => activeTab && patchTab(activeTab.id, { goal: event.target.value })} placeholder="Draft a project brief, audit these figures, prepare a polished report…" rows={3} />
+            {!activeProject && !isKnowledge && <textarea
               id="instructions-input"
               className="composer-instructions"
               value={activeTab?.instructions || ""}
@@ -1075,9 +1164,20 @@ function App() {
               rows={1}
               disabled={activeTab?.status === "running"}
             />}
+            {(activeTab?.queued.length || 0) > 0 && <div className="queue-strip">
+              {activeTab?.queued.map((message, index) => (
+                <span className="queue-chip" key={`${index}-${message.slice(0, 12)}`}>
+                  <span className="queue-copy" title={message}>{message}</span>
+                  {activeTab.status === "running"
+                    ? <small>queued</small>
+                    : <button type="button" className="queue-send" onClick={() => sendFollowUp(index)}>{index === 0 ? "Send as follow-up" : "Send"}</button>}
+                  <button type="button" className="icon-button folder-remove" aria-label="Remove queued message" onClick={() => removeQueued(index)}><X size={12} /></button>
+                </span>
+              ))}
+            </div>}
             <div className="goal-form-bottom">
               <div className="composer-context">
-                <select
+                {!isKnowledge && <select
                   className="settings-select model-override"
                   value={activeTab?.modelOverride || ""}
                   aria-label="Model for this task"
@@ -1088,10 +1188,12 @@ function App() {
                   {availableModels.map((route) => (
                     <option key={`${route.provider}:${route.model}`} value={route.model}>{route.model} · {route.provider}</option>
                   ))}
-                </select>
-                <span><CircleHelp size={14} /> {activeProject ? `Runs inside “${activeProject.name}” with its instructions and folders.` : activeTab?.instructions ? "Custom instructions will apply to this task." : "Your mounted folders define the workspace boundary."}</span>
+                </select>}
+                <span><CircleHelp size={14} /> {activeTab?.status === "running"
+                  ? "Your message joins the queue and runs as a follow-up when this step finishes."
+                  : activeProject ? `Runs inside “${activeProject.name}” with its instructions and folders.` : isKnowledge ? "Your mounted folders define the workspace boundary." : activeTab?.instructions ? "Custom instructions will apply to this task." : "Your mounted folders define the workspace boundary."}</span>
               </div>
-              <button className="primary-action" type="submit" disabled={busy || activeTab?.status === "running" || !activeTab?.goal.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={15} fill="currentColor" />} Start task <ArrowUpRight size={15} /></button>
+              <button className="primary-action" type="submit" disabled={!activeTab?.goal.trim() || busy}>{busy ? <LoaderCircle className="spin" size={16} /> : activeTab?.status === "running" ? null : <Play size={15} fill="currentColor" />} {activeTab?.status === "running" ? "Queue message" : isKnowledge ? "Start" : "Start task"} <ArrowUpRight size={15} /></button>
             </div>
           </form>
 
@@ -1102,7 +1204,7 @@ function App() {
           <div className="feed-heading"><div><span className="feed-kicker">LIVE SESSION</span><h2>{activeTab?.status === "running" ? "Work in motion" : activeTab?.status === "completed" ? "Session complete" : activeTab?.status === "stopped" || activeTab?.status === "failed" ? "Session stopped" : "Session"}</h2></div><div className="feed-actions">{activeTab?.status === "running" && <button className="stop-action" onClick={stopTask}><StopCircle size={15} /> Stop task</button>}{activeTab && activeTab.status !== "running" && activeTab.status !== "idle" && activeTab.taskId && <button className="transcript-action" onClick={() => setTranscriptView({ taskId: activeTab.taskId, goal: activeTab.title })}><FileText size={15} /> View transcript</button>}<span className={`task-badge ${activeTab?.status || "idle"}`}>{activeTab?.status === "running" ? <><i className="pulse-dot" /> In progress</> : activeTab?.status === "completed" ? "Completed" : activeTab?.status === "stopped" ? "Stopped" : activeTab?.status === "failed" ? "Failed" : "Waiting"}</span></div></div>
 
           <div className="feed-list">
-            {activeTab?.feed.map((entry) => <FeedCard key={entry.key} entry={entry} handled={activeTab.handledApprovals} onAnswer={(id, approved) => answerApproval(activeTab.id, id, approved)} />)}
+            {activeTab?.feed.map((entry) => <FeedCard key={entry.key} entry={entry} handled={activeTab.handledApprovals} plain={isKnowledge} onAnswer={(id, approved) => answerApproval(activeTab.id, id, approved)} />)}
             {activeTab && !activeTab.feed.length && <div className="feed-empty"><div className="empty-orbit"><ArrowDown size={19} /></div><strong>{activeTab.status === "running" ? "Connecting to your task…" : "The next step starts with you"}</strong><span>When work begins, agents, tool activity, and approval requests will appear here.</span></div>}
           </div>
           {Boolean(activeTab?.feed.length) && <div className="feed-end"><span /> Session activity <span /></div>}
@@ -1149,6 +1251,8 @@ function App() {
       />}
 
       {transcriptView && <TranscriptDialog view={transcriptView} onClose={() => setTranscriptView(null)} />}
+
+      {!settings.hasOnboarded && <OnboardingDialog settings={settings} onChange={updateSetting} onDone={() => {}} />}
     </main>
   </ErrorBoundary>);
 }
@@ -1247,6 +1351,73 @@ function ProjectDialog({ project, models, defaultModel, onClose, onCreate, onUpd
   );
 }
 
+/// The Interface Layout choice, cloned from the reference design: two cards
+/// for the simplified Knowledge Work face vs the full Software Engineering
+/// interface. Shared by Settings → General and first-run onboarding.
+function LayoutCards({ value, onSelect }: { value: InterfaceLayout; onSelect: (layout: InterfaceLayout) => void }) {
+  return (
+    <div className="layout-cards">
+      <button type="button" className={`layout-card ${value === "knowledge" ? "selected" : ""}`} onClick={() => onSelect("knowledge")}>
+        <Briefcase size={16} />
+        <strong>Knowledge Work</strong>
+        <small>Simplified interface for research, writing, and everyday tasks.</small>
+      </button>
+      <button type="button" className={`layout-card ${value === "software" ? "selected" : ""}`} onClick={() => onSelect("software")}>
+        <Wrench size={16} />
+        <strong>Software Engineering</strong>
+        <small>Full interface for coding, developer tools, and managing agents.</small>
+      </button>
+    </div>
+  );
+}
+
+/// First-run onboarding: pick a layout, connect a provider, done. Every step
+/// reuses an existing surface; skipping is always available.
+function OnboardingDialog({ settings, onChange, onDone }: {
+  settings: Settings;
+  onChange: <K extends keyof Settings>(key: K, value: Settings[K]) => void;
+  onDone: () => void;
+}) {
+  const [step, setStep] = useState(1);
+  function finish() {
+    onChange("hasOnboarded", true);
+    onDone();
+  }
+  return (
+    <div className="settings-overlay" role="presentation">
+      <div className="settings-dialog onboarding-dialog" role="dialog" aria-modal="true" aria-label="Welcome to Cworkspace">
+        <header className="settings-header">
+          <div><span className="feed-kicker">WELCOME</span><h2>{step === 1 ? "Choose your workspace" : "Connect your providers"}</h2></div>
+          <div className="onboarding-dots"><i className={step === 1 ? "on" : ""} /><i className={step === 2 ? "on" : ""} /></div>
+        </header>
+        {step === 1 ? (
+          <>
+            <section className="settings-section">
+              <p className="sidebar-hint">Pick the interface that fits your work — you can switch anytime in Settings → General.</p>
+              <LayoutCards value={settings.interfaceLayout} onSelect={(layout) => onChange("interfaceLayout", layout)} />
+            </section>
+            <footer className="settings-footer">
+              <button type="button" className="secondary-action" onClick={finish}>Skip setup</button>
+              <button type="button" className="primary-action" onClick={() => setStep(2)}>Next <ChevronRight size={15} /></button>
+            </footer>
+          </>
+        ) : (
+          <>
+            <section className="settings-section">
+              <p className="sidebar-hint">Sign in to at least one provider — the same credentials the jcode CLI uses. You can add more later in Settings → Accounts.</p>
+              <AccountsSection />
+            </section>
+            <footer className="settings-footer">
+              <button type="button" className="secondary-action" onClick={() => setStep(1)}>Back</button>
+              <button type="button" className="primary-action" onClick={finish}><Check size={15} /> Start working</button>
+            </footer>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SettingsDialog({ settings, models, daemonInfo, daemonStatus, onChange, onClose }: {
   settings: Settings;
   models: ModelRoute[];
@@ -1255,6 +1426,7 @@ function SettingsDialog({ settings, models, daemonInfo, daemonStatus, onChange, 
   onChange: <K extends keyof Settings>(key: K, value: Settings[K]) => void;
   onClose: () => void;
 }) {
+  const isKnowledge = settings.interfaceLayout === "knowledge";
   return (
     <div className="settings-overlay" onClick={onClose} role="presentation">
       <div className="settings-dialog" role="dialog" aria-modal="true" aria-label="Settings" onClick={(event) => event.stopPropagation()}>
@@ -1294,9 +1466,15 @@ function SettingsDialog({ settings, models, daemonInfo, daemonStatus, onChange, 
         </section>
 
         <section className="settings-section">
+          <h3>General</h3>
+          <p className="sidebar-hint">Configure agent execution, queued message delivery, and permissions — then choose how much interface you want around them.</p>
+          <LayoutCards value={settings.interfaceLayout} onSelect={(layout) => onChange("interfaceLayout", layout)} />
+        </section>
+
+        <section className="settings-section">
           <h3>Capabilities</h3>
           <ApprovalModeRow />
-          <ToolsSection />
+          {!isKnowledge && <ToolsSection />}
           <div className="settings-row static">
             <span className="settings-copy"><strong>Folder access</strong><small>Tasks read and write only inside folders you mount — per project, with explicit read-only or read/write access. Revoking a mount takes effect immediately.</small></span>
           </div>
@@ -1306,7 +1484,7 @@ function SettingsDialog({ settings, models, daemonInfo, daemonStatus, onChange, 
         </section>
 
         <AccountsSection />
-        <McpSection />
+        {!isKnowledge && <McpSection />}
         <UsageSection />
 
         <section className="settings-section">
@@ -1792,14 +1970,17 @@ function iconForArtifact(path: string) {
   return extension === "xlsx" || extension === "xls" ? <FileSpreadsheet size={15} /> : <FileText size={15} />;
 }
 
-function FeedCard({ entry, handled, onAnswer }: { entry: FeedEntry; handled: Record<string, boolean>; onAnswer: (id: string | number, approved: boolean) => void }) {
+function FeedCard({ entry, handled, plain, onAnswer }: { entry: FeedEntry; handled: Record<string, boolean>; plain?: boolean; onAnswer: (id: string | number, approved: boolean) => void }) {
   const [expanded, setExpanded] = useState(true);
-  const label = entry.event === "AgentSpawned" ? "Agent joined" : entry.event === "ToolInvoked" ? "Tool activity" : entry.event === "ArtifactCreated" ? "Artifact created" : entry.event === "ApprovalRequired" ? "Permission requested" : "Task finished";
+  const label = entry.event === "AgentSpawned" ? "Agent joined" : entry.event === "ToolInvoked" ? (plain ? "Working" : "Tool activity") : entry.event === "ArtifactCreated" ? "Artifact created" : entry.event === "ApprovalRequired" ? "Permission requested" : "Task finished";
   const approvalId = entry.data.id;
   const approvalKey = identifier(entry.data, "id");
   const approvalHandled = approvalKey in handled;
   const agentName = text(entry.data, "agent", "agent_name", "name") || "Cworkspace agent";
-  const toolName = text(entry.data, "tool", "tool_name", "name") || "Tool";
+  const rawTool = text(entry.data, "tool", "tool_name");
+  const toolName = rawTool || "Tool";
+  // Knowledge Work shows what the agent is doing, not which tool it uses.
+  const displayTool = plain && rawTool ? toolPhrase(rawTool) : toolName;
   const description = text(entry.data, "description", "summary", "message", "input", "arguments");
   const artifactPath = text(entry.data, "path");
   const approvalReady = typeof approvalId === "string" || typeof approvalId === "number";
@@ -1808,9 +1989,9 @@ function FeedCard({ entry, handled, onAnswer }: { entry: FeedEntry; handled: Rec
     <article className={`feed-entry ${entry.event.toLowerCase()}`}>
       <div className="timeline-rail"><span className={`event-symbol ${entry.event.toLowerCase()}`}>{entry.event === "AgentSpawned" ? <Sparkles size={14} /> : entry.event === "ToolInvoked" ? <ChevronRight size={14} /> : entry.event === "ArtifactCreated" ? <FileText size={14} /> : entry.event === "ApprovalRequired" ? <ShieldCheck size={14} /> : <Check size={14} />}</span><span className="rail-line" /></div>
       <div className="event-body">
-        <button className="event-title-row" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><div><span className="event-label">{label}</span><strong>{entry.event === "AgentSpawned" ? agentName : entry.event === "ToolInvoked" ? toolName : entry.event === "ArtifactCreated" ? folderName(artifactPath || "New file") : entry.event === "ApprovalRequired" ? text(entry.data, "tool", "tool_name") || "Action needs your approval" : "This task is complete"}</strong></div><span className="event-time"><Clock3 size={12} /> {new Date(entry.createdAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span></button>
+        <button className="event-title-row" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><div><span className="event-label">{label}</span><strong>{entry.event === "AgentSpawned" ? agentName : entry.event === "ToolInvoked" ? displayTool : entry.event === "ArtifactCreated" ? folderName(artifactPath || "New file") : entry.event === "ApprovalRequired" ? (rawTool ? displayTool : "Action needs your approval") : "This task is complete"}</strong></div><span className="event-time"><Clock3 size={12} /> {new Date(entry.createdAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span></button>
         {expanded && <div className="event-detail">
-          {entry.event === "ApprovalRequired" ? <div className={`approval-card ${approvalHandled ? "answered" : ""}`}><div className="approval-copy"><span className="approval-eyebrow"><ShieldCheck size={13} /> YOUR DECISION</span><p>{description || "An agent is requesting permission to continue with this action."}</p>{text(entry.data, "tool", "tool_name") && <code>{text(entry.data, "tool", "tool_name")}</code>}</div>{approvalHandled ? <div className="approval-result"><Check size={14} /> {handled[approvalKey] ? "Allowed" : "Rejected"}</div> : <div className="approval-actions"><button className="reject-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, false)}><X size={14} /> Reject</button><button className="allow-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, true)}><Check size={14} /> Allow</button></div>}</div>
+          {entry.event === "ApprovalRequired" ? <div className={`approval-card ${approvalHandled ? "answered" : ""}`}><div className="approval-copy"><span className="approval-eyebrow"><ShieldCheck size={13} /> {plain ? "PERMISSION NEEDED" : "YOUR DECISION"}</span><p>{description || (plain ? `Cworkspace wants to ${rawTool ? toolPhrase(rawTool).toLowerCase() : "continue with this action"}. Allow it?` : "An agent is requesting permission to continue with this action.")}</p>{rawTool && <code>{displayTool}</code>}</div>{approvalHandled ? <div className="approval-result"><Check size={14} /> {handled[approvalKey] ? "Allowed" : "Rejected"}</div> : <div className="approval-actions"><button className="reject-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, false)}><X size={14} /> {plain ? "No thanks" : "Reject"}</button><button className="allow-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, true)}><Check size={14} /> {plain ? "Allow" : "Allow"}</button></div>}</div>
           : entry.event === "ArtifactCreated" ? <p className="event-description">{artifactPath || description || "A new deliverable is ready to preview."}</p>
           : <p className="event-description">{description || (entry.event === "AgentSpawned" ? "Preparing a focused workstream." : entry.event === "ToolInvoked" ? "Working through the requested step." : "The requested work has finished.")}</p>}
         </div>}

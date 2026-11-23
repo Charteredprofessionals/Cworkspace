@@ -2669,6 +2669,7 @@ pub async fn run_cowork_task(
     model: Option<String>,
     task_id: String,
     instructions: Option<String>,
+    resume_session: Option<String>,
     rpc: crate::cli::cowork_rpc::CoworkRpc,
 ) -> Result<String> {
     let roots = crate::cli::cowork_rpc::validate_workspace_roots(allowed_roots).await?;
@@ -2709,6 +2710,9 @@ pub async fn run_cowork_task(
         wait_for_cold_cache_mcp_tools(&registry).await;
     }
     let mut agent = crate::agent::Agent::new(provider, registry);
+    // Follow-up turns resume the task's persisted session, so the agent keeps
+    // the earlier conversation context instead of starting from scratch.
+    restore_agent_session_if_requested(&mut agent, resume_session.as_deref())?;
     agent.set_working_dir(&working_dir.display().to_string());
     let session_id = agent.session_id().to_owned();
     rpc.note_task_session(&task_id, &session_id).await;
