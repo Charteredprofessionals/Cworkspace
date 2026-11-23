@@ -562,8 +562,11 @@ fn tray_task_watcher(app: AppHandle, item: MenuItem<Wry>) {
             }
             _ => "Daemon stopped".to_owned(),
         };
-        let _ = app.run_on_main_thread(move || {
-            let _ = item.set_text(&label);
+        let _ = app.run_on_main_thread({
+            let item = item.clone();
+            move || {
+                let _ = item.set_text(&label);
+            }
         });
     }
 }
