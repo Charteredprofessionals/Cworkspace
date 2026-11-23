@@ -488,3 +488,26 @@ button.approval-counter { border: none; font: inherit; cursor: pointer; }
   .layout-cards { grid-template-columns: 1fr; }
   .queue-copy { max-width: 200px; }
 }
+
+/* ---- v0.1.6: permission rules + always-remember approvals ---- */
+.approval-actions-wrap { display: grid; gap: 6px; }
+.approval-remember { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.approval-remember button { display: inline-flex; align-items: center; gap: 4px; border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 10px; font-weight: 600; padding: 2px 4px; border-radius: 4px; cursor: pointer; text-decoration: underline dotted; }
+.approval-remember button:hover { color: var(--ink); background: rgba(0, 0, 0, 0.04); }
+.approval-remember small { font-size: 9.5px; color: var(--muted); }
+
+.permission-rules { display: grid; gap: 5px; margin: 8px 0; }
+.permission-rule { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid #e3e2d8; border-radius: 6px; background: #fbfaf6; }
+.rule-chip { flex: 0 0 auto; font-size: 9px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 7px; border-radius: 999px; }
+.rule-chip.allow { background: var(--moss-light); color: var(--moss); }
+.rule-chip.deny { background: #f6ded7; color: var(--clay); }
+.rule-tool { flex: 1 1 auto; font-size: 10.5px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rule-scope { flex: 0 0 auto; font-size: 10px; color: var(--muted); }
+.permission-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 4px; }
+.permission-form .settings-input { flex: 1 1 170px; }
+.settings-error { font-size: 10.5px; color: var(--clay); margin-bottom: 6px; }
+
+@media (max-width: 640px) {
+  .permission-form { align-items: stretch; }
+  .permission-form .settings-select, .permission-form .settings-input { width: 100%; max-width: 100%; }
+}

@@ -157,6 +157,9 @@ type SessionTab = {
   /// Messages typed while the task runs, delivered as follow-up turns when
   /// the current run finishes.
   queued: string[];
+  /// Project the task runs in, by name — used to scope "always allow"
+  /// permission rules on approval cards. Empty for ad-hoc tasks.
+  projectName: string;
 };
 
 type Settings = {
@@ -372,6 +375,7 @@ function newTab(): SessionTab {
     error: "",
     notice: "",
     queued: [],
+    projectName: "",
   };
 }
 
@@ -840,6 +844,7 @@ function App() {
       selectedArtifact: null,
       handledApprovals: {},
       queued: [],
+      projectName: activeProject?.name || "",
       title: tabTitle(goal),
     });
     try {
@@ -885,9 +890,9 @@ function App() {
     }
   }
 
-  async function answerApproval(tabId: string, id: string | number, approved: boolean) {
+  async function answerApproval(tabId: string, id: string | number, approved: boolean, remember?: "global" | "project") {
     try {
-      await invoke("respond_approval", { id, approved });
+      await invoke("respond_approval", { id, approved, remember: remember || undefined });
       setTabs((current) => current.map((tab) => tab.id === tabId
         ? { ...tab, handledApprovals: { ...tab.handledApprovals, [id]: approved } }
         : tab));
@@ -1204,7 +1209,7 @@ function App() {
           <div className="feed-heading"><div><span className="feed-kicker">LIVE SESSION</span><h2>{activeTab?.status === "running" ? "Work in motion" : activeTab?.status === "completed" ? "Session complete" : activeTab?.status === "stopped" || activeTab?.status === "failed" ? "Session stopped" : "Session"}</h2></div><div className="feed-actions">{activeTab?.status === "running" && <button className="stop-action" onClick={stopTask}><StopCircle size={15} /> Stop task</button>}{activeTab && activeTab.status !== "running" && activeTab.status !== "idle" && activeTab.taskId && <button className="transcript-action" onClick={() => setTranscriptView({ taskId: activeTab.taskId, goal: activeTab.title })}><FileText size={15} /> View transcript</button>}<span className={`task-badge ${activeTab?.status || "idle"}`}>{activeTab?.status === "running" ? <><i className="pulse-dot" /> In progress</> : activeTab?.status === "completed" ? "Completed" : activeTab?.status === "stopped" ? "Stopped" : activeTab?.status === "failed" ? "Failed" : "Waiting"}</span></div></div>
 
           <div className="feed-list">
-            {activeTab?.feed.map((entry) => <FeedCard key={entry.key} entry={entry} handled={activeTab.handledApprovals} plain={isKnowledge} onAnswer={(id, approved) => answerApproval(activeTab.id, id, approved)} />)}
+            {activeTab?.feed.map((entry) => <FeedCard key={entry.key} entry={entry} handled={activeTab.handledApprovals} plain={isKnowledge} projectName={activeTab.projectName} onAnswer={(id, approved, remember) => answerApproval(activeTab.id, id, approved, remember)} />)}
             {activeTab && !activeTab.feed.length && <div className="feed-empty"><div className="empty-orbit"><ArrowDown size={19} /></div><strong>{activeTab.status === "running" ? "Connecting to your task…" : "The next step starts with you"}</strong><span>When work begins, agents, tool activity, and approval requests will appear here.</span></div>}
           </div>
           {Boolean(activeTab?.feed.length) && <div className="feed-end"><span /> Session activity <span /></div>}
@@ -1418,6 +1423,127 @@ function OnboardingDialog({ settings, onChange, onDone }: {
   );
 }
 
+/// Stored permission rule as returned by the daemon.
+type RuleRecord = {
+  id: string;
+  tool: string;
+  decision: "allow" | "deny";
+  scope: { kind: "global" } | { kind: "project"; project_id: string };
+  created_at: number;
+};
+
+/// Common tool names offered in the rule editor's datalist.
+const RULE_TOOL_SUGGESTIONS = [
+  "bash", "write", "edit", "apply_patch", "read", "ls", "glob", "agentgrep",
+  "webfetch", "websearch", "browser", "open", "office_docs", "computer_use",
+  "gmail", "calendar", "memory", "bg", "schedule",
+];
+
+/// Settings → Permissions: the stored allow/deny rules and the form to add
+/// more. Rules are checked before the approval policy on every tool call, so
+/// "always allow websearch" means exactly that — no more per-file prompts.
+function PermissionRulesSection() {
+  const [rules, setRules] = useState<RuleRecord[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [tool, setTool] = useState("");
+  const [decision, setDecision] = useState<"allow" | "deny">("allow");
+  const [scope, setScope] = useState("global");
+  const [error, setError] = useState("");
+  const [loaded, setLoaded] = useState(false);
+
+  async function refresh() {
+    try {
+      const [rulesResult, projectsResult] = await Promise.all([
+        invoke<{ rules?: RuleRecord[] }>("permission_list"),
+        invoke<{ projects?: Project[] }>("project_list"),
+      ]);
+      setRules(rulesResult.rules || []);
+      setProjects(projectsResult.projects || []);
+      setError("");
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setLoaded(true);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  async function addRule() {
+    if (!tool.trim()) return;
+    try {
+      await invoke("permission_add", {
+        tool: tool.trim(),
+        decision,
+        scope: scope === "global" ? undefined : "project",
+        projectId: scope === "global" ? undefined : scope,
+      });
+      setTool("");
+      await refresh();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }
+
+  async function removeRule(id: string) {
+    try {
+      await invoke("permission_remove", { id });
+      await refresh();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }
+
+  function scopeLabel(scope: RuleRecord["scope"]) {
+    if (scope.kind === "global") return "Everywhere";
+    const project = projects.find((candidate) => candidate.id === scope.project_id);
+    return project ? `In “${project.name}”` : "In a deleted project";
+  }
+
+  return (
+    <section className="settings-section">
+      <h3>Permissions</h3>
+      <p className="sidebar-hint">Rules decide tool calls before the approval mode above — “always allow websearch” means exactly that. Approvals and folder mounts always apply on top.</p>
+      {error && <div className="settings-error" role="alert">{error}</div>}
+      <div className="permission-rules">
+        {rules.map((rule) => (
+          <div className="permission-rule" key={rule.id}>
+            <span className={`rule-chip ${rule.decision}`}>{rule.decision === "allow" ? "Allow" : "Block"}</span>
+            <code className="rule-tool">{rule.tool}</code>
+            <span className="rule-scope">{scopeLabel(rule.scope)}</span>
+            <button className="icon-button folder-remove" aria-label={`Remove rule for ${rule.tool}`} title="Remove rule" onClick={() => removeRule(rule.id)}><X size={13} /></button>
+          </div>
+        ))}
+        {loaded && !rules.length && <p className="sidebar-empty">No custom rules yet — approval cards offer “Always allow” / “Always block” to remember a choice.</p>}
+      </div>
+      <div className="permission-form">
+        <input
+          className="settings-input"
+          list="rule-tool-suggestions"
+          value={tool}
+          placeholder="Tool name — bash, webfetch, mcp__gmail__…"
+          aria-label="Tool for the new rule"
+          onChange={(event) => setTool(event.target.value)}
+        />
+        <datalist id="rule-tool-suggestions">{RULE_TOOL_SUGGESTIONS.map((name) => <option key={name} value={name} />)}</datalist>
+        <select className="settings-select" value={decision} aria-label="Decision for the new rule" onChange={(event) => setDecision(event.target.value === "deny" ? "deny" : "allow")}>
+          <option value="allow">Always allow</option>
+          <option value="deny">Always block</option>
+        </select>
+        <select className="settings-select" value={scope} aria-label="Scope for the new rule" onChange={(event) => setScope(event.target.value)}>
+          <option value="global">Everywhere</option>
+          {projects.map((project) => (
+            <option key={project.id} value={project.id}>In “{project.name}”</option>
+          ))}
+        </select>
+        <button type="button" className="secondary-action" disabled={!tool.trim()} onClick={addRule}><Plus size={14} /> Add rule</button>
+      </div>
+    </section>
+  );
+}
+
 function SettingsDialog({ settings, models, daemonInfo, daemonStatus, onChange, onClose }: {
   settings: Settings;
   models: ModelRoute[];
@@ -1482,6 +1608,8 @@ function SettingsDialog({ settings, models, daemonInfo, daemonStatus, onChange, 
             <span className="settings-copy"><strong>Destructive actions</strong><small>Shell commands, file edits, office document creation, and computer control always wait for your approval, regardless of the mode above.</small></span>
           </div>
         </section>
+
+        <PermissionRulesSection />
 
         <AccountsSection />
         {!isKnowledge && <McpSection />}
@@ -1970,7 +2098,7 @@ function iconForArtifact(path: string) {
   return extension === "xlsx" || extension === "xls" ? <FileSpreadsheet size={15} /> : <FileText size={15} />;
 }
 
-function FeedCard({ entry, handled, plain, onAnswer }: { entry: FeedEntry; handled: Record<string, boolean>; plain?: boolean; onAnswer: (id: string | number, approved: boolean) => void }) {
+function FeedCard({ entry, handled, plain, projectName, onAnswer }: { entry: FeedEntry; handled: Record<string, boolean>; plain?: boolean; projectName?: string; onAnswer: (id: string | number, approved: boolean, remember?: "global" | "project") => void }) {
   const [expanded, setExpanded] = useState(true);
   const label = entry.event === "AgentSpawned" ? "Agent joined" : entry.event === "ToolInvoked" ? (plain ? "Working" : "Tool activity") : entry.event === "ArtifactCreated" ? "Artifact created" : entry.event === "ApprovalRequired" ? "Permission requested" : "Task finished";
   const approvalId = entry.data.id;
@@ -1991,7 +2119,7 @@ function FeedCard({ entry, handled, plain, onAnswer }: { entry: FeedEntry; handl
       <div className="event-body">
         <button className="event-title-row" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><div><span className="event-label">{label}</span><strong>{entry.event === "AgentSpawned" ? agentName : entry.event === "ToolInvoked" ? displayTool : entry.event === "ArtifactCreated" ? folderName(artifactPath || "New file") : entry.event === "ApprovalRequired" ? (rawTool ? displayTool : "Action needs your approval") : "This task is complete"}</strong></div><span className="event-time"><Clock3 size={12} /> {new Date(entry.createdAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span></button>
         {expanded && <div className="event-detail">
-          {entry.event === "ApprovalRequired" ? <div className={`approval-card ${approvalHandled ? "answered" : ""}`}><div className="approval-copy"><span className="approval-eyebrow"><ShieldCheck size={13} /> {plain ? "PERMISSION NEEDED" : "YOUR DECISION"}</span><p>{description || (plain ? `Cworkspace wants to ${rawTool ? toolPhrase(rawTool).toLowerCase() : "continue with this action"}. Allow it?` : "An agent is requesting permission to continue with this action.")}</p>{rawTool && <code>{displayTool}</code>}</div>{approvalHandled ? <div className="approval-result"><Check size={14} /> {handled[approvalKey] ? "Allowed" : "Rejected"}</div> : <div className="approval-actions"><button className="reject-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, false)}><X size={14} /> {plain ? "No thanks" : "Reject"}</button><button className="allow-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, true)}><Check size={14} /> {plain ? "Allow" : "Allow"}</button></div>}</div>
+          {entry.event === "ApprovalRequired" ? <div className={`approval-card ${approvalHandled ? "answered" : ""}`}><div className="approval-copy"><span className="approval-eyebrow"><ShieldCheck size={13} /> {plain ? "PERMISSION NEEDED" : "YOUR DECISION"}</span><p>{description || (plain ? `Cworkspace wants to ${rawTool ? toolPhrase(rawTool).toLowerCase() : "continue with this action"}. Allow it?` : "An agent is requesting permission to continue with this action.")}</p>{rawTool && <code>{displayTool}</code>}</div>{approvalHandled ? <div className="approval-result"><Check size={14} /> {handled[approvalKey] ? "Allowed" : "Rejected"}</div> : <div className="approval-actions-wrap"><div className="approval-actions"><button className="reject-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, false)}><X size={14} /> {plain ? "No thanks" : "Reject"}</button><button className="allow-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, true)}><Check size={14} /> Allow</button></div><div className="approval-remember"><button type="button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, true, projectName ? "project" : "global")}><Check size={12} /> Always allow</button><button type="button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, false, projectName ? "project" : "global")}><X size={12} /> Always block</button><small>for {projectName ? `“${projectName}”` : "everywhere"}</small></div></div>}</div>
           : entry.event === "ArtifactCreated" ? <p className="event-description">{artifactPath || description || "A new deliverable is ready to preview."}</p>
           : <p className="event-description">{description || (entry.event === "AgentSpawned" ? "Preparing a focused workstream." : entry.event === "ToolInvoked" ? "Working through the requested step." : "The requested work has finished.")}</p>}
         </div>}

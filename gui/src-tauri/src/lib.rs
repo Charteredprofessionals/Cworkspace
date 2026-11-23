@@ -614,12 +614,58 @@ async fn respond_approval(
     bridge: State<'_, Bridge>,
     id: Value,
     approved: bool,
+    remember: Option<String>,
 ) -> Result<(), String> {
     tokio::task::block_in_place(|| {
         let connection = ensure_connection(&app, &bridge)?;
-        connection.request("approve_tool_call", json!({ "id": id, "approved": approved }))
+        connection.request(
+            "approve_tool_call",
+            json!({ "id": id, "approved": approved, "remember": remember }),
+        )
     })?;
     Ok(())
+}
+
+#[tauri::command]
+async fn permission_list(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("permissions.list", json!({}))
+    })
+}
+
+#[tauri::command]
+async fn permission_add(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    tool: String,
+    decision: String,
+    scope: Option<String>,
+    project_id: Option<String>,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        let mut params = json!({ "tool": tool, "decision": decision });
+        if let Some(scope) = scope {
+            params["scope"] = json!(scope);
+        }
+        if let Some(project_id) = project_id {
+            params["project_id"] = json!(project_id);
+        }
+        connection.request("permissions.add", params)
+    })
+}
+
+#[tauri::command]
+async fn permission_remove(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    id: String,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("permissions.remove", json!({ "id": id }))
+    })
 }
 
 #[tauri::command]
@@ -1098,6 +1144,9 @@ pub fn run() {
             task_transcript,
             task_followup,
             tools_list,
+            permission_list,
+            permission_add,
+            permission_remove,
             usage_report,
             auth_status,
             auth_set_api_key,

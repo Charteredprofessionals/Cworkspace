@@ -49,9 +49,16 @@ composer as a fresh goal.
   to the same tab. Approvals re-gate per the active policy.
 - Effort ≈ 2 days; reuses existing session-resume machinery.
 
-### 3. Permission rules (per tool, per project) — v0.1.6, daemon + UI
+### 3. Permission rules (per tool, per project) — v0.1.6, daemon + UI — SHIPPED
 
 General's "permissions" implies more than the two global approval modes.
+
+Shipped as `PermissionRule { tool, decision: allow|deny, scope: global|project }`
+persisted in the cowork store (`permission_rules.json`); the approval gate
+consults rules **before** the policy (project scope beats global, newest wins,
+one rule per tool+scope). Approval cards gained "Always allow / Always block"
+(remember scopes to the task's project when it has one, else global);
+Settings → Permissions lists rules with an add/remove editor in both layouts.
 
 - Daemon settings store gains `permissions: { always_allow: [...],
   per_project: { <project_id>: { allow: [...], ask: [...] } } }`; the approval

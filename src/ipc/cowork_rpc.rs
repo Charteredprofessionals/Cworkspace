@@ -87,6 +87,77 @@ fn save_policy(policy: ApprovalPolicy) -> Result<()> {
     Ok(())
 }
 
+/// What a stored permission rule decides when a tool call matches it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleDecision {
+    Allow,
+    Deny,
+}
+
+impl RuleDecision {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "allow" => Some(RuleDecision::Allow),
+            "deny" => Some(RuleDecision::Deny),
+            _ => None,
+        }
+    }
+}
+
+/// Where a permission rule applies: every task, or only tasks running inside
+/// one project.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuleScope {
+    Global,
+    Project { project_id: String },
+}
+
+/// A stored permission decision for one tool. Rules outrank the coarse
+/// approval policy: an explicit "always allow bash in this project" or
+/// "never ask me about webfetch" applies before the policy auto-allow and
+/// before prompting. One rule per (tool, scope) — a newer decision replaces
+/// the older one.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PermissionRule {
+    pub id: String,
+    /// Exact tool name ("bash", "webfetch", "mcp__gmail__send_email").
+    pub tool: String,
+    pub decision: RuleDecision,
+    pub scope: RuleScope,
+    /// Unix seconds when the rule was stored.
+    pub created_at: u64,
+}
+
+/// Load persisted permission rules; malformed entries are skipped so one bad
+/// line can never block task approvals.
+fn load_permission_rules() -> Vec<PermissionRule> {
+    store_dir()
+        .ok()
+        .and_then(|dir| std::fs::read_to_string(dir.join("permission_rules.json")).ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| {
+            let list = value.get("rules")?.as_array()?.clone();
+            Some(
+                list.into_iter()
+                    .filter_map(|entry| serde_json::from_value::<PermissionRule>(entry).ok())
+                    .collect::<Vec<PermissionRule>>(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn save_permission_rules(rules: &[PermissionRule]) -> Result<()> {
+    let dir = store_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let payload = serde_json::json!({ "rules": rules });
+    let temp = dir.join("permission_rules.json.tmp");
+    std::fs::write(&temp, serde_json::to_vec_pretty(&payload)?)?;
+    std::fs::rename(&temp, dir.join("permission_rules.json"))?;
+    Ok(())
+}
+
 /// Maximum accepted JSON-RPC message size (S-7): a connected client must not
 /// be able to exhaust daemon memory with a single oversized line or frame.
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -222,7 +293,7 @@ pub struct CoworkRpc {
 struct CoworkRpcInner {
     auth_token: String,
     events: broadcast::Sender<CoworkEvent>,
-    approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    approvals: Mutex<HashMap<String, PendingApproval>>,
     mounted_roots: Mutex<HashMap<String, Vec<PathBuf>>>,
     jail_registrations: Mutex<HashMap<String, crate::tool::SessionPathValidatorRegistration>>,
     approval_registrations: Mutex<HashMap<String, crate::tool::SessionApprovalRegistration>>,
@@ -243,6 +314,9 @@ struct CoworkRpcInner {
     /// Current approval policy. A sync mutex is fine: critical sections are
     /// single reads/writes with no await points.
     approval_policy: std::sync::Mutex<ApprovalPolicy>,
+    /// Stored permission rules, checked before the policy on every approval.
+    /// A sync mutex: list/upsert/remove are short non-awaiting sections.
+    permission_rules: std::sync::Mutex<Vec<PermissionRule>>,
     /// Persistent project registry (projects, mounts with access levels,
     /// instructions, model defaults, task history).
     project_store: std::sync::OnceLock<crate::cli::cowork_projects::ProjectStore>,
@@ -288,6 +362,14 @@ pub struct TaskContext {
     pub model: Option<String>,
 }
 
+/// A pending approval and what it was for, so "remember this choice" can
+/// store a permission rule without another round trip to the agent session.
+struct PendingApproval {
+    sender: oneshot::Sender<bool>,
+    tool: String,
+    task_id: String,
+}
+
 impl CoworkRpc {
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(128);
@@ -305,6 +387,7 @@ impl CoworkRpc {
                 task_contexts: Mutex::new(VecDeque::new()),
                 models_provider: tokio::sync::OnceCell::new(),
                 approval_policy: std::sync::Mutex::new(load_policy()),
+                permission_rules: std::sync::Mutex::new(load_permission_rules()),
                 project_store: std::sync::OnceLock::new(),
             }),
         }
@@ -339,6 +422,99 @@ impl CoworkRpc {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
         Ok(())
+    }
+
+    /// The stored permission rules (oldest first).
+    pub fn permission_rules(&self) -> Vec<PermissionRule> {
+        self.inner
+            .permission_rules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Store (or replace) the rule for a tool in a scope. One rule per
+    /// (tool, scope): the newest decision wins.
+    fn upsert_rule(
+        &self,
+        tool: &str,
+        decision: RuleDecision,
+        scope: RuleScope,
+    ) -> Result<PermissionRule> {
+        let rule = PermissionRule {
+            id: crate::id::new_id("rule"),
+            tool: tool.to_owned(),
+            decision,
+            scope,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        let mut rules = self
+            .inner
+            .permission_rules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        rules.retain(|existing| !(existing.tool == rule.tool && existing.scope == rule.scope));
+        rules.push(rule.clone());
+        save_permission_rules(&rules)?;
+        Ok(rule)
+    }
+
+    /// Remove a rule by id; reports whether it existed.
+    fn remove_rule(&self, id: &str) -> bool {
+        let removed;
+        {
+            let mut rules = self
+                .inner
+                .permission_rules
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = rules.len();
+            rules.retain(|rule| rule.id != id);
+            removed = rules.len() != before;
+        }
+        if removed {
+            let rules = self.permission_rules();
+            if let Err(error) = save_permission_rules(&rules) {
+                tracing::warn!("could not persist permission rules: {error}");
+            }
+        }
+        removed
+    }
+
+    /// Most specific matching rule for a tool call: project scope beats
+    /// global, and within one specificity the newest rule wins.
+    fn evaluate_permission_rules(
+        &self,
+        tool: &str,
+        project_id: Option<&str>,
+    ) -> Option<RuleDecision> {
+        let rules = self
+            .inner
+            .permission_rules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut best: Option<(u8, u64, RuleDecision)> = None;
+        for rule in rules.iter().filter(|rule| rule.tool == tool) {
+            let (specificity, matches) = match &rule.scope {
+                RuleScope::Global => (0u8, true),
+                RuleScope::Project {
+                    project_id: rule_project,
+                } => (1u8, project_id == Some(rule_project.as_str())),
+            };
+            if !matches {
+                continue;
+            }
+            let replaces = best.is_none_or(|(best_spec, best_at, _)| {
+                specificity > best_spec || (specificity == best_spec && rule.created_at >= best_at)
+            });
+            if replaces {
+                best = Some((specificity, rule.created_at, rule.decision));
+            }
+        }
+        best.map(|(_, _, decision)| decision)
     }
 
     /// Live model routes for the GUI. Bootstraps one provider per daemon
@@ -656,7 +832,7 @@ pub async fn list_tasks(&self) -> Vec<(String, bool)> {
                 .approvals
                 .lock()
                 .await
-                .retain(|_, sender| !sender.is_closed());
+                .retain(|_, pending| !pending.sender.is_closed());
             let _ = self.emit_event(CoworkEvent::TaskCompleted {
                 task_id: task_id.to_owned(),
                 success: false,
@@ -815,6 +991,19 @@ pub async fn list_tasks(&self) -> Vec<(String, bool)> {
         task_id: impl Into<String>,
     ) -> Result<bool> {
         let tool_name = tool_name.into();
+        let task_id = task_id.into();
+        // Explicit permission rules outrank the coarse policy: a stored allow
+        // or deny for this tool (globally, or inside this task's project)
+        // applies first and never reaches the user.
+        let project_id = self
+            .task_context(&task_id)
+            .await
+            .and_then(|context| context.project_id);
+        match self.evaluate_permission_rules(&tool_name, project_id.as_deref()) {
+            Some(RuleDecision::Allow) => return Ok(true),
+            Some(RuleDecision::Deny) => return Ok(false),
+            None => {}
+        }
         // Auto-allow read-only mode: reads run without prompting so long
         // research tasks do not queue a decision per file. Writes, shell
         // commands, office document creation, and computer use still ask.
@@ -836,7 +1025,14 @@ pub async fn list_tasks(&self) -> Vec<(String, bool)> {
             if approvals.contains_key(&id) {
                 return Err(anyhow!("approval request id is already pending: {id}"));
             }
-            approvals.insert(id.clone(), sender);
+            approvals.insert(
+                id.clone(),
+                PendingApproval {
+                    sender,
+                    tool: tool_name.clone(),
+                    task_id: task_id.clone(),
+                },
+            );
         }
 
         if self
@@ -844,7 +1040,7 @@ pub async fn list_tasks(&self) -> Vec<(String, bool)> {
                 id: id.clone(),
                 tool_name,
                 description: description.into(),
-                task_id: task_id.into(),
+                task_id,
             })
             .is_err()
         {
@@ -865,7 +1061,47 @@ pub async fn list_tasks(&self) -> Vec<(String, bool)> {
             .lock()
             .await
             .remove(id)
-            .is_some_and(|sender| sender.send(approved).is_ok())
+            .is_some_and(|pending| pending.sender.send(approved).is_ok())
+    }
+
+    /// The tool and task a pending approval belongs to (looked up BEFORE the
+    /// decision is sent — sending removes the entry).
+    async fn pending_approval_info(&self, id: &str) -> Option<(String, String)> {
+        self.inner
+            .approvals
+            .lock()
+            .await
+            .get(id)
+            .map(|pending| (pending.tool.clone(), pending.task_id.clone()))
+    }
+
+    /// Apply "remember this choice": store a permission rule for the
+    /// approval's tool, scoped to the task's project when known, else
+    /// globally.
+    async fn remember_approval_decision(
+        &self,
+        tool: &str,
+        task_id: &str,
+        approved: bool,
+        scope_hint: &str,
+    ) {
+        let decision = if approved {
+            RuleDecision::Allow
+        } else {
+            RuleDecision::Deny
+        };
+        let scope = if scope_hint == "project" {
+            self.task_context(task_id)
+                .await
+                .and_then(|context| context.project_id)
+                .map(|project_id| RuleScope::Project { project_id })
+                .unwrap_or(RuleScope::Global)
+        } else {
+            RuleScope::Global
+        };
+        if let Err(error) = self.upsert_rule(tool, decision, scope) {
+            tracing::warn!("could not store permission rule: {error}");
+        }
     }
 
     /// Associate a task with its jcode session so `task.transcript` can read
@@ -1853,15 +2089,100 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
         "approve_tool_call" => {
             let approval_id = request.params.get("id").and_then(Value::as_str);
             let approved = request.params.get("approved").and_then(Value::as_bool);
+            let remember = request.params.get("remember").and_then(Value::as_str);
             match (approval_id, approved) {
                 (Some(approval_id), Some(approved)) => {
-                    Ok(json!({ "resolved": rpc.approve_tool_call(approval_id, approved).await }))
+                    let valid_remember =
+                        matches!(remember, None | Some("global") | Some("project"));
+                    if !valid_remember {
+                        return Some(rpc_error(
+                            Some(id),
+                            -32602,
+                            "remember must be \"global\" or \"project\" when present",
+                        ));
+                    }
+                    // Look up what the approval was for BEFORE resolving —
+                    // sending the decision removes the pending entry.
+                    let remembered = if remember.is_some() {
+                        rpc.pending_approval_info(approval_id).await
+                    } else {
+                        None
+                    };
+                    let resolved = rpc.approve_tool_call(approval_id, approved).await;
+                    if resolved
+                        && let Some((tool, task_id)) = remembered
+                        && let Some(scope_hint) = remember
+                    {
+                        rpc.remember_approval_decision(&tool, &task_id, approved, scope_hint)
+                            .await;
+                    }
+                    Ok(json!({ "resolved": resolved }))
                 }
                 _ => Err((
                     -32602,
                     "params require string id and boolean approved".to_string(),
                 )),
             }
+        }
+        "permissions.list" => Ok(json!({ "rules": rpc.permission_rules() })),
+        "permissions.add" => {
+            let tool = request
+                .params
+                .get("tool")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|tool| !tool.is_empty());
+            let decision = request
+                .params
+                .get("decision")
+                .and_then(Value::as_str)
+                .and_then(RuleDecision::parse);
+            let (Some(tool), Some(decision)) = (tool, decision) else {
+                return Some(rpc_error(
+                    Some(id),
+                    -32602,
+                    "params require string tool and decision \"allow\"|\"deny\"",
+                ));
+            };
+            let scope = match request.params.get("scope").and_then(Value::as_str) {
+                None | Some("global") => RuleScope::Global,
+                Some("project") => {
+                    let project_id = request
+                        .params
+                        .get("project_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if rpc.project_store().get(project_id).is_err() {
+                        return Some(rpc_error(
+                            Some(id),
+                            -32000,
+                            format!("unknown project {project_id}"),
+                        ));
+                    }
+                    RuleScope::Project {
+                        project_id: project_id.to_owned(),
+                    }
+                }
+                Some(other) => {
+                    return Some(rpc_error(
+                        Some(id),
+                        -32602,
+                        format!("scope must be \"global\" or \"project\", got {other:?}"),
+                    ));
+                }
+            };
+            let rule = match rpc.upsert_rule(tool, decision, scope) {
+                Ok(rule) => rule,
+                Err(error) => return Some(rpc_error(Some(id), -32000, error.to_string())),
+            };
+            Ok(json!({ "rule": rule }))
+        }
+        "permissions.remove" => {
+            let rule_id = request.params.get("id").and_then(Value::as_str);
+            let Some(rule_id) = rule_id else {
+                return Some(rpc_error(Some(id), -32602, "params require string id"));
+            };
+            Ok(json!({ "removed": rpc.remove_rule(rule_id) }))
         }
         "tools.list" => Ok(tools_list_result()),
         "task.transcript" => {
@@ -2545,6 +2866,316 @@ mod tests {
         assert_eq!(response["id"], 7);
         assert_eq!(response["result"]["name"], "jcode-cowork");
         assert_eq!(response["result"]["version"], PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn permission_rules_upsert_persist_and_replace() {
+        let _env = lock_store_env();
+        let store_dir_handle = tempfile::tempdir().unwrap();
+        // SAFETY: the STORE_ENV_LOCK is held, so no other thread reads the
+        // environment while it mutates.
+        unsafe { std::env::set_var("JCODE_COWORK_STORE_DIR", store_dir_handle.path()) };
+        let rpc = CoworkRpc::new();
+        assert!(rpc.permission_rules().is_empty());
+
+        let allow = rpc
+            .upsert_rule("webfetch", RuleDecision::Allow, RuleScope::Global)
+            .unwrap();
+        // One rule per (tool, scope): a newer decision replaces the older one.
+        let deny = rpc
+            .upsert_rule("webfetch", RuleDecision::Deny, RuleScope::Global)
+            .unwrap();
+        let rules = rpc.permission_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, deny.id);
+        assert_ne!(rules[0].id, allow.id);
+        assert_eq!(rules[0].decision, RuleDecision::Deny);
+
+        // Project-scope rules coexist with the global one for the same tool.
+        let _project = rpc
+            .upsert_rule(
+                "webfetch",
+                RuleDecision::Allow,
+                RuleScope::Project {
+                    project_id: "proj-1".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(rpc.permission_rules().len(), 2);
+
+        // Persistence: a fresh CoworkRpc loads the rules from the store file.
+        let restarted = CoworkRpc::new();
+        assert_eq!(restarted.permission_rules().len(), 2);
+        assert!(restarted.remove_rule(&deny.id));
+        assert!(!restarted.remove_rule(&deny.id), "second remove is a no-op");
+        assert_eq!(restarted.permission_rules().len(), 1);
+        assert!(restarted.permission_rules()[0].scope != RuleScope::Global
+            || restarted.permission_rules()[0].decision == RuleDecision::Allow);
+        unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
+    }
+
+    #[tokio::test]
+    async fn permission_rules_project_scope_beats_global() {
+        let _env = lock_store_env();
+        let store_dir_handle = tempfile::tempdir().unwrap();
+        // SAFETY: the STORE_ENV_LOCK is held, so no other thread reads the
+        // environment while it mutates.
+        unsafe { std::env::set_var("JCODE_COWORK_STORE_DIR", store_dir_handle.path()) };
+        let rpc = CoworkRpc::new();
+        let deny = rpc
+            .upsert_rule("bash", RuleDecision::Deny, RuleScope::Global)
+            .unwrap();
+        let allow = rpc
+            .upsert_rule(
+                "bash",
+                RuleDecision::Allow,
+                RuleScope::Project {
+                    project_id: "proj-9".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(allow.created_at >= deny.created_at);
+        // Inside the project: the project rule wins despite the global deny.
+        assert_eq!(
+            rpc.evaluate_permission_rules("bash", Some("proj-9")),
+            Some(RuleDecision::Allow)
+        );
+        // Outside it: only the global rule matches.
+        assert_eq!(
+            rpc.evaluate_permission_rules("bash", Some("proj-other")),
+            Some(RuleDecision::Deny)
+        );
+        assert_eq!(rpc.evaluate_permission_rules("bash", None), Some(RuleDecision::Deny));
+        // No rule for the tool → no decision.
+        assert_eq!(rpc.evaluate_permission_rules("webfetch", None), None);
+        unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
+    }
+
+    #[tokio::test]
+    async fn permission_rules_short_circuit_the_approval_gate() {
+        let _env = lock_store_env();
+        let store_dir_handle = tempfile::tempdir().unwrap();
+        // SAFETY: the STORE_ENV_LOCK is held, so no other thread reads the
+        // environment while it mutates.
+        unsafe { std::env::set_var("JCODE_COWORK_STORE_DIR", store_dir_handle.path()) };
+        let rpc = CoworkRpc::new();
+        let mut events = rpc.subscribe();
+        let allow = rpc
+            .upsert_rule(
+                "bash",
+                RuleDecision::Allow,
+                RuleScope::Project {
+                    project_id: "proj-9".to_owned(),
+                },
+            )
+            .unwrap();
+        let deny = rpc
+            .upsert_rule("webfetch", RuleDecision::Deny, RuleScope::Global)
+            .unwrap();
+        assert_ne!(allow.id, deny.id);
+
+        // Simulated task context for a project-scoped task: run_cowork_task
+        // records this via start_task; do it directly here.
+        rpc.inner.task_contexts.lock().await.push_back((
+            "task-p".to_owned(),
+            TaskContext {
+                mounts: vec![],
+                project_id: Some("proj-9".to_owned()),
+                model: None,
+            },
+        ));
+
+        // Allowed by the project rule — no ApprovalRequired event is emitted.
+        let approved = rpc
+            .request_tool_approval("ap-1", "bash", "run make", "task-p")
+            .await
+            .unwrap();
+        assert!(approved);
+        assert!(events.try_recv().is_err(), "rule allow must not prompt");
+
+        // Denied by the global rule — also no prompt, reported as rejected.
+        let approved = rpc
+            .request_tool_approval("ap-2", "webfetch", "open page", "task-p")
+            .await
+            .unwrap();
+        assert!(!approved);
+        assert!(events.try_recv().is_err(), "rule deny must not prompt");
+
+        // An unruled tool still prompts normally (the future would await a
+        // decision forever here, so bound it and assert the prompt arrived).
+        let prompt = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            rpc.request_tool_approval("ap-3", "write", "write report.md", "task-p"),
+        )
+        .await;
+        assert!(prompt.is_err(), "no IPC client is connected to answer");
+        assert!(matches!(
+            events.try_recv(),
+            Ok(CoworkEvent::ApprovalRequired { .. })
+        ));
+        unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
+    }
+
+    #[tokio::test]
+    async fn approve_tool_call_with_remember_stores_project_rule() {
+        let _env = lock_store_env();
+        let store_dir_handle = tempfile::tempdir().unwrap();
+        // SAFETY: the STORE_ENV_LOCK is held, so no other thread reads the
+        // environment while it mutates.
+        unsafe { std::env::set_var("JCODE_COWORK_STORE_DIR", store_dir_handle.path()) };
+        let rpc = CoworkRpc::new();
+        let mut events = rpc.subscribe();
+        // A project task context, as recorded by start_task.
+        rpc.inner.task_contexts.lock().await.push_back((
+            "task-p".to_owned(),
+            TaskContext {
+                mounts: vec![],
+                project_id: Some("proj-7".to_owned()),
+                model: None,
+            },
+        ));
+
+        // Open two approvals the way the agent session would (spawns a
+        // waiter that blocks until the decision arrives).
+        let waiter = {
+            let rpc = rpc.clone();
+            tokio::spawn(async move {
+                rpc.request_tool_approval("ap-r1", "bash", "run build", "task-p")
+                    .await
+            })
+        };
+        let CoworkEvent::ApprovalRequired { id, tool_name, .. } = events.recv().await.unwrap()
+        else {
+            panic!("expected ApprovalRequired");
+        };
+        assert_eq!(tool_name, "bash");
+
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                41,
+                "approve_tool_call",
+                json!({ "id": id, "approved": true, "remember": "project" }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["result"]["resolved"], true);
+        assert_eq!(waiter.await.unwrap().unwrap(), true);
+
+        let rules = rpc.permission_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tool, "bash");
+        assert_eq!(rules[0].decision, RuleDecision::Allow);
+        assert_eq!(
+            rules[0].scope,
+            RuleScope::Project {
+                project_id: "proj-7".to_owned()
+            }
+        );
+
+        // A second approval remembered globally replaces nothing else but
+        // adds a global rule for a different tool.
+        let waiter = {
+            let rpc = rpc.clone();
+            tokio::spawn(async move {
+                rpc.request_tool_approval("ap-r2", "write", "write file", "task-p")
+                    .await
+            })
+        };
+        let CoworkEvent::ApprovalRequired { id, .. } = events.recv().await.unwrap() else {
+            panic!("expected ApprovalRequired");
+        };
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                42,
+                "approve_tool_call",
+                json!({ "id": id, "approved": false, "remember": "global" }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["result"]["resolved"], true);
+        assert_eq!(waiter.await.unwrap().unwrap(), false);
+        let rules = rpc.permission_rules();
+        assert_eq!(rules.len(), 2);
+        assert!(rules.iter().any(|rule| rule.tool == "write"
+            && rule.decision == RuleDecision::Deny
+            && rule.scope == RuleScope::Global));
+        unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
+    }
+
+    #[tokio::test]
+    async fn permissions_add_and_remove_via_dispatch() {
+        let _env = lock_store_env();
+        let store_dir_handle = tempfile::tempdir().unwrap();
+        // SAFETY: the STORE_ENV_LOCK is held, so no other thread reads the
+        // environment while it mutates.
+        unsafe { std::env::set_var("JCODE_COWORK_STORE_DIR", store_dir_handle.path()) };
+        let rpc = CoworkRpc::new();
+
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                60,
+                "permissions.add",
+                json!({ "tool": "  websearch  ", "decision": "allow" }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        let rule_id = response["result"]["rule"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(response["result"]["rule"]["tool"], "websearch");
+        assert_eq!(response["result"]["rule"]["decision"], "allow");
+        assert_eq!(response["result"]["rule"]["scope"]["kind"], "global");
+
+        let response = dispatch_request(authed_request(&rpc, 61, "permissions.list", json!({})), &rpc)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["rules"].as_array().unwrap().len(), 1);
+
+        // Invalid decision and unknown scope are rejected cleanly.
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                62,
+                "permissions.add",
+                json!({ "tool": "bash", "decision": "sometimes" }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                63,
+                "permissions.add",
+                json!({ "tool": "bash", "decision": "deny", "scope": "everywhere" }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+
+        let response = dispatch_request(
+            authed_request(&rpc, 64, "permissions.remove", json!({ "id": rule_id })),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["result"]["removed"], true);
+        let response = dispatch_request(authed_request(&rpc, 65, "permissions.list", json!({})), &rpc)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["rules"].as_array().unwrap().len(), 0);
+        unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
     }
 
     #[tokio::test]
