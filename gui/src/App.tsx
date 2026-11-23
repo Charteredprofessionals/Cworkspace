@@ -446,6 +446,7 @@ function App() {
   const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
   const [transcriptView, setTranscriptView] = useState<TranscriptView | null>(null);
   const [protocolWarning, setProtocolWarning] = useState("");
+  const [reattachNotice, setReattachNotice] = useState("");
   const [editingTitle, setEditingTitle] = useState<{ tabId: string; value: string } | null>(null);
   const goalInputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -500,10 +501,17 @@ function App() {
   // user asked us to reopen them (Settings → Workspace).
   useEffect(() => {
     let cancelled = false;
-    invoke("connect_daemon")
-      .then(async () => {
+    invoke<{ adopted?: boolean; running_tasks?: number }>("connect_daemon")
+      .then(async (handshake) => {
         if (cancelled) return;
         setDaemonStatus("connected");
+        // The daemon survives GUI close since v0.1.7: if this session
+        // attached to an existing daemon with tasks still running, say so.
+        if (handshake.adopted && (handshake.running_tasks || 0) > 0) {
+          setReattachNotice(
+            `Reattached to the background daemon — ${handshake.running_tasks} task(s) still running. Your work never stopped.`,
+          );
+        }
         // Protocol handshake (Milestone 0 exit criterion): a daemon whose
         // protocol version predates the GUI's would fail every newer RPC with
         // "Method not found" — surface that immediately instead.
@@ -1203,6 +1211,7 @@ function App() {
           </form>
 
           {protocolWarning && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{protocolWarning}</span><button className="icon-button" aria-label="Dismiss warning" onClick={() => setProtocolWarning("")}><X size={15} /></button></div>}
+          {reattachNotice && <div className="info-banner" role="status"><Sparkles size={15} /><span>{reattachNotice}</span><button className="icon-button" aria-label="Dismiss notice" onClick={() => setReattachNotice("")}><X size={15} /></button></div>}
           {activeTab?.notice && <div className="info-banner" role="status"><Sparkles size={15} /><span>{activeTab.notice}</span><button className="icon-button" aria-label="Dismiss notice" onClick={() => patchTab(activeTab.id, { notice: "" })}><X size={14} /></button></div>}
           {activeTab?.error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{activeTab.error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => patchTab(activeTab.id, { error: "" })}><X size={15} /></button></div>}
 

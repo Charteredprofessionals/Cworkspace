@@ -317,6 +317,9 @@ struct CoworkRpcInner {
     /// Stored permission rules, checked before the policy on every approval.
     /// A sync mutex: list/upsert/remove are short non-awaiting sections.
     permission_rules: std::sync::Mutex<Vec<PermissionRule>>,
+    /// Set by a `shutdown` request; the server loop exits the process after
+    /// the response is written. Atomic: no lock ordering concerns.
+    shutdown_requested: std::sync::atomic::AtomicBool,
     /// Persistent project registry (projects, mounts with access levels,
     /// instructions, model defaults, task history).
     project_store: std::sync::OnceLock<crate::cli::cowork_projects::ProjectStore>,
@@ -388,6 +391,7 @@ impl CoworkRpc {
                 models_provider: tokio::sync::OnceCell::new(),
                 approval_policy: std::sync::Mutex::new(load_policy()),
                 permission_rules: std::sync::Mutex::new(load_permission_rules()),
+                shutdown_requested: std::sync::atomic::AtomicBool::new(false),
                 project_store: std::sync::OnceLock::new(),
             }),
         }
@@ -842,6 +846,45 @@ pub async fn list_tasks(&self) -> Vec<(String, bool)> {
         } else {
             false
         }
+    }
+
+    /// Whether a `shutdown` request was accepted and the daemon should exit
+    /// once its response has been written. The server loop polls this after
+    /// every response; tests set it without running a server.
+    pub fn shutdown_requested(&self) -> bool {
+        self.inner
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Abort every running task and mark the daemon for exit (v0.1.7: the
+    /// daemon survives GUI close, so an explicit quit — tray menu or
+    /// installer — must be able to stop it). Returns how many tasks were
+    /// stopped. The actual process exit happens in the server loop after the
+    /// shutdown response flushes; nothing here exits the process so tests
+    /// can exercise the logic directly.
+    async fn initiate_shutdown(&self) -> usize {
+        let handles: Vec<(String, tokio::task::JoinHandle<()>)> =
+            self.inner.tasks.lock().await.drain().collect();
+        let stopped = handles.len();
+        for (task_id, handle) in handles {
+            handle.abort();
+            let _ = handle.await;
+            let _ = self.emit_event(CoworkEvent::TaskCompleted {
+                task_id: task_id.clone(),
+                success: false,
+                summary: Some("Daemon shutting down".to_owned()),
+            });
+        }
+        self.inner
+            .approvals
+            .lock()
+            .await
+            .retain(|_, pending| !pending.sender.is_closed());
+        self.inner
+            .shutdown_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        stopped
     }
 
     pub async fn mount_folder(&self, session_id: &str, path: &Path) -> Result<PathBuf> {
@@ -1373,6 +1416,61 @@ async fn run_due_schedule_entries(rpc: &CoworkRpc) -> Result<()> {
 
 /// Start the scheduler loop for the desktop daemon: every 30 seconds, fire
 /// any due `schedule.create` entries as project-scoped cowork tasks.
+/// Tracks consecutive quiet minutes for the daemon's idle janitor. Pure
+/// logic so tests can drive it without a clock.
+struct IdleJanitor {
+    idle_ticks: u32,
+}
+
+impl IdleJanitor {
+    /// 10 ticks x 60 s = ten minutes with no connected client and no running
+    /// task before the daemon exits. Generous enough that a GUI restart
+    /// (seconds) never races it, short enough that a hard-killed GUI does
+    /// not leave an orphaned daemon for hours.
+    const SHUTDOWN_AFTER_TICKS: u32 = 10;
+
+    fn new() -> Self {
+        Self { idle_ticks: 0 }
+    }
+
+    /// One 60-second tick. Returns true when the daemon should exit: no
+    /// client connected and no task running for `SHUTDOWN_AFTER_TICKS`
+    /// consecutive minutes.
+    fn tick(&mut self, clients_connected: usize, tasks_running: usize) -> bool {
+        if clients_connected == 0 && tasks_running == 0 {
+            self.idle_ticks += 1;
+        } else {
+            self.idle_ticks = 0;
+        }
+        self.idle_ticks >= Self::SHUTDOWN_AFTER_TICKS
+    }
+}
+
+/// Exit the daemon once it has been idle — no IPC client and no running
+/// task — for ten consecutive minutes. Background execution (v0.1.7) means
+/// the daemon outlives the GUI, so this is what prevents an orphaned daemon
+/// after a crash or a forced kill of the desktop app.
+pub fn spawn_idle_janitor(rpc: CoworkRpc) {
+    tokio::spawn(async move {
+        let mut janitor = IdleJanitor::new();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // the first tick fires immediately; skip it
+        loop {
+            ticker.tick().await;
+            let clients = rpc.inner.events.receiver_count();
+            let tasks = rpc.list_tasks().await.len();
+            if janitor.tick(clients, tasks) {
+                tracing::info!(
+                    "daemon idle for {} minutes with no client and no running task; exiting",
+                    IdleJanitor::SHUTDOWN_AFTER_TICKS
+                );
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
 pub fn spawn_scheduler(rpc: CoworkRpc) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -2124,6 +2222,10 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                 )),
             }
         }
+        "shutdown" => {
+            let stopped = rpc.initiate_shutdown().await;
+            Ok(json!({ "shutting_down": true, "stopped_tasks": stopped }))
+        }
         "permissions.list" => Ok(json!({ "rules": rpc.permission_rules() })),
         "permissions.add" => {
             let tool = request
@@ -2514,6 +2616,7 @@ pub async fn run_server() -> Result<()> {
 
     let rpc = global().clone();
     spawn_scheduler(rpc.clone());
+    spawn_idle_janitor(rpc.clone());
     let token_path = rpc.publish_capability_token().await?;
     tracing::info!(
         "Cowork IPC capability token published at {}",
@@ -2561,6 +2664,12 @@ pub async fn run_server() -> Result<()> {
                             {
                                 break;
                             }
+                            // A `shutdown` request just completed: the
+                            // response is flushed, so exit cleanly. Tasks
+                            // were already aborted by initiate_shutdown.
+                            if client_rpc.shutdown_requested() {
+                                std::process::exit(0);
+                            }
                         }
                     }
                     event = events.recv() => {
@@ -2600,6 +2709,7 @@ pub async fn run_server() -> Result<()> {
 
     let rpc = global().clone();
     spawn_scheduler(rpc.clone());
+    spawn_idle_janitor(rpc.clone());
     let token_path = rpc.publish_capability_token().await?;
     tracing::info!(
         "Cowork WebSocket IPC server listening on ws://{}; capability token published at {}",
@@ -2657,6 +2767,11 @@ pub async fn run_server() -> Result<()> {
                                 let json = serde_json::to_string(&response).unwrap_or_default();
                                 if ws_sink.send(Message::Text(json.into())).await.is_err() {
                                     break;
+                                }
+                                // A `shutdown` request just completed: the
+                                // response is flushed, so exit cleanly.
+                                if client_rpc.shutdown_requested() {
+                                    std::process::exit(0);
                                 }
                             }
                         } else if msg.is_close() {
@@ -3176,6 +3291,80 @@ mod tests {
             .unwrap();
         assert_eq!(response["result"]["rules"].as_array().unwrap().len(), 0);
         unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
+    }
+
+    #[tokio::test]
+    async fn initiate_shutdown_aborts_running_tasks_and_sets_flag() {
+        let rpc = CoworkRpc::new();
+        let mut events = rpc.subscribe();
+        // A long-running fake task, as start_task would have registered it.
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        rpc.inner.tasks.lock().await.insert("task-1".to_owned(), handle);
+        rpc.inner.task_contexts.lock().await.push_back((
+            "task-1".to_owned(),
+            TaskContext {
+                mounts: vec![],
+                project_id: None,
+                model: None,
+            },
+        ));
+
+        assert!(!rpc.shutdown_requested());
+        let stopped = rpc.initiate_shutdown().await;
+        assert_eq!(stopped, 1);
+        assert!(rpc.shutdown_requested());
+        assert!(rpc.list_tasks().await.is_empty(), "tasks map must drain");
+        // The aborted task signals completion like a user stop would.
+        let completed = events.recv().await.unwrap();
+        assert_eq!(
+            completed,
+            CoworkEvent::TaskCompleted {
+                task_id: "task-1".to_owned(),
+                success: false,
+                summary: Some("Daemon shutting down".to_owned()),
+            }
+        );
+        // Flag resets are not part of the contract: a second call still
+        // succeeds with zero tasks.
+        assert_eq!(rpc.initiate_shutdown().await, 0);
+    }
+
+    #[tokio::test]
+    async fn idle_janitor_fires_only_after_ten_quiet_minutes() {
+        let mut janitor = IdleJanitor::new();
+        // Active periods reset the counter: client connected, then tasks
+        // running, then connected again.
+        for _ in 0..7 {
+            assert!(!janitor.tick(1, 0));
+            assert!(!janitor.tick(0, 2));
+        }
+        // Quiet stretch: fires exactly on the tenth consecutive idle tick.
+        for _ in 0..9 {
+            assert!(!janitor.tick(0, 0));
+        }
+        assert!(janitor.tick(0, 0));
+        // And one quiet tick after activity starts again does not fire.
+        assert!(!janitor.tick(1, 0));
+        assert!(!janitor.tick(0, 0));
+    }
+
+    #[tokio::test]
+    async fn shutdown_dispatches_and_reports_stopped_tasks() {
+        let rpc = CoworkRpc::new();
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        rpc.inner.tasks.lock().await.insert("task-2".to_owned(), handle);
+
+        let response = dispatch_request(authed_request(&rpc, 70, "shutdown", json!({})), &rpc)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["shutting_down"], true);
+        assert_eq!(response["result"]["stopped_tasks"], 1);
+        assert!(rpc.shutdown_requested());
+        assert!(rpc.list_tasks().await.is_empty());
     }
 
     #[tokio::test]

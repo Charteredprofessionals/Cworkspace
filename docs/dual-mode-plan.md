@@ -69,18 +69,24 @@ Settings → Permissions lists rules with an add/remove editor in both layouts.
   always ask); Knowledge Work renders it as plain-language toggles.
 - Effort ≈ 2 days.
 
-### 4. Background execution + tray — v0.1.7
+### 4. Background execution + tray — v0.1.7 — SHIPPED
 
 Today the daemon is a GUI child wrapped in a kill-on-close job object: closing
 the window kills running tasks — acceptable for devs, hostile to "start a
 report and walk away".
 
-- Setting "Keep tasks running when I close the window" (default off;
-  Knowledge Work onboarding suggests it): skip job-object kill, keep daemon
-  alive, add a tray icon with running-task count and "Open Cworkspace".
-- The installer's orphan-kill hook already cleans up abandoned daemons on
-  upgrade/uninstall, so the safety net exists.
-- Effort ≈ 2 days (Tauri tray feature + detach path).
+Shipped differently from the sketch (simpler, no setting): the job object
+lost its kill-on-close flag entirely, so the daemon — and every running task
+— survives GUI close, GUI crash, and OS logoff by default. Closing the
+window hides to tray (Open Cworkspace / task count / Quit). Quit asks the
+daemon to shut down gracefully (new `shutdown` RPC: aborts running tasks,
+then the server loop exits after flushing the response); the quit path
+retains a job/child kill fallback. Re-adoption needs no daemon-info file —
+the pipe name is fixed, so the GUI's existing connect-before-spawn logic
+attaches to the running daemon, and `connect_daemon` now reports
+`{adopted, running_tasks}` for a frontend reattach notice. An idle janitor
+exits a daemon left orphaned after ten consecutive quiet minutes (no client,
+no tasks); installer hooks already taskkill jcode.exe for upgrades.
 
 ### 5. Streaming + narrative feed — protocol v4
 

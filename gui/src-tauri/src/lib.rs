@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent, Wry};
 use uuid::Uuid;
 
 const PIPE_NAME: &str = r"\\.\pipe\jcode-cowork";
@@ -84,12 +86,14 @@ fn refresh_project_roots(connection: &RpcConnection, bridge: &Bridge) {
 struct Bridge {
     connection: Mutex<Option<Arc<RpcConnection>>>,
     child: Mutex<Option<Child>>,
-    /// Windows job object wrapping the daemon child. Its kill-on-close flag
-    /// terminates the daemon whenever the GUI process exits — even on a
-    /// crash or a forced kill from an installer — so an orphaned daemon can
-    /// never keep the install directory's files in use and block
-    /// uninstallation or upgrades. Raw handle stored as `isize` to keep
-    /// `Bridge` Send + Sync.
+    /// Windows job object wrapping the daemon child — a tracking handle the
+    /// quit path uses to terminate the daemon group explicitly. Since v0.1.7
+    /// it deliberately has NO kill-on-close flag: the daemon (and its running
+    /// tasks) survives plain GUI exits and even a GUI crash, adopting the
+    /// "background execution" model; an idle janitor exits an orphaned
+    /// daemon after ten quiet minutes, and the NSIS installer hooks taskkill
+    /// jcode.exe so upgrades and uninstalls are never blocked. Raw handle
+    /// stored as `isize` to keep `Bridge` Send + Sync.
     job: Mutex<Option<isize>>,
     mounted_roots: Mutex<Vec<PathBuf>>,
     /// Union of every project's mount roots (daemon-side). Project-scoped
@@ -97,6 +101,13 @@ struct Bridge {
     /// files living inside project mounts.
     project_roots: Mutex<Vec<PathBuf>>,
     session_id: String,
+    /// Set only by the tray's Quit item: an explicit quit stops the daemon
+    /// (graceful RPC, then a job/child kill as fallback). Any other exit —
+    /// crash, OS logoff, dev restart — leaves the daemon running.
+    quitting: AtomicBool,
+    /// True when this GUI session attached to an ALREADY RUNNING daemon
+    /// instead of spawning one; the frontend surfaces a reattach notice.
+    adopted: AtomicBool,
 }
 
 impl Bridge {
@@ -105,12 +116,15 @@ impl Bridge {
     }
 
     fn shutdown(&self) {
-        // Closing the job handle terminates the daemon (kill-on-close), so
-        // this is also the cleanup path if child.kill() were to fail.
+        // Explicit-quit cleanup only (the run closure gates this on
+        // `quitting`): terminate the daemon group through the job handle,
+        // then release it. The graceful `shutdown` RPC usually wins the
+        // race; this is the fallback that also covers a hung daemon.
         #[cfg(windows)]
         if let Ok(job) = self.job.lock() {
             if let Some(handle) = job.as_ref() {
                 unsafe {
+                    windows_sys::Win32::System::JobObjects::TerminateJobObject(*handle, 0);
                     windows_sys::Win32::Foundation::CloseHandle(*handle);
                 }
             }
@@ -140,6 +154,8 @@ impl Default for Bridge {
             mounted_roots: Mutex::new(Vec::new()),
             project_roots: Mutex::new(Vec::new()),
             session_id: Uuid::new_v4().to_string(),
+            quitting: AtomicBool::new(false),
+            adopted: AtomicBool::new(false),
         }
     }
 }
@@ -345,7 +361,7 @@ fn launch_daemon(bridge: &Bridge) -> Result<(), String> {
         // the daemon, so it can never outlive the app and keep the install
         // directory's files in use.
         if let Some(child) = child_slot.as_mut() {
-            unsafe { attach_kill_on_close_job(&bridge.job, child) };
+            unsafe { attach_daemon_job(&bridge.job, child) };
         }
         Ok(())
     }
@@ -356,34 +372,23 @@ fn launch_daemon(bridge: &Bridge) -> Result<(), String> {
     }
 }
 
-/// Put `child` into a fresh kill-on-close job object and remember the job
-/// handle in `slot` so `Bridge::shutdown` can close it explicitly.
+/// Put `child` into a fresh job object and remember the job handle in
+/// `slot` so `Bridge::shutdown` can terminate the daemon group explicitly
+/// on an explicit quit. Deliberately WITHOUT the kill-on-close flag since
+/// v0.1.7: the daemon (and its running tasks) must survive plain GUI exits
+/// and GUI crashes — background execution. The idle janitor inside the
+/// daemon cleans up an orphaned daemon after ten quiet minutes, and the
+/// NSIS installer hooks taskkill jcode.exe for upgrades/uninstalls.
 /// Best-effort: if job creation or assignment fails the daemon still runs,
-/// just without the lifetime tie (e.g. hosts too old for nested jobs).
+/// just untracked (e.g. hosts too old for nested jobs).
 #[cfg(windows)]
-unsafe fn attach_kill_on_close_job(slot: &Mutex<Option<isize>>, child: &mut Child) {
+unsafe fn attach_daemon_job(slot: &Mutex<Option<isize>>, child: &mut Child) {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    };
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
 
     let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
     if job == 0 {
-        return;
-    }
-    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if SetInformationJobObject(
-        job,
-        JobObjectExtendedLimitInformation,
-        &limits as *const _ as *const core::ffi::c_void,
-        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-    ) == 0
-    {
-        CloseHandle(job);
         return;
     }
     // HANDLE is an isize in windows-sys 0.52; the child's raw handle is a
@@ -413,6 +418,10 @@ fn ensure_connection(app: &AppHandle, bridge: &Bridge) -> Result<Arc<RpcConnecti
     match RpcConnection::open(app.clone()) {
         Ok(connection) => {
             connection.request("ping", json!({}))?;
+            // Attached to an already-running daemon (a previous GUI session
+            // or one left running with background tasks) instead of spawning
+            // one — the frontend surfaces a reattach notice.
+            bridge.adopted.store(true, Ordering::SeqCst);
             *slot = Some(Arc::clone(&connection));
             return Ok(connection);
         }
@@ -464,11 +473,99 @@ fn ensure_connection(app: &AppHandle, bridge: &Bridge) -> Result<Arc<RpcConnecti
 }
 
 #[tauri::command]
-async fn connect_daemon(app: AppHandle, bridge: State<'_, Bridge>) -> Result<(), String> {
+async fn connect_daemon(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, String> {
     // Opening the pipe, the ping handshake, and the launch retry loop are
     // blocking; keep them off the shared runtime workers so a slow daemon
     // start never stalls other IPC commands.
-    tokio::task::block_in_place(|| ensure_connection(&app, &bridge)).map(|_| ())
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        let adopted = bridge.adopted.load(Ordering::SeqCst);
+        let running_tasks = connection
+            .request("task.list", json!({}))
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("tasks")
+                    .and_then(Value::as_array)
+                    .map(|tasks| tasks.len())
+            })
+            .unwrap_or(0);
+        Ok(json!({ "adopted": adopted, "running_tasks": running_tasks }))
+    })
+}
+
+/// Show (and focus) the main window from the tray.
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// Explicit quit from the tray: mark the session as quitting so the Exit
+/// path is allowed to kill the daemon, ask it to stop gracefully first
+/// (aborting running tasks), then leave. The graceful request runs on a
+/// thread without waiting — a hung daemon must not block quitting, and
+/// `Bridge::shutdown` at Exit is the fallback kill.
+fn quit_application(app: &AppHandle) {
+    if let Some(bridge) = app.try_state::<Bridge>() {
+        bridge.quitting.store(true, Ordering::SeqCst);
+        let connection = bridge
+            .connection
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(Arc::clone));
+        thread::spawn(move || {
+            if let Some(connection) = connection {
+                if connection.alive.load(Ordering::Acquire) {
+                    let _ = connection.request("shutdown", json!({}));
+                }
+            }
+        });
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+    app.exit(0);
+}
+
+/// Keep the tray's task counter current by polling the daemon's task list
+/// every 20 seconds. Polling (instead of counting events) stays correct
+/// across reattach: the count reflects what the daemon itself believes.
+fn tray_task_watcher(app: AppHandle, item: MenuItem<Wry>) {
+    loop {
+        thread::sleep(Duration::from_secs(20));
+        let Some(bridge) = app.try_state::<Bridge>() else { return };
+        let connection = bridge
+            .connection
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(Arc::clone));
+        let label = match connection {
+            Some(connection) if connection.alive.load(Ordering::Acquire) => {
+                match connection.request("task.list", json!({})) {
+                    Ok(value) => {
+                        let count = value
+                            .get("tasks")
+                            .and_then(Value::as_array)
+                            .map(|tasks| tasks.len())
+                            .unwrap_or(0);
+                        match count {
+                            0 => "No tasks running".to_owned(),
+                            1 => "1 task running".to_owned(),
+                            other => format!("{other} tasks running"),
+                        }
+                    }
+                    Err(_) => "Daemon not responding".to_owned(),
+                }
+            }
+            _ => "Daemon stopped".to_owned(),
+        };
+        let _ = app.run_on_main_thread(move || {
+            let _ = item.set_text(&label);
+        });
+    }
 }
 
 fn canonical_folder(path: &str) -> Result<PathBuf, String> {
@@ -1123,6 +1220,57 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(bridge)
+        .setup(|app| {
+            // Tray (v0.1.7): the GUI window can close while the daemon keeps
+            // running tasks; the tray is how the user gets back in and how
+            // they quit for real.
+            let open_item = MenuItem::with_id(app, "open", "Open Cworkspace", true, None::<&str>)?;
+            let tasks_item =
+                MenuItem::with_id(app, "tasks", "No tasks running", false, None::<&str>)?;
+            let quit_item = MenuItem::with_id(
+                app,
+                "quit",
+                "Quit Cworkspace (stops background tasks)",
+                true,
+                None::<&str>,
+            )?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &open_item,
+                    &tasks_item,
+                    &PredefinedMenuItem::separator(app)?,
+                    &quit_item,
+                ],
+            )?;
+            TrayIconBuilder::with_id("main-tray")
+                .icon(app.default_window_icon().expect("bundle icon").clone())
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .tooltip("Cworkspace — tasks keep running in the background")
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "open" => show_main_window(app),
+                    "quit" => quit_application(app),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                    ) {
+                        show_main_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+            let watcher_app = app.handle().clone();
+            let watcher_item = tasks_item.clone();
+            thread::spawn(move || tray_task_watcher(watcher_app, watcher_item));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             connect_daemon,
             list_models,
@@ -1161,10 +1309,39 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Cworkspace")
         .run(|app, event| {
-            if matches!(event, RunEvent::Exit) {
-                if let Some(bridge) = app.try_state::<Bridge>() {
-                    bridge.shutdown();
+            match event {
+                // Close-to-tray: the window hides and the daemon (with any
+                // running tasks) keeps working. Quitting happens via the
+                // tray menu, not the window's X button.
+                RunEvent::WindowEvent {
+                    label,
+                    event: WindowEvent::CloseRequested { api, .. },
+                    ..
+                } => {
+                    if label == "main" {
+                        api.prevent_close();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.hide();
+                        }
+                    }
                 }
+                RunEvent::Exit => {
+                    if let Some(bridge) = app.try_state::<Bridge>() {
+                        // Explicit quit: stop the daemon (graceful RPC was
+                        // already sent; this is the fallback kill). Any other
+                        // exit — crash, OS logoff, dev restart — leaves the
+                        // daemon and its running tasks alive in the
+                        // background, adopted by the next GUI launch.
+                        if bridge.quitting.load(Ordering::SeqCst) {
+                            bridge.shutdown();
+                        } else if let Ok(mut connection) = bridge.connection.lock() {
+                            if let Some(connection) = connection.take() {
+                                connection.close();
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         });
 }
