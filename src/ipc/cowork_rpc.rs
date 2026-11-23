@@ -18,7 +18,9 @@ pub const PIPE_NAME: &str = r"\\.\pipe\jcode-cowork";
 /// v3: parity surfaces for every jcode capability the desktop was missing —
 /// tool catalog, task transcripts, usage reports, auth status/keys,
 /// MCP server management, and scheduled tasks.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// v4: additive — `TaskDelta` streams assistant text while a task runs, so
+/// the feed types out live instead of waiting for `TaskCompleted`.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Tool names considered read-only for the auto-allow policy. They cannot
 /// mutate the workspace: reads list files, grep searches content, webfetch
@@ -282,6 +284,15 @@ pub enum CoworkEvent {
         task_id: String,
         success: bool,
         summary: Option<String>,
+    },
+    /// Streaming assistant-text delta for a running task (protocol v4,
+    /// additive). `replace` marks a full-text rewrite so clients keeping an
+    /// append-only narrative stay correct when the provider replaces its
+    /// in-progress message instead of appending to it.
+    TaskDelta {
+        task_id: String,
+        text: String,
+        replace: bool,
     },
 }
 
@@ -1172,7 +1183,9 @@ pub async fn list_tasks(&self) -> Vec<(String, bool)> {
             .map(|(_, session_id)| session_id.clone())
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<CoworkEvent> {
+    /// Subscribe to the event broadcast. Visible to the crate so the task
+    /// runner's tests (commands_tests) can assert emitted deltas.
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<CoworkEvent> {
         self.inner.events.subscribe()
     }
 }
@@ -3291,6 +3304,22 @@ mod tests {
             .unwrap();
         assert_eq!(response["result"]["rules"].as_array().unwrap().len(), 0);
         unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
+    }
+
+    #[test]
+    fn task_delta_event_serializes_with_type_tag() {
+        let event = CoworkEvent::TaskDelta {
+            task_id: "t1".to_owned(),
+            text: "hello".to_owned(),
+            replace: false,
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "TaskDelta");
+        assert_eq!(value["task_id"], "t1");
+        assert_eq!(value["text"], "hello");
+        assert_eq!(value["replace"], false);
+        let roundtrip: CoworkEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, event);
     }
 
     #[tokio::test]

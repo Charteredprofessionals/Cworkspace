@@ -88,13 +88,25 @@ attaches to the running daemon, and `connect_daemon` now reports
 exits a daemon left orphaned after ten consecutive quiet minutes (no client,
 no tasks); installer hooks already taskkill jcode.exe for upgrades.
 
-### 5. Streaming + narrative feed — protocol v4
+### 5. Streaming + narrative feed — protocol v4 — SHIPPED (v0.1.8)
 
 - Stream token deltas as cowork events so answers type out live.
 - Knowledge Work narration layer: map tool events to human sentences
   (office_docs → "Writing the report…", websearch → "Searching the web…").
 - The sibling harness API already has streaming events; this is a protocol
   addition (`PROTOCOL_VERSION = 4`, additive like v3).
+
+Shipped: `run_cowork_task` now drives the engine's streaming turn path
+(`run_once_streaming_mpsc`) and forwards assistant text through a new
+additive `CoworkEvent::TaskDelta { task_id, text, replace }` — TextReplace
+and TextSuffixReplace are folded into full-replacement deltas so the
+GUI's append-only narrative stays correct, and the accumulated text doubles
+as the `TaskCompleted` summary (identical to what `run_once_capture`
+returned). The GUI batches deltas into a ~120 ms flush, merging chunks into
+the tab's last narrative entry (Pencil timeline symbol, purple); completion
+flushes the buffer before the summary entry lands. Narration phrases
+extended to swarm/batch/skill_manage/conversation_search/codemode/side
+panel/mcp. 2 new tests (serde roundtrip + forwarder semantics), 381/381.
 
 ### 6. First-run onboarding — v0.1.5, UI-only
 

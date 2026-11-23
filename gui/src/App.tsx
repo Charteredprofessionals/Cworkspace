@@ -93,7 +93,13 @@ type ModelRoute = {
 };
 
 type CoworkEvent = {
-  event: "AgentSpawned" | "ToolInvoked" | "ArtifactCreated" | "ApprovalRequired" | "TaskCompleted";
+  event:
+    | "AgentSpawned"
+    | "ToolInvoked"
+    | "ArtifactCreated"
+    | "ApprovalRequired"
+    | "TaskDelta"
+    | "TaskCompleted";
   data: Record<string, unknown>;
 };
 
@@ -277,7 +283,8 @@ type TranscriptView = {
 
 /// Must match `cowork_rpc::PROTOCOL_VERSION`. The daemon bumps it on breaking
 /// RPC changes; the GUI warns instead of failing mysteriously on a mismatch.
-const PROTOCOL_VERSION = 3;
+/// v4 is additive: `TaskDelta` streams the assistant's text live.
+const PROTOCOL_VERSION = 4;
 
 const HISTORY_KEY = "jcode-cowork-history-v1";
 const SETTINGS_KEY = "cworkspace-settings-v1";
@@ -347,6 +354,14 @@ const TOOL_PHRASES: Record<string, string> = {
   schedule: "Scheduling a follow-up",
   gmail: "Checking Gmail",
   calendar: "Checking Calendar",
+  swarm: "Coordinating with helper agents",
+  batch: "Running a batch of steps",
+  skill_manage: "Managing its skills",
+  conversation_search: "Searching past conversations",
+  codemode: "Working through code",
+  side_panel: "Opening the side panel",
+  panel: "Opening the side panel",
+  mcp: "Using an extension tool",
 };
 
 function toolPhrase(name: string) {
@@ -619,10 +634,85 @@ function App() {
   // (task_id), so each event lands in the tab that owns the task — parallel
   // sessions never cross-contaminate. Events without a task id (older
   // daemons) fall back to the one running tab, preserving v0.1.1 behavior.
+  const tabsRef = useRef<SessionTab[]>([]);
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
+
+  // Streaming narrative (protocol v4): TaskDelta chunks arrive per token, so
+  // they are batched into a ~120 ms flush — the feed types out live without
+  // a React update for every single token. Chunks merge into the tab's last
+  // narrative entry; a `replace` chunk starts a fresh one with the new text.
+  const deltaBuffers = useRef<Map<string, { text: string; replace: boolean; timer: number | null }>>(new Map());
+  const flushDelta = (tabId: string) => {
+    const buffered = deltaBuffers.current.get(tabId);
+    if (!buffered) return;
+    deltaBuffers.current.delete(tabId);
+    if (!buffered.text) return;
+    const chunk = buffered.text;
+    const replace = buffered.replace;
+    setTabs((current) => current.map((tab) => {
+      if (tab.id !== tabId) return tab;
+      const last = tab.feed[tab.feed.length - 1];
+      if (!replace && last && last.event === "TaskDelta") {
+        const merged: FeedEntry = {
+          ...last,
+          data: { ...last.data, text: `${String(last.data.text ?? "")}${chunk}` },
+        };
+        return { ...tab, feed: [...tab.feed.slice(0, -1), merged] };
+      }
+      const entry: FeedEntry = {
+        key: `delta-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        event: "TaskDelta",
+        data: { text: chunk },
+        createdAt: Date.now(),
+      };
+      return { ...tab, feed: [...tab.feed, entry] };
+    }));
+  };
+  const queueDelta = (tabId: string, chunk: string, replace: boolean) => {
+    const existing = deltaBuffers.current.get(tabId);
+    if (existing) {
+      existing.text = replace ? chunk : existing.text + chunk;
+      existing.replace = replace;
+      return;
+    }
+    deltaBuffers.current.set(tabId, {
+      text: chunk,
+      replace,
+      timer: window.setTimeout(() => flushDelta(tabId), 120),
+    });
+  };
+  useEffect(() => () => {
+    for (const buffered of deltaBuffers.current.values()) {
+      if (buffered.timer !== null) window.clearTimeout(buffered.timer);
+    }
+    deltaBuffers.current.clear();
+  }, []);
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     listen<CoworkEvent>("cowork-event", ({ payload }) => {
+      // Streaming deltas take the buffered path; everything else flows
+      // through the immutable per-event routing below.
+      if (payload.event === "TaskDelta") {
+        const data = payload.data || {};
+        const chunk = String(data.text ?? "");
+        if (!chunk) return;
+        const tid = identifier(data, "task_id");
+        const current = tabsRef.current;
+        let targetId = "";
+        if (tid) {
+          const owner = current.find((tab) => tab.taskId === tid);
+          if (owner) targetId = owner.id;
+        } else {
+          const running = current.filter((tab) => tab.status === "running");
+          if (running.length === 1) targetId = running[0].id;
+        }
+        if (targetId) queueDelta(targetId, chunk, data.replace === true);
+        return;
+      }
       const entry: FeedEntry = {
         key: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
         event: payload.event,
@@ -630,6 +720,15 @@ function App() {
         createdAt: Date.now(),
       };
       const taskId = identifier(entry.data, "task_id");
+      // A completion flushes any still-buffered narrative first, so the
+      // final text lands above the completion entry in order.
+      if (entry.event === "TaskCompleted") {
+        const current = tabsRef.current;
+        const owner = taskId
+          ? current.find((tab) => tab.taskId === taskId)
+          : current.find((tab) => tab.status === "running");
+        if (owner) flushDelta(owner.id);
+      }
       setTabs((current) => {
         let targetId = "";
         if (taskId) {
@@ -2109,7 +2208,7 @@ function iconForArtifact(path: string) {
 
 function FeedCard({ entry, handled, plain, projectName, onAnswer }: { entry: FeedEntry; handled: Record<string, boolean>; plain?: boolean; projectName?: string; onAnswer: (id: string | number, approved: boolean, remember?: "global" | "project") => void }) {
   const [expanded, setExpanded] = useState(true);
-  const label = entry.event === "AgentSpawned" ? "Agent joined" : entry.event === "ToolInvoked" ? (plain ? "Working" : "Tool activity") : entry.event === "ArtifactCreated" ? "Artifact created" : entry.event === "ApprovalRequired" ? "Permission requested" : "Task finished";
+  const label = entry.event === "AgentSpawned" ? "Agent joined" : entry.event === "TaskDelta" ? (plain ? "Narrating" : "Live narrative") : entry.event === "ToolInvoked" ? (plain ? "Working" : "Tool activity") : entry.event === "ArtifactCreated" ? "Artifact created" : entry.event === "ApprovalRequired" ? "Permission requested" : "Task finished";
   const approvalId = entry.data.id;
   const approvalKey = identifier(entry.data, "id");
   const approvalHandled = approvalKey in handled;
@@ -2124,11 +2223,12 @@ function FeedCard({ entry, handled, plain, projectName, onAnswer }: { entry: Fee
 
   return (
     <article className={`feed-entry ${entry.event.toLowerCase()}`}>
-      <div className="timeline-rail"><span className={`event-symbol ${entry.event.toLowerCase()}`}>{entry.event === "AgentSpawned" ? <Sparkles size={14} /> : entry.event === "ToolInvoked" ? <ChevronRight size={14} /> : entry.event === "ArtifactCreated" ? <FileText size={14} /> : entry.event === "ApprovalRequired" ? <ShieldCheck size={14} /> : <Check size={14} />}</span><span className="rail-line" /></div>
+      <div className="timeline-rail"><span className={`event-symbol ${entry.event.toLowerCase()}`}>{entry.event === "AgentSpawned" ? <Sparkles size={14} /> : entry.event === "TaskDelta" ? <Pencil size={14} /> : entry.event === "ToolInvoked" ? <ChevronRight size={14} /> : entry.event === "ArtifactCreated" ? <FileText size={14} /> : entry.event === "ApprovalRequired" ? <ShieldCheck size={14} /> : <Check size={14} />}</span><span className="rail-line" /></div>
       <div className="event-body">
-        <button className="event-title-row" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><div><span className="event-label">{label}</span><strong>{entry.event === "AgentSpawned" ? agentName : entry.event === "ToolInvoked" ? displayTool : entry.event === "ArtifactCreated" ? folderName(artifactPath || "New file") : entry.event === "ApprovalRequired" ? (rawTool ? displayTool : "Action needs your approval") : "This task is complete"}</strong></div><span className="event-time"><Clock3 size={12} /> {new Date(entry.createdAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span></button>
+        <button className="event-title-row" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><div><span className="event-label">{label}</span><strong>{entry.event === "AgentSpawned" ? agentName : entry.event === "TaskDelta" ? agentName : entry.event === "ToolInvoked" ? displayTool : entry.event === "ArtifactCreated" ? folderName(artifactPath || "New file") : entry.event === "ApprovalRequired" ? (rawTool ? displayTool : "Action needs your approval") : "This task is complete"}</strong></div><span className="event-time"><Clock3 size={12} /> {new Date(entry.createdAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span></button>
         {expanded && <div className="event-detail">
-          {entry.event === "ApprovalRequired" ? <div className={`approval-card ${approvalHandled ? "answered" : ""}`}><div className="approval-copy"><span className="approval-eyebrow"><ShieldCheck size={13} /> {plain ? "PERMISSION NEEDED" : "YOUR DECISION"}</span><p>{description || (plain ? `Cworkspace wants to ${rawTool ? toolPhrase(rawTool).toLowerCase() : "continue with this action"}. Allow it?` : "An agent is requesting permission to continue with this action.")}</p>{rawTool && <code>{displayTool}</code>}</div>{approvalHandled ? <div className="approval-result"><Check size={14} /> {handled[approvalKey] ? "Allowed" : "Rejected"}</div> : <div className="approval-actions-wrap"><div className="approval-actions"><button className="reject-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, false)}><X size={14} /> {plain ? "No thanks" : "Reject"}</button><button className="allow-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, true)}><Check size={14} /> Allow</button></div><div className="approval-remember"><button type="button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, true, projectName ? "project" : "global")}><Check size={12} /> Always allow</button><button type="button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, false, projectName ? "project" : "global")}><X size={12} /> Always block</button><small>for {projectName ? `“${projectName}”` : "everywhere"}</small></div></div>}</div>
+          {entry.event === "TaskDelta" ? <p className="narrative-text">{String(entry.data.text ?? "")}</p>
+          : entry.event === "ApprovalRequired" ? <div className={`approval-card ${approvalHandled ? "answered" : ""}`}><div className="approval-copy"><span className="approval-eyebrow"><ShieldCheck size={13} /> {plain ? "PERMISSION NEEDED" : "YOUR DECISION"}</span><p>{description || (plain ? `Cworkspace wants to ${rawTool ? toolPhrase(rawTool).toLowerCase() : "continue with this action"}. Allow it?` : "An agent is requesting permission to continue with this action.")}</p>{rawTool && <code>{displayTool}</code>}</div>{approvalHandled ? <div className="approval-result"><Check size={14} /> {handled[approvalKey] ? "Allowed" : "Rejected"}</div> : <div className="approval-actions-wrap"><div className="approval-actions"><button className="reject-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, false)}><X size={14} /> {plain ? "No thanks" : "Reject"}</button><button className="allow-button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, true)}><Check size={14} /> Allow</button></div><div className="approval-remember"><button type="button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, true, projectName ? "project" : "global")}><Check size={12} /> Always allow</button><button type="button" disabled={!approvalReady} onClick={() => approvalReady && onAnswer(approvalId, false, projectName ? "project" : "global")}><X size={12} /> Always block</button><small>for {projectName ? `“${projectName}”` : "everywhere"}</small></div></div>}</div>
           : entry.event === "ArtifactCreated" ? <p className="event-description">{artifactPath || description || "A new deliverable is ready to preview."}</p>
           : <p className="event-description">{description || (entry.event === "AgentSpawned" ? "Preparing a focused workstream." : entry.event === "ToolInvoked" ? "Working through the requested step." : "The requested work has finished.")}</p>}
         </div>}

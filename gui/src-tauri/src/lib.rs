@@ -22,11 +22,12 @@ const PIPE_NAME: &str = r"\\.\pipe\jcode-cowork";
 /// clients, and every RPC request must carry it or the daemon rejects the
 /// call as unauthorized.
 const TOKEN_FILE_NAME: &str = "jcode-cowork-ipc.token";
-const KNOWN_EVENTS: [&str; 5] = [
+const KNOWN_EVENTS: [&str; 6] = [
     "AgentSpawned",
     "ToolInvoked",
     "ArtifactCreated",
     "ApprovalRequired",
+    "TaskDelta",
     "TaskCompleted",
 ];
 

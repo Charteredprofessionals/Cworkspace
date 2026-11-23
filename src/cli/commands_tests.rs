@@ -1803,3 +1803,42 @@ async fn one_shot_cleanup_preserves_the_original_command_error() {
         ));
     }
 }
+
+#[tokio::test]
+async fn forward_task_deltas_streams_chunks_and_resolves_replacements() {
+    use crate::cli::cowork_rpc::CoworkEvent;
+    use crate::protocol::ServerEvent;
+
+    let rpc = crate::cli::cowork_rpc::CoworkRpc::new();
+    let mut events = rpc.subscribe();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let forwarder = tokio::spawn(forward_task_deltas(rx, rpc.clone(), "task-d".to_owned()));
+
+    tx.send(ServerEvent::TextDelta { text: "Hel".to_owned() }).unwrap();
+    tx.send(ServerEvent::TextDelta { text: "lo".to_owned() }).unwrap();
+    tx.send(ServerEvent::TextReplace { text: "Hello there".to_owned() }).unwrap();
+    tx.send(ServerEvent::TextSuffixReplace {
+        old_text: "there".to_owned(),
+        new_text: "world".to_owned(),
+    })
+    .unwrap();
+    drop(tx);
+
+    // The accumulated text is what run_once_capture would have returned as
+    // the task's final summary.
+    assert_eq!(forwarder.await.unwrap(), "Hello world");
+
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        match events.recv().await.unwrap() {
+            CoworkEvent::TaskDelta { task_id, text, replace } => {
+                seen.push((task_id, text, replace));
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+    assert_eq!(seen[0], ("task-d".to_owned(), "Hel".to_owned(), false));
+    assert_eq!(seen[1], ("task-d".to_owned(), "lo".to_owned(), false));
+    assert_eq!(seen[2], ("task-d".to_owned(), "Hello there".to_owned(), true));
+    assert_eq!(seen[3], ("task-d".to_owned(), "Hello world".to_owned(), true));
+}

@@ -123,6 +123,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #728772; outli
 .event-symbol { width: 23px; height: 23px; display: grid; place-items: center; border: 1px solid #dedfd5; border-radius: 50%; background: #f4f3ed; color: var(--moss); z-index: 1; }
 .event-symbol.approvalrequired { color: #b3744b; background: #fcf1e8; border-color: #ead3bf; }
 .event-symbol.artifactcreated { color: #64745a; background: #edf1e5; }
+.event-symbol.taskdelta { color: #7a6a9a; background: #efebf6; }
 .event-symbol.taskcompleted { color: #526b54; background: #e7eee2; }
 .rail-line { width: 1px; background: #dedfd5; flex: 1; margin: 3px 0 -4px; }
 .event-body { padding: 1px 0 17px; min-width: 0; }
@@ -133,6 +134,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #728772; outli
 .event-time { display: flex; gap: 5px; align-items: center; color: #a2a398; font-size: 9px; white-space: nowrap; }
 .event-detail { padding-top: 8px; }
 .event-description { margin: 0; color: #787a70; font-size: 10px; line-height: 1.6; overflow-wrap: anywhere; }
+.narrative-text { margin: 0; color: #55584f; font-size: 11px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 .approval-card { border: 1px solid #ead7c4; border-radius: 5px; background: #fffaf3; padding: 12px; }
 .approval-copy { color: #5d5146; }
 .approval-eyebrow { display: flex; gap: 5px; align-items: center; color: #a76c43; font-size: 8px; font-weight: 750; letter-spacing: .07em; }

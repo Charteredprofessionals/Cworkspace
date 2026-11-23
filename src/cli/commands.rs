@@ -2742,11 +2742,75 @@ pub async fn run_cowork_task(
 
     rpc.emit_event(crate::cli::cowork_rpc::CoworkEvent::AgentSpawned {
         agent_id: session_id,
-        task_id,
+        task_id: task_id.clone(),
     })?;
-    let result = agent.run_once_capture(&goal).await;
+    // Protocol v4: run the turn on the engine's streaming path and forward
+    // assistant text as CoworkEvent::TaskDelta, so the GUI feed types out
+    // live instead of waiting for TaskCompleted. The forwarder accumulates
+    // the same text run_once_capture would have returned, and that becomes
+    // the task's final summary.
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let forward_rpc = rpc.clone();
+    let forwarder = tokio::spawn(forward_task_deltas(event_rx, forward_rpc, task_id.clone()));
+    let result = agent
+        .run_once_streaming_mpsc(&goal, Vec::new(), None, event_tx)
+        .await;
+    let summary = forwarder.await.unwrap_or_default();
     agent.mark_closed();
-    result
+    result.map(|()| summary)
+}
+
+/// Consume the engine's streaming events for one task turn, re-emitting
+/// assistant text as `CoworkEvent::TaskDelta` and returning the accumulated
+/// final text (what `run_once_capture` would have returned as the summary).
+///
+/// Replace semantics from the engine are folded into full-replacement
+/// deltas: `TextReplace` swaps the accumulated text wholesale, and
+/// `TextSuffixReplace` corrects a trailing `old_text` match before the
+/// replacement is appended. Both are sent to clients with `replace: true`,
+/// which keeps the append-only GUI model correct.
+pub(crate) async fn forward_task_deltas(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::protocol::ServerEvent>,
+    rpc: crate::cli::cowork_rpc::CoworkRpc,
+    task_id: String,
+) -> String {
+    use crate::protocol::ServerEvent;
+
+    let mut accumulated = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            ServerEvent::TextDelta { text } => {
+                accumulated.push_str(&text);
+                let _ = rpc.emit_event(crate::cli::cowork_rpc::CoworkEvent::TaskDelta {
+                    task_id: task_id.clone(),
+                    text,
+                    replace: false,
+                });
+            }
+            ServerEvent::TextReplace { text } => {
+                accumulated = text.clone();
+                let _ = rpc.emit_event(crate::cli::cowork_rpc::CoworkEvent::TaskDelta {
+                    task_id: task_id.clone(),
+                    text,
+                    replace: true,
+                });
+            }
+            ServerEvent::TextSuffixReplace { old_text, new_text } => {
+                if accumulated.ends_with(&old_text) {
+                    let keep = accumulated.len() - old_text.len();
+                    accumulated.truncate(keep);
+                }
+                accumulated.push_str(&new_text);
+                let _ = rpc.emit_event(crate::cli::cowork_rpc::CoworkEvent::TaskDelta {
+                    task_id: task_id.clone(),
+                    text: accumulated.clone(),
+                    replace: true,
+                });
+            }
+            _ => {}
+        }
+    }
+    accumulated
 }
 
 /// Provider id for `jcode run --json`/`--ndjson` output.
