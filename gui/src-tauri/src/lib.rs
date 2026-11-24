@@ -565,9 +565,15 @@ fn tray_task_watcher(app: AppHandle, tray: TrayIcon<Wry>) {
                                             .get("task_id")
                                             .and_then(Value::as_str)?
                                             .to_owned();
+                                        // A user-set title names the task better
+                                        // than the raw launch goal.
                                         let goal = truncate_task_label(
-                                            task.get("goal")
+                                            task.get("title")
                                                 .and_then(Value::as_str)
+                                                .filter(|title| !title.is_empty())
+                                                .or_else(|| {
+                                                    task.get("goal").and_then(Value::as_str)
+                                                })
                                                 .unwrap_or("Running task"),
                                         );
                                         Some((id, goal))
@@ -1038,6 +1044,44 @@ async fn task_list(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, S
 }
 
 #[tauri::command]
+async fn set_task_title(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    task_id: String,
+    title: String,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("task.set_title", json!({ "task_id": task_id, "title": title }))
+    })
+}
+
+#[tauri::command]
+async fn audit_query(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    kind: Option<String>,
+    limit: Option<u32>,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        let mut params = json!({ "limit": limit.unwrap_or(200) });
+        if let Some(project_id) = project_id {
+            params["project_id"] = json!(project_id);
+        }
+        if let Some(task_id) = task_id {
+            params["task_id"] = json!(task_id);
+        }
+        if let Some(kind) = kind {
+            params["kind"] = json!(kind);
+        }
+        connection.request("audit.query", params)
+    })
+}
+
+#[tauri::command]
 async fn tools_list(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, String> {
     tokio::task::block_in_place(|| {
         let connection = ensure_connection(&app, &bridge)?;
@@ -1397,6 +1441,8 @@ pub fn run() {
             settings_update,
             task_transcript,
             task_list,
+            set_task_title,
+            audit_query,
             task_followup,
             tools_list,
             permission_list,

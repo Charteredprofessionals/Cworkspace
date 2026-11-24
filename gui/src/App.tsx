@@ -26,6 +26,7 @@ import {
   Pencil,
   Play,
   Plus,
+  ScrollText,
   Settings,
   ShieldCheck,
   Sparkles,
@@ -464,6 +465,7 @@ function App() {
   const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [scheduleEntries, setScheduleEntries] = useState<ScheduleEntryInfo[]>([]);
   const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
+  const [auditOpen, setAuditOpen] = useState(false);
   const [transcriptView, setTranscriptView] = useState<TranscriptView | null>(null);
   const [protocolWarning, setProtocolWarning] = useState("");
   const [reattachNotice, setReattachNotice] = useState("");
@@ -538,13 +540,13 @@ function App() {
         // list, then seed each new tab's feed from the persisted
         // transcript so it shows where the work actually stands.
         try {
-          const listed = await invoke<{ task_id: string; running: boolean; goal?: string | null }[]>("task_list");
+          const listed = await invoke<{ task_id: string; running: boolean; goal?: string | null; title?: string | null }[]>("task_list");
           let firstReplayed = true;
           for (const task of listed) {
             if (cancelled) break;
             if (!task.running) continue;
             if (tabsRef.current.some((tab) => tab.taskId === task.task_id)) continue;
-            await replayRunningTask(task.task_id, task.goal || "", firstReplayed);
+            await replayRunningTask(task.task_id, task.title || task.goal || "", firstReplayed);
             firstReplayed = false;
           }
         } catch {
@@ -658,6 +660,16 @@ function App() {
   // (task_id), so each event lands in the tab that owns the task — parallel
   // sessions never cross-contaminate. Events without a task id (older
   // daemons) fall back to the one running tab, preserving v0.1.1 behavior.
+  // Persist a tab rename to the daemon: the tray menu and feed replay
+  // prefer the user's title over the raw launch goal.
+  function renameTab(tabId: string, value: string) {
+    patchTab(tabId, { title: value });
+    const tab = tabsRef.current.find((entry) => entry.id === tabId);
+    if (tab?.taskId && value.trim()) {
+      invoke("set_task_title", { taskId: tab.taskId, title: value.trim() }).catch(() => undefined);
+    }
+  }
+
   const tabsRef = useRef<SessionTab[]>([]);
   useEffect(() => {
     tabsRef.current = tabs;
@@ -1305,6 +1317,15 @@ function App() {
           </div>
         </section>
 
+        <section className="sidebar-section audit-section">
+          <div className="section-heading"><span>AUDIT</span><ScrollText size={14} /></div>
+          <button className="audit-open" onClick={() => setAuditOpen(true)}>
+            <ShieldCheck size={14} />
+            <span className="audit-open-copy"><strong>Approval ledger</strong><small>Every allow, deny, and rule change</small></span>
+            <ChevronRight size={14} />
+          </button>
+        </section>
+
         <div className="sidebar-footer">
           <div className="avatar">J</div>
           <div><strong>Local workspace</strong><span>Private by default</span></div>
@@ -1334,9 +1355,9 @@ function App() {
                     aria-label="Tab title"
                     onChange={(event) => setEditingTitle({ tabId: tab.id, value: event.target.value })}
                     onClick={(event) => event.stopPropagation()}
-                    onBlur={() => { patchTab(tab.id, { title: editingTitle.value.trim() || tab.title }); setEditingTitle(null); }}
+                    onBlur={() => { renameTab(tab.id, editingTitle.value.trim() || tab.title); setEditingTitle(null); }}
                     onKeyDown={(event) => {
-                      if (event.key === "Enter") { patchTab(tab.id, { title: editingTitle.value.trim() || tab.title }); setEditingTitle(null); }
+                      if (event.key === "Enter") { renameTab(tab.id, editingTitle.value.trim() || tab.title); setEditingTitle(null); }
                       if (event.key === "Escape") setEditingTitle(null);
                     }}
                   />
@@ -1466,6 +1487,7 @@ function App() {
       />}
 
       {transcriptView && <TranscriptDialog view={transcriptView} onClose={() => setTranscriptView(null)} />}
+      {auditOpen && <AuditDialog onClose={() => setAuditOpen(false)} />}
 
       {!settings.hasOnboarded && <OnboardingDialog settings={settings} onChange={updateSetting} onDone={() => {}} />}
     </main>
@@ -2167,6 +2189,97 @@ function UsageSection() {
 
 /// Schedule a project-scoped task for later; the daemon fires it via its
 /// 30-second scheduler loop with the project's mounts and instructions.
+type AuditEntryRow = {
+  id: string;
+  ts: number;
+  kind: string;
+  tool?: string | null;
+  task_id?: string | null;
+  project_name?: string | null;
+  detail?: string | null;
+};
+
+const AUDIT_KINDS: { value: string; label: string }[] = [
+  { value: "all", label: "All events" },
+  { value: "user_allow", label: "Allowed by you" },
+  { value: "user_deny", label: "Rejected by you" },
+  { value: "rule_allow", label: "Allowed by rule" },
+  { value: "rule_deny", label: "Blocked by rule" },
+  { value: "policy_allow", label: "Auto-allowed (read-only)" },
+  { value: "pending_expired", label: "Timed out" },
+  { value: "blocked_no_client", label: "Blocked (no approval surface)" },
+  { value: "policy_changed", label: "Policy changed" },
+  { value: "rule_added", label: "Rule stored" },
+  { value: "rule_removed", label: "Rule removed" },
+  { value: "project_created", label: "Project created" },
+  { value: "project_deleted", label: "Project deleted" },
+  { value: "mount_added", label: "Folder mounted" },
+  { value: "mount_revoked", label: "Mount revoked" },
+];
+
+function auditBadgeClass(kind: string) {
+  if (kind.endsWith("_allow") && kind !== "policy_allow") return "allow";
+  if (kind.endsWith("_deny") || kind === "blocked_no_client") return "deny";
+  return "change";
+}
+
+function AuditDialog({ onClose }: { onClose: () => void }) {
+  const [entries, setEntries] = useState<AuditEntryRow[] | null>(null);
+  const [error, setError] = useState("");
+  const [kindFilter, setKindFilter] = useState("all");
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      invoke<{ entries?: AuditEntryRow[] }>("audit_query", {
+        projectId: null,
+        taskId: null,
+        kind: kindFilter === "all" ? null : kindFilter,
+        limit: 200,
+      })
+        .then((result) => { if (!cancelled) { setEntries(Array.isArray(result?.entries) ? result.entries : []); setError(""); } })
+        .catch((reason) => { if (!cancelled) setError(errorMessage(reason)); });
+    };
+    load();
+    const timer = setInterval(load, 15000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [kindFilter]);
+
+  return (
+    <div className="settings-overlay" onClick={onClose} role="presentation">
+      <div className="settings-dialog audit-dialog" role="dialog" aria-modal="true" aria-label="Approval ledger" onClick={(event) => event.stopPropagation()}>
+        <header className="settings-header">
+          <div><span className="feed-kicker">AUDIT</span><h2>Approval ledger</h2></div>
+          <select className="audit-filter" value={kindFilter} onChange={(event) => setKindFilter(event.target.value)} aria-label="Filter events">
+            {AUDIT_KINDS.map((kind) => <option key={kind.value} value={kind.value}>{kind.label}</option>)}
+          </select>
+          <button className="icon-button" aria-label="Close audit ledger" onClick={onClose}><X size={17} /></button>
+        </header>
+        <div className="audit-body">
+          {error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{error}</span></div>}
+          {!error && entries === null && <div className="preview-message"><LoaderCircle className="spin" size={19} /><span>Loading ledger…</span></div>}
+          {entries !== null && !entries.length && <p className="sidebar-empty">Nothing recorded yet. Approvals, rule changes, and project events land here as they happen.</p>}
+          {entries !== null && entries.length > 0 && (
+            <ul className="audit-list">
+              {entries.map((entry) => (
+                <li className={`audit-entry ${auditBadgeClass(entry.kind)}`} key={entry.id}>
+                  <span className="audit-when">{new Date(entry.ts * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}</span>
+                  <span className="audit-badge">{AUDIT_KINDS.find((kind) => kind.value === entry.kind)?.label || entry.kind}</span>
+                  <span className="audit-copy">
+                    {entry.tool && <code>{entry.tool}</code>}
+                    {entry.project_name && <small>in “{entry.project_name}”</small>}
+                    {entry.detail && <small>{entry.detail}</small>}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ScheduleDialog({ projectId, projectName, defaultModel, onClose, onSchedule }: {
   projectId: string;
   projectName: string;

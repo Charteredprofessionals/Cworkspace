@@ -27,6 +27,12 @@ Daemon-side enforcement is identical either way — the desktop talks to the sam
 | Windows computer use | `computer_use` tool available in tasks (approval-gated) |
 | Multi-task | Tabs, one task per tab, `task_id`-routed events |
 | Project history | Task-count badges, project edit/delete, per-project default model |
+| Streaming answers (protocol v4) | Feed types out live (`TaskDelta`), v0.1.8 |
+| Mount health states | Available / moved / disconnected badges with re-find by (dev, ino), v0.1.9 |
+| Dynamic tray menu | Running tasks by name, per-task focus/stop, 20 s rebuild, v0.1.9 |
+| Feed replay on reattach | New tab reseeds from the persisted transcript, v0.1.9 |
+| Audit ledger | Every gate decision, rule/policy change, and project/mount event recorded; AUDIT sidebar → Approval ledger (`audit.query`), v0.1.10 |
+| Per-task display titles | Double-click a tab title; daemon persists it (`task.set_title`), tray + replay prefer it, v0.1.10 |
 
 ## CLI-assisted (by design)
 
@@ -44,10 +50,11 @@ Daemon-side enforcement is identical either way — the desktop talks to the sam
 
 ## Not yet bridged (backlog)
 
-- Streaming token deltas into the feed (protocol v4 candidate — events exist on the sibling harness API).
-- Session resume/fork/rewind of a finished desktop task (today: restore goal + artifacts, start fresh).
+- Session fork/rewind of a finished desktop task (follow-up turns resume the session via `task.followup`; forking to a new tab and rewinding to an earlier turn are pending).
 - Ambient runner parity (the desktop scheduler is a separate project-scoped store, not the TUI ambient queue).
-- Mount health states (available / moved / disconnected indicators).
+- Split-pane / parent-child workstreams.
+- Connectors/OAuth (browser/app scopes) + browser/computer-use escalation UI.
+- Members/sharing.
 - macOS/Linux desktop builds (daemon already serves WebSocket IPC on non-Windows).
 
 ## Security model (unchanged)

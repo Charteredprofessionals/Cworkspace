@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use crate::cli::cowork_schedule::{now_unix_secs, ScheduleStore};
 use crate::cli::cowork_projects::MountAccess;
+use crate::cli::cowork_audit::AuditEventKind as Audit;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -378,6 +379,9 @@ pub struct TaskContext {
     /// replay) can name running tasks without having seen the launch
     /// event — the GUI often (re)connects after a task already started.
     pub goal: String,
+    /// User-chosen display name (double-click a tab title to set). When
+    /// present, the tray menu and feed replay prefer it over the goal.
+    pub title: Option<String>,
 }
 
 /// A pending approval and what it was for, so "remember this choice" can
@@ -398,6 +402,8 @@ pub struct TaskSummary {
     /// Recorded launch goal, when one is on file. The tray menu and feed
     /// replay render this instead of a bare task id.
     pub goal: Option<String>,
+    /// User-set display title, when one was chosen for this task.
+    pub title: Option<String>,
 }
 
 impl CoworkRpc {
@@ -446,12 +452,22 @@ impl CoworkRpc {
     }
 
     pub async fn set_approval_policy(&self, policy: ApprovalPolicy) -> Result<()> {
+        let previous = self.approval_policy();
         save_policy(policy)?;
         *self
             .inner
             .approval_policy
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+        if previous != policy {
+            self.record_audit(
+                Audit::PolicyChanged,
+                None,
+                None,
+                None,
+                Some(format!("{} → {}", previous.as_str(), policy.as_str())),
+            );
+        }
         Ok(())
     }
 
@@ -462,6 +478,30 @@ impl CoworkRpc {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Append an audit entry, resolving the project's display name first so
+    /// entries stay readable after the project is deleted. Best-effort: a
+    /// ledger failure is logged and swallowed, never surfaced to callers.
+    fn record_audit(
+        &self,
+        kind: Audit,
+        tool: Option<&str>,
+        task_id: Option<&str>,
+        project_id: Option<&str>,
+        detail: Option<String>,
+    ) {
+        let project_name = project_id
+            .and_then(|id| self.project_store().get(id).ok())
+            .map(|project| project.name);
+        crate::cli::cowork_audit::record(
+            kind,
+            tool,
+            task_id,
+            project_id,
+            project_name.as_deref(),
+            detail,
+        );
     }
 
     /// Store (or replace) the rule for a tool in a scope. One rule per
@@ -490,11 +530,25 @@ impl CoworkRpc {
         rules.retain(|existing| !(existing.tool == rule.tool && existing.scope == rule.scope));
         rules.push(rule.clone());
         save_permission_rules(&rules)?;
+        self.record_audit(
+            Audit::RuleAdded,
+            Some(&rule.tool),
+            None,
+            match &rule.scope {
+                RuleScope::Project { project_id } => Some(project_id.as_str()),
+                RuleScope::Global => None,
+            },
+            Some(match rule.decision {
+                RuleDecision::Allow => format!("always allow {} (rule {})", rule.tool, rule.id),
+                RuleDecision::Deny => format!("always block {} (rule {})", rule.tool, rule.id),
+            }),
+        );
         Ok(rule)
     }
 
     /// Remove a rule by id; reports whether it existed.
     fn remove_rule(&self, id: &str) -> bool {
+        let captured;
         let removed;
         {
             let mut rules = self
@@ -502,6 +556,7 @@ impl CoworkRpc {
                 .permission_rules
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            captured = rules.iter().find(|rule| rule.id == id).cloned();
             let before = rules.len();
             rules.retain(|rule| rule.id != id);
             removed = rules.len() != before;
@@ -510,6 +565,18 @@ impl CoworkRpc {
             let rules = self.permission_rules();
             if let Err(error) = save_permission_rules(&rules) {
                 tracing::warn!("could not persist permission rules: {error}");
+            }
+            if let Some(rule) = captured {
+                self.record_audit(
+                    Audit::RuleRemoved,
+                    Some(&rule.tool),
+                    None,
+                    match &rule.scope {
+                        RuleScope::Project { project_id } => Some(project_id.as_str()),
+                        RuleScope::Global => None,
+                    },
+                    Some(format!("removed rule {}", rule.id)),
+                );
             }
         }
         removed
@@ -521,13 +588,13 @@ impl CoworkRpc {
         &self,
         tool: &str,
         project_id: Option<&str>,
-    ) -> Option<RuleDecision> {
+    ) -> Option<PermissionRule> {
         let rules = self
             .inner
             .permission_rules
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut best: Option<(u8, u64, RuleDecision)> = None;
+        let mut best: Option<(u8, u64, PermissionRule)> = None;
         for rule in rules.iter().filter(|rule| rule.tool == tool) {
             let (specificity, matches) = match &rule.scope {
                 RuleScope::Global => (0u8, true),
@@ -538,14 +605,17 @@ impl CoworkRpc {
             if !matches {
                 continue;
             }
-            let replaces = best.is_none_or(|(best_spec, best_at, _)| {
-                specificity > best_spec || (specificity == best_spec && rule.created_at >= best_at)
-            });
+            let replaces = best
+                .as_ref()
+                .is_none_or(|(best_spec, best_at, _)| {
+                    specificity > *best_spec
+                        || (specificity == *best_spec && rule.created_at >= *best_at)
+                });
             if replaces {
-                best = Some((specificity, rule.created_at, rule.decision));
+                best = Some((specificity, rule.created_at, rule.clone()));
             }
         }
-        best.map(|(_, _, decision)| decision)
+        best.map(|(_, _, rule)| rule)
     }
 
     /// Live model routes for the GUI. Bootstraps one provider per daemon
@@ -779,6 +849,7 @@ where
         project_id: launch.project_id.clone(),
         model: launch.model.clone(),
         goal: launch.goal.clone(),
+        title: None,
     };
     let work = run(
         launch.goal,
@@ -844,6 +915,30 @@ pub async fn task_is_running(&self, task_id: &str) -> bool {
     self.inner.tasks.lock().await.contains_key(task_id)
 }
 
+/// Record a user-chosen display name for a task (double-click a tab title
+/// in the GUI). The tray menu and feed replay prefer it over the raw goal.
+/// Titles are trimmed, capped at 200 chars, and only stick to tasks the
+/// daemon has a recorded launch context for.
+pub async fn set_task_title(&self, task_id: &str, title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let truncated: String = trimmed.chars().take(200).collect();
+    let mut contexts = self.inner.task_contexts.lock().await;
+    let matched = contexts
+        .iter_mut()
+        .rev()
+        .find(|(existing, _)| existing == task_id);
+    match matched {
+        Some((_, context)) => {
+            context.title = Some(truncated);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Task ids currently registered and whether their work is still running,
 /// with recorded goals where known.
 pub async fn list_tasks(&self) -> Vec<TaskSummary> {
@@ -858,16 +953,19 @@ pub async fn list_tasks(&self) -> Vec<TaskSummary> {
     let contexts = self.inner.task_contexts.lock().await;
     ids.into_iter()
         .map(|task_id| {
-            let goal = contexts
+            let recorded = contexts
                 .iter()
                 .rev()
-                .find(|(existing, _)| *existing == task_id)
+                .find(|(existing, _)| *existing == task_id);
+            let goal = recorded
                 .map(|(_, context)| context.goal.clone())
                 .filter(|goal| !goal.is_empty());
+            let title = recorded.and_then(|(_, context)| context.title.clone());
             TaskSummary {
                 task_id,
                 running: true,
                 goal,
+                title,
             }
         })
         .collect()
@@ -1089,9 +1187,27 @@ pub async fn list_tasks(&self) -> Vec<TaskSummary> {
             .await
             .and_then(|context| context.project_id);
         match self.evaluate_permission_rules(&tool_name, project_id.as_deref()) {
-            Some(RuleDecision::Allow) => return Ok(true),
-            Some(RuleDecision::Deny) => return Ok(false),
-            None => {}
+            Some(rule) if rule.decision == RuleDecision::Allow => {
+                self.record_audit(
+                    Audit::RuleAllow,
+                    Some(&tool_name),
+                    Some(&task_id),
+                    project_id.as_deref(),
+                    Some(format!("stored rule {}", rule.id)),
+                );
+                return Ok(true);
+            }
+            Some(rule) if rule.decision == RuleDecision::Deny => {
+                self.record_audit(
+                    Audit::RuleDeny,
+                    Some(&tool_name),
+                    Some(&task_id),
+                    project_id.as_deref(),
+                    Some(format!("stored rule {}", rule.id)),
+                );
+                return Ok(false);
+            }
+            _ => {}
         }
         // Auto-allow read-only mode: reads run without prompting so long
         // research tasks do not queue a decision per file. Writes, shell
@@ -1099,15 +1215,33 @@ pub async fn list_tasks(&self) -> Vec<TaskSummary> {
         if self.approval_policy() == ApprovalPolicy::AutoAllowReadonly
             && READ_ONLY_TOOLS.contains(&tool_name.as_str())
         {
+            self.record_audit(
+                Audit::PolicyAllow,
+                Some(&tool_name),
+                Some(&task_id),
+                project_id.as_deref(),
+                Some("read-only policy auto-allow".to_string()),
+            );
             return Ok(true);
         }
         if self.inner.events.receiver_count() == 0 {
+            self.record_audit(
+                Audit::BlockedNoClient,
+                Some(&tool_name),
+                Some(&task_id),
+                project_id.as_deref(),
+                Some("no approval surface connected".to_string()),
+            );
             return Err(anyhow!(
                 "no Cowork IPC client is connected to approve this action"
             ));
         }
 
         let id = id.into();
+        // The event below moves the tool and task names; the expiry path
+        // still needs them for the ledger.
+        let tool_for_audit = tool_name.clone();
+        let task_for_audit = task_id.clone();
         let (sender, receiver) = oneshot::channel();
         {
             let mut approvals = self.inner.approvals.lock().await;
@@ -1139,18 +1273,53 @@ pub async fn list_tasks(&self) -> Vec<TaskSummary> {
             ));
         }
 
-        receiver
-            .await
-            .context("Cowork IPC client disconnected before approving or rejecting")
+        match receiver.await {
+            Ok(decided) => Ok(decided),
+            Err(_) => {
+                self.record_audit(
+                    Audit::PendingExpired,
+                    Some(&tool_for_audit),
+                    Some(&task_for_audit),
+                    project_id.as_deref(),
+                    Some("approval surface disconnected before a decision".to_string()),
+                );
+                Err(anyhow!(
+                    "Cowork IPC client disconnected before approving or rejecting"
+                ))
+            }
+        }
     }
 
     pub async fn approve_tool_call(&self, id: &str, approved: bool) -> bool {
-        self.inner
+        // Look up what the approval was for BEFORE removing the entry.
+        let info = self.pending_approval_info(id).await;
+        let decided = self
+            .inner
             .approvals
             .lock()
             .await
             .remove(id)
-            .is_some_and(|pending| pending.sender.send(approved).is_ok())
+            .is_some_and(|pending| pending.sender.send(approved).is_ok());
+        if decided {
+            if let Some((tool, task_id)) = info {
+                let project_id = self
+                    .task_context(&task_id)
+                    .await
+                    .and_then(|context| context.project_id);
+                self.record_audit(
+                    if approved {
+                        Audit::UserAllow
+                    } else {
+                        Audit::UserDeny
+                    },
+                    Some(&tool),
+                    Some(&task_id),
+                    project_id.as_deref(),
+                    None,
+                );
+            }
+        }
+        decided
     }
 
     /// The tool and task a pending approval belongs to (looked up BEFORE the
@@ -1942,7 +2111,16 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                                 .and_then(Value::as_str)
                                 .unwrap_or(""),
                         )
-                        .map(|project| json!({ "project": project.view_json() }))
+                        .map(|project| {
+                            rpc.record_audit(
+                                Audit::ProjectCreated,
+                                None,
+                                None,
+                                Some(&project.id),
+                                Some(format!("created project \"{}\"", project.name)),
+                            );
+                            json!({ "project": project.view_json() })
+                        })
                         .map_err(|error| (-32000, error.to_string()))
                 }
                 None => Err((-32602, "params require string name".to_string())),
@@ -2023,11 +2201,31 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
         "project.delete" => {
             let project_id = request.params.get("project_id").and_then(Value::as_str);
             match project_id {
-                Some(project_id) => rpc
-                    .project_store()
-                    .delete(project_id)
-                    .map(|deleted| json!({ "deleted": deleted }))
-                    .map_err(|error| (-32000, error.to_string())),
+                Some(project_id) => {
+                    // Resolve the display name BEFORE deletion: after the
+                    // store drops the project, lookups no longer find it.
+                    let name = rpc
+                        .project_store()
+                        .get(project_id)
+                        .ok()
+                        .map(|project| project.name);
+                    rpc.project_store()
+                        .delete(project_id)
+                        .map(|deleted| {
+                            if deleted {
+                                crate::cli::cowork_audit::record(
+                                    Audit::ProjectDeleted,
+                                    None,
+                                    None,
+                                    Some(project_id),
+                                    name.as_deref(),
+                                    None,
+                                );
+                            }
+                            json!({ "deleted": deleted })
+                        })
+                        .map_err(|error| (-32000, error.to_string()))
+                }
                 None => Err((-32602, "params require string project_id".to_string())),
             }
         }
@@ -2050,6 +2248,13 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                     let store_path = rpc.project_store().store_path().to_owned();
                     let project_id = project_id.to_owned();
                     let path = PathBuf::from(path);
+                    // Copies for the ledger: the originals move into the
+                    // blocking task below.
+                    let audit_path = path.display().to_string();
+                    let audit_access = match access {
+                        MountAccess::ReadOnly => "read_only",
+                        MountAccess::ReadWrite => "read_write",
+                    };
                     match tokio::task::spawn_blocking(move || {
                         crate::cli::cowork_projects::ProjectStore::add_mount_sync(
                             &store_path, &project_id, &path, access,
@@ -2057,7 +2262,16 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                     })
                     .await
                     {
-                        Ok(Ok(project)) => Ok(json!({ "project": project.view_json() })),
+                        Ok(Ok(project)) => {
+                            rpc.record_audit(
+                                Audit::MountAdded,
+                                None,
+                                None,
+                                Some(&project.id),
+                                Some(format!("{audit_path} ({audit_access})")),
+                            );
+                            Ok(json!({ "project": project.view_json() }))
+                        }
                         Ok(Err(error)) => Err((-32000, error.to_string())),
                         Err(error) => Err((-32000, format!("mount task failed: {error}"))),
                     }
@@ -2077,6 +2291,7 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                     let store_path = rpc.project_store().store_path().to_owned();
                     let project_id = project_id.to_owned();
                     let path = PathBuf::from(path);
+                    let audit_path = path.display().to_string();
                     match tokio::task::spawn_blocking(move || {
                         crate::cli::cowork_projects::ProjectStore::revoke_mount_sync(
                             &store_path, &project_id, &path,
@@ -2084,7 +2299,16 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                     })
                     .await
                     {
-                        Ok(Ok(project)) => Ok(json!({ "project": project.view_json() })),
+                        Ok(Ok(project)) => {
+                            rpc.record_audit(
+                                Audit::MountRevoked,
+                                None,
+                                None,
+                                Some(&project.id),
+                                Some(audit_path),
+                            );
+                            Ok(json!({ "project": project.view_json() }))
+                        }
                         Ok(Err(error)) => Err((-32000, error.to_string())),
                         Err(error) => Err((-32000, format!("revoke task failed: {error}"))),
                     }
@@ -2105,10 +2329,40 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                             "task_id": task.task_id,
                             "running": task.running,
                             "goal": task.goal,
+                            "title": task.title,
                         })
                     })
                     .collect::<Vec<_>>(),
             }))
+        }
+        "task.set_title" => {
+            let task_id = request.params.get("task_id").and_then(Value::as_str);
+            let title = request.params.get("title").and_then(Value::as_str);
+            match (task_id, title) {
+                (Some(task_id), Some(title)) => {
+                    let updated = rpc.set_task_title(task_id, title).await;
+                    Ok(json!({ "updated": updated }))
+                }
+                _ => Err((
+                    -32602,
+                    "params require string task_id and string title".to_string(),
+                )),
+            }
+        }
+        "audit.query" => {
+            let limit = request
+                .params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(200) as usize;
+            crate::cli::cowork_audit::query(
+                request.params.get("project_id").and_then(Value::as_str),
+                request.params.get("task_id").and_then(Value::as_str),
+                request.params.get("kind").and_then(Value::as_str),
+                limit,
+            )
+            .map(|entries| json!({ "entries": entries }))
+            .map_err(|error| (-32000, error.to_string()))
         }
         "mount_folder" => {
             let session_id = request.params.get("session_id").and_then(Value::as_str);
@@ -2858,20 +3112,25 @@ pub async fn run_server() -> Result<()> {
     }
 }
 
+/// Shared with the crate's other test modules (`cowork_audit`): anything
+/// that repoints `JCODE_COWORK_STORE_DIR` must hold this lock so parallel
+/// test threads never observe each other's store directory.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::BufReader;
-
-    /// Tests that repoint `JCODE_COWORK_STORE_DIR` serialize on this lock so
-    /// parallel test threads never observe each other's store directory.
+pub(crate) mod test_support {
     static STORE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn lock_store_env() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn lock_store_env() -> std::sync::MutexGuard<'static, ()> {
         STORE_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::BufReader;
+    use test_support::lock_store_env;
 
     /// Build a request that carries the daemon's capability token.
     fn authed_request(rpc: &CoworkRpc, id: i64, method: &str, params: Value) -> RpcRequest {
@@ -3111,15 +3370,20 @@ mod tests {
         assert!(allow.created_at >= deny.created_at);
         // Inside the project: the project rule wins despite the global deny.
         assert_eq!(
-            rpc.evaluate_permission_rules("bash", Some("proj-9")),
+            rpc.evaluate_permission_rules("bash", Some("proj-9"))
+                .map(|rule| rule.decision),
             Some(RuleDecision::Allow)
         );
         // Outside it: only the global rule matches.
         assert_eq!(
-            rpc.evaluate_permission_rules("bash", Some("proj-other")),
+            rpc.evaluate_permission_rules("bash", Some("proj-other"))
+                .map(|rule| rule.decision),
             Some(RuleDecision::Deny)
         );
-        assert_eq!(rpc.evaluate_permission_rules("bash", None), Some(RuleDecision::Deny));
+        assert_eq!(
+            rpc.evaluate_permission_rules("bash", None).map(|rule| rule.decision),
+            Some(RuleDecision::Deny)
+        );
         // No rule for the tool → no decision.
         assert_eq!(rpc.evaluate_permission_rules("webfetch", None), None);
         unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
@@ -3157,6 +3421,7 @@ mod tests {
                 project_id: Some("proj-9".to_owned()),
                 model: None,
                 goal: "Write the Q3 review".to_owned(),
+                title: None,
             },
         ));
 
@@ -3192,6 +3457,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_ledger_records_every_gate_decision() {
+        let _env = lock_store_env();
+        let store_dir_handle = tempfile::tempdir().unwrap();
+        // SAFETY: the STORE_ENV_LOCK is held, so no other thread reads the
+        // environment while it mutates.
+        unsafe { std::env::set_var("JCODE_COWORK_STORE_DIR", store_dir_handle.path()) };
+        let rpc = CoworkRpc::new();
+        let mut events = rpc.subscribe();
+        rpc.inner.task_contexts.lock().await.push_back((
+            "task-a".to_owned(),
+            TaskContext {
+                mounts: vec![],
+                project_id: None,
+                model: None,
+                goal: "Ship the release".to_owned(),
+                title: None,
+            },
+        ));
+
+        // Stored deny: decides before any prompt, recorded with the rule
+        // that decided it.
+        rpc.upsert_rule("bash", RuleDecision::Deny, RuleScope::Global)
+            .unwrap();
+        let denied = rpc
+            .request_tool_approval("ap-a1", "bash", "run make", "task-a")
+            .await
+            .unwrap();
+        assert!(!denied);
+
+        // Read-only policy auto-allow: no prompt, recorded as policy_allow.
+        rpc.set_approval_policy(ApprovalPolicy::AutoAllowReadonly)
+            .await
+            .unwrap();
+        let auto_allowed = rpc
+            .request_tool_approval("ap-a2", "webfetch", "read docs", "task-a")
+            .await
+            .unwrap();
+        assert!(auto_allowed);
+
+        // Explicit user decision via the RPC handler (a non-read-only tool
+        // so the gate prompts instead of auto-allowing).
+        let waiter = {
+            let rpc = rpc.clone();
+            tokio::spawn(async move {
+                rpc.request_tool_approval("ap-a3", "patch", "apply changes", "task-a")
+                    .await
+            })
+        };
+        let CoworkEvent::ApprovalRequired { id, .. } = events.recv().await.unwrap() else {
+            panic!("expected ApprovalRequired");
+        };
+        let response = dispatch_request(
+            authed_request(&rpc, 90, "approve_tool_call", json!({ "id": id, "approved": true })),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["result"]["resolved"], true);
+        assert_eq!(waiter.await.unwrap().unwrap(), true);
+
+        // Filtered query through the dispatch arm.
+        let response = dispatch_request(
+            authed_request(&rpc, 91, "audit.query", json!({ "kind": "user_allow" })),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        let entries = response["result"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["tool"], "patch");
+        assert_eq!(entries[0]["task_id"], "task-a");
+
+        let kinds: Vec<String> = crate::cli::cowork_audit::query(None, None, None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.kind)
+            .collect();
+        for expected in ["rule_added", "rule_deny", "policy_changed", "policy_allow", "user_allow"]
+        {
+            assert!(kinds.contains(&expected.to_string()), "missing {expected}: {kinds:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn set_task_title_flows_to_task_list() {
+        let rpc = CoworkRpc::new();
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        rpc.inner.tasks.lock().await.insert("task-1".to_owned(), handle);
+        rpc.inner.task_contexts.lock().await.push_back((
+            "task-1".to_owned(),
+            TaskContext {
+                mounts: vec![],
+                project_id: None,
+                model: None,
+                goal: "Draft the annual report".to_owned(),
+                title: None,
+            },
+        ));
+
+        assert!(rpc.set_task_title("task-1", "  Q3 report  ").await);
+        let summary = rpc
+            .list_tasks()
+            .await
+            .into_iter()
+            .find(|task| task.task_id == "task-1")
+            .unwrap();
+        assert_eq!(summary.title.as_deref(), Some("Q3 report"));
+        assert_eq!(summary.goal.as_deref(), Some("Draft the annual report"));
+
+        // Unknown tasks and blank titles are rejected.
+        assert!(!rpc.set_task_title("task-missing", "Nope").await);
+        assert!(!rpc.set_task_title("task-1", "   ").await);
+
+        // The dispatch arm round-trips the title to task.list.
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                92,
+                "task.set_title",
+                json!({ "task_id": "task-1", "title": "Board deck" }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["result"]["updated"], true);
+        let response = dispatch_request(authed_request(&rpc, 93, "task.list", json!({})), &rpc)
+            .await
+            .unwrap();
+        let tasks = response["result"]["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["title"], "Board deck");
+    }
+
+    #[tokio::test]
     async fn approve_tool_call_with_remember_stores_project_rule() {
         let _env = lock_store_env();
         let store_dir_handle = tempfile::tempdir().unwrap();
@@ -3208,6 +3609,7 @@ mod tests {
                 project_id: Some("proj-7".to_owned()),
                 model: None,
                 goal: "Draft the brief".to_owned(),
+                title: None,
             },
         ));
 
@@ -3386,6 +3788,7 @@ mod tests {
                 project_id: None,
                 model: None,
                 goal: String::new(),
+                title: None,
             },
         ));
 
@@ -3829,6 +4232,7 @@ mod tests {
                 project_id: None,
                 model: None,
                 goal: "Draft the launch brief".to_owned(),
+                title: None,
             },
         ));
         let handle = tokio::spawn(async {
@@ -4346,6 +4750,7 @@ mod tests {
             project_id: Some("proj-1".to_owned()),
             model: Some("original-model".to_owned()),
             goal: "Summarize the workbook".to_owned(),
+            title: None,
         };
         // No override: keep the original model; project instructions carried.
         let launch = build_followup_launch(

@@ -7,6 +7,8 @@ pub mod cloud_managed;
 pub mod cloud_move;
 pub mod commands;
 pub mod compatible_runtime;
+#[path = "../ipc/cowork_audit.rs"]
+pub mod cowork_audit;
 #[path = "../prompts/cowork_persona.rs"]
 pub mod cowork_persona;
 pub mod cowork_projects;
