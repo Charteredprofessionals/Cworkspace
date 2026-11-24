@@ -402,6 +402,9 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #728772; outli
 .transcript-event { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--muted); padding: 2px 0; flex-wrap: wrap; }
 .transcript-event code { background: #eae9e2; border-radius: 3px; padding: 1px 5px; font-size: 10px; }
 .transcript-event.error { color: var(--clay); }
+.transcript-rewind { grid-column: 1 / -1; display: inline-flex; align-items: center; gap: 5px; justify-self: start; margin-top: 4px; padding: 3px 9px; border-radius: 4px; border: 1px solid var(--border, #d8d4c8); background: transparent; color: var(--muted); font-size: 10px; font-weight: 600; cursor: pointer; }
+.transcript-rewind:hover:not(:disabled) { background: #efece2; color: #4c5247; }
+.transcript-rewind:disabled { opacity: 0.55; cursor: default; }
 
 .tools-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; flex: 0 0 auto; max-width: 240px; }
 .tool-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border-radius: 999px; background: #efece2; color: #4c5247; font-size: 9.5px; font-weight: 600; }

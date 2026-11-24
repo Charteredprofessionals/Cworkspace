@@ -14,6 +14,7 @@ import {
   ChevronRight,
   CircleHelp,
   Clock3,
+  Copy,
   FileDown,
   FileSpreadsheet,
   FileText,
@@ -277,6 +278,8 @@ type UsageReport = {
 };
 
 type TranscriptEntry = {
+  /// Persisted session message id (v5 daemons). Rewind targets one of these.
+  id?: string;
   role: "user" | "assistant";
   text: string;
   events: { type: string; tool?: string; text?: string; is_error?: boolean }[];
@@ -289,8 +292,10 @@ type TranscriptView = {
 
 /// Must match `cowork_rpc::PROTOCOL_VERSION`. The daemon bumps it on breaking
 /// RPC changes; the GUI warns instead of failing mysteriously on a mismatch.
-/// v4 is additive: `TaskDelta` streams the assistant's text live.
-const PROTOCOL_VERSION = 4;
+/// v4 was additive: `TaskDelta` streams the assistant's text live.
+/// v5 is additive: `task.fork`/`task.rewind` resurrect and rewind finished
+/// tasks; transcripts carry per-message ids to target a rewind point.
+const PROTOCOL_VERSION = 5;
 
 const HISTORY_KEY = "jcode-cowork-history-v1";
 const SETTINGS_KEY = "cworkspace-settings-v1";
@@ -1099,6 +1104,71 @@ function App() {
     }
   }
 
+  /// Fork a finished task (v0.1.11): the daemon copies the task's persisted
+  /// session into a fresh resumable one and registers a new task id. This
+  /// opens a tab on the fork and seeds the feed from the inherited
+  /// transcript, exactly like reattach replay does for running tasks — the
+  /// next message in that tab is a follow-up on the forked session.
+  async function forkActiveTask() {
+    const tab = activeTab;
+    if (!tab?.taskId || tab.status === "running") return;
+    patchTab(tab.id, { error: "" });
+    try {
+      const fork = await invoke<{ task_id: string; messages_inherited?: number }>("task_fork", { sourceTaskId: tab.taskId });
+      const inherited = typeof fork.messages_inherited === "number" ? fork.messages_inherited : 0;
+      const shell = newTab();
+      const forkedTab: SessionTab = {
+        ...shell,
+        goal: tab.goal,
+        title: `Fork: ${tab.title || tabTitle(tab.goal)}`,
+        status: "idle",
+        taskId: fork.task_id,
+        projectName: tab.projectName,
+        notice: `Forked from “${tab.title || tab.goal}” — ${inherited} message${inherited === 1 ? "" : "s"} inherited. Continue with a follow-up; the original task is untouched.`,
+      };
+      setTabs((current) => [...current, forkedTab]);
+      setActiveTabId(forkedTab.id);
+      setHistory((current) => [
+        ...current,
+        { taskId: fork.task_id, goal: forkedTab.title, status: "completed" as const, updatedAt: Date.now(), artifacts: [] },
+      ]);
+      try {
+        const transcript = await invoke<{ messages?: TranscriptEntry[] }>("task_transcript", { taskId: fork.task_id, limit: 400 });
+        const entries: FeedEntry[] = [];
+        for (const message of transcript.messages ?? []) {
+          for (const toolEvent of message.events ?? []) {
+            if (toolEvent.type === "tool_use" && toolEvent.tool) {
+              entries.push({
+                key: `fork-${fork.task_id}-${entries.length}`,
+                event: "ToolInvoked",
+                data: { tool: toolEvent.tool, summary: toolEvent.text ?? "" },
+                createdAt: Date.now(),
+              });
+            }
+          }
+          if (message.role === "assistant" && message.text.trim()) {
+            entries.push({
+              key: `fork-${fork.task_id}-${entries.length}`,
+              event: "TaskDelta",
+              data: { text: message.text.trim() },
+              createdAt: Date.now(),
+            });
+          }
+        }
+        if (entries.length) {
+          setTabs((current) => current.map((existing) => (
+            existing.id === forkedTab.id && existing.feed.length === 0 ? { ...existing, feed: entries } : existing
+          )));
+        }
+      } catch {
+        // The inherited transcript could not be read — the fork tab still
+        // works; follow-ups resume the copied session regardless.
+      }
+    } catch (reason) {
+      patchTab(tab.id, { error: `Could not fork task: ${errorMessage(reason)}` });
+    }
+  }
+
   async function answerApproval(tabId: string, id: string | number, approved: boolean, remember?: "global" | "project") {
     try {
       await invoke("respond_approval", { id, approved, remember: remember || undefined });
@@ -1437,7 +1507,7 @@ function App() {
           {activeTab?.notice && <div className="info-banner" role="status"><Sparkles size={15} /><span>{activeTab.notice}</span><button className="icon-button" aria-label="Dismiss notice" onClick={() => patchTab(activeTab.id, { notice: "" })}><X size={14} /></button></div>}
           {activeTab?.error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{activeTab.error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => patchTab(activeTab.id, { error: "" })}><X size={15} /></button></div>}
 
-          <div className="feed-heading"><div><span className="feed-kicker">LIVE SESSION</span><h2>{activeTab?.status === "running" ? "Work in motion" : activeTab?.status === "completed" ? "Session complete" : activeTab?.status === "stopped" || activeTab?.status === "failed" ? "Session stopped" : "Session"}</h2></div><div className="feed-actions">{activeTab?.status === "running" && <button className="stop-action" onClick={stopTask}><StopCircle size={15} /> Stop task</button>}{activeTab && activeTab.status !== "running" && activeTab.status !== "idle" && activeTab.taskId && <button className="transcript-action" onClick={() => setTranscriptView({ taskId: activeTab.taskId, goal: activeTab.title })}><FileText size={15} /> View transcript</button>}<span className={`task-badge ${activeTab?.status || "idle"}`}>{activeTab?.status === "running" ? <><i className="pulse-dot" /> In progress</> : activeTab?.status === "completed" ? "Completed" : activeTab?.status === "stopped" ? "Stopped" : activeTab?.status === "failed" ? "Failed" : "Waiting"}</span></div></div>
+          <div className="feed-heading"><div><span className="feed-kicker">LIVE SESSION</span><h2>{activeTab?.status === "running" ? "Work in motion" : activeTab?.status === "completed" ? "Session complete" : activeTab?.status === "stopped" || activeTab?.status === "failed" ? "Session stopped" : "Session"}</h2></div><div className="feed-actions">{activeTab?.status === "running" && <button className="stop-action" onClick={stopTask}><StopCircle size={15} /> Stop task</button>}{activeTab && activeTab.status !== "running" && activeTab.taskId && <button className="transcript-action" onClick={forkActiveTask}><Copy size={15} /> Fork task</button>}{activeTab && activeTab.status !== "running" && activeTab.status !== "idle" && activeTab.taskId && <button className="transcript-action" onClick={() => setTranscriptView({ taskId: activeTab.taskId, goal: activeTab.title })}><FileText size={15} /> View transcript</button>}<span className={`task-badge ${activeTab?.status || "idle"}`}>{activeTab?.status === "running" ? <><i className="pulse-dot" /> In progress</> : activeTab?.status === "completed" ? "Completed" : activeTab?.status === "stopped" ? "Stopped" : activeTab?.status === "failed" ? "Failed" : "Waiting"}</span></div></div>
 
           <div className="feed-list">
             {activeTab?.feed.map((entry) => <FeedCard key={entry.key} entry={entry} handled={activeTab.handledApprovals} plain={isKnowledge} projectName={activeTab.projectName} onAnswer={(id, approved, remember) => answerApproval(activeTab.id, id, approved, remember)} />)}
@@ -2359,11 +2429,13 @@ function ScheduleDialog({ projectId, projectName, defaultModel, onClose, onSched
 }
 
 /// Full conversation transcript for a finished or running task, read from the
-/// daemon's persisted session store (task.transcript).
+/// daemon's persisted session store (task.transcript). On v5 daemons each
+/// message carries its id and can be targeted by task.rewind (v0.1.11).
 function TranscriptDialog({ view, onClose }: { view: TranscriptView; onClose: () => void }) {
   const [entries, setEntries] = useState<TranscriptEntry[] | null>(null);
   const [total, setTotal] = useState(0);
   const [error, setError] = useState("");
+  const [rewinding, setRewinding] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -2376,6 +2448,31 @@ function TranscriptDialog({ view, onClose }: { view: TranscriptView; onClose: ()
       .catch((reason) => { if (!cancelled) setError(errorMessage(reason)); });
     return () => { cancelled = true; };
   }, [view.taskId]);
+
+  async function loadTranscript() {
+    const result = await invoke<{ messages?: TranscriptEntry[]; total_messages?: number }>("task_transcript", { taskId: view.taskId, limit: 400 });
+    setEntries(Array.isArray(result?.messages) ? result.messages : []);
+    setTotal(typeof result?.total_messages === "number" ? result.total_messages : 0);
+  }
+
+  /// Rewind the task's conversation to this message: everything after it is
+  /// dropped from the persisted session and the next follow-up continues
+  /// from here. Only offered on finished tasks — a running session owns its
+  /// history.
+  async function rewindTo(entry: TranscriptEntry) {
+    if (!entry.id || rewinding) return;
+    if (!window.confirm("Drop everything after this message? The task's next follow-up continues from here. This cannot be undone.")) return;
+    setError("");
+    setRewinding(entry.id);
+    try {
+      await invoke("task_rewind", { taskId: view.taskId, messageId: entry.id });
+      await loadTranscript();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setRewinding("");
+    }
+  }
 
   return (
     <div className="settings-overlay" onClick={onClose} role="presentation">
@@ -2393,7 +2490,7 @@ function TranscriptDialog({ view, onClose }: { view: TranscriptView; onClose: ()
               {total > entries.length && <p className="sidebar-hint">Showing the last {entries.length} of {total} conversation messages.</p>}
               <div className="transcript-list">
                 {entries.map((entry, index) => (
-                  <article className={`transcript-entry ${entry.role}`} key={index}>
+                  <article className={`transcript-entry ${entry.role}`} key={entry.id ?? index}>
                     <span className="transcript-role">{entry.role === "user" ? "You" : "Agent"}</span>
                     <div className="transcript-content">
                       {entry.text && <p>{entry.text}</p>}
@@ -2405,6 +2502,7 @@ function TranscriptDialog({ view, onClose }: { view: TranscriptView; onClose: ()
                         </div>
                       ))}
                     </div>
+                    {entry.id && <button className="transcript-rewind" disabled={rewinding !== ""} onClick={() => rewindTo(entry)} title="Rewind here — drop everything after this message"><History size={13} /> {rewinding === entry.id ? "Rewinding…" : "Rewind here"}</button>}
                   </article>
                 ))}
               </div>

@@ -21,7 +21,11 @@ pub const PIPE_NAME: &str = r"\\.\pipe\jcode-cowork";
 /// MCP server management, and scheduled tasks.
 /// v4: additive — `TaskDelta` streams assistant text while a task runs, so
 /// the feed types out live instead of waiting for `TaskCompleted`.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5: additive — `task.fork` resurrects a finished task as a new resumable
+/// task seeded by a copy of its session, and `task.rewind` truncates a
+/// finished task's session back to a chosen message; transcripts now carry
+/// per-message ids so the GUI can target a rewind point.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Tool names considered read-only for the auto-allow policy. They cannot
 /// mutate the workspace: reads list files, grep searches content, webfetch
@@ -1387,6 +1391,112 @@ pub async fn list_tasks(&self) -> Vec<TaskSummary> {
             .map(|(_, session_id)| session_id.clone())
     }
 
+    /// Fork a finished task into a new resumable task (v0.1.11). The source
+    /// task's persisted session is copied — optionally up to a chosen
+    /// message — into a fresh session that records the source as its parent,
+    /// and the new task is registered with the same workspace context so the
+    /// GUI can immediately send follow-ups. The source task is untouched.
+    pub async fn fork_task(
+        &self,
+        source_task_id: &str,
+        title: Option<&str>,
+        to_message_id: Option<&str>,
+    ) -> Result<Value> {
+        anyhow::ensure!(
+            !self.task_is_running(source_task_id).await,
+            "task {source_task_id} is still running; wait for it to finish before forking"
+        );
+        let session_id = self.task_session_id(source_task_id).await.ok_or_else(|| {
+            anyhow!("no session recorded for task {source_task_id}; it cannot be forked")
+        })?;
+        let context = self.task_context(source_task_id).await.ok_or_else(|| {
+            anyhow!("no workspace context recorded for task {source_task_id}; it cannot be forked")
+        })?;
+        let to_message_id = to_message_id.map(str::to_owned);
+        let source_session_id = session_id.clone();
+        let (new_session_id, inherited, parent_name) = tokio::task::spawn_blocking(move || {
+            fork_session_on_disk(&session_id, to_message_id.as_deref())
+        })
+        .await
+        .map_err(|error| anyhow!("fork task failed: {error}"))??;
+        let fork_title: Option<String> = title
+            .map(|title| title.chars().take(200).collect::<String>())
+            .or_else(|| {
+                parent_name
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+                    .map(|name| format!("Fork: {}", name.trim()))
+            });
+        let new_task_id = crate::id::new_id("cowork");
+        {
+            let mut contexts = self.inner.task_contexts.lock().await;
+            contexts.retain(|(existing, _)| existing != &new_task_id);
+            contexts.push_back((
+                new_task_id.clone(),
+                TaskContext {
+                    mounts: context.mounts.clone(),
+                    project_id: context.project_id.clone(),
+                    model: context.model.clone(),
+                    goal: format!("Forked from task {source_task_id}"),
+                    title: fork_title,
+                },
+            ));
+            while contexts.len() > 200 {
+                contexts.pop_front();
+            }
+        }
+        self.note_task_session(&new_task_id, &new_session_id).await;
+        self.record_audit(
+            Audit::TaskForked,
+            None,
+            Some(&new_task_id),
+            context.project_id.as_deref(),
+            Some(format!(
+                "forked from task {source_task_id} (session {source_session_id} → {new_session_id}), {inherited} message(s) inherited"
+            )),
+        );
+        Ok(json!({
+            "task_id": new_task_id,
+            "session_id": new_session_id,
+            "messages_inherited": inherited,
+        }))
+    }
+
+    /// Rewind a finished task's conversation back to a chosen message
+    /// (v0.1.11). Everything after the message is dropped from the persisted
+    /// session; the next follow-up rebuilds provider context from the
+    /// truncated local history. The running check mirrors follow-up.
+    pub async fn rewind_task(&self, task_id: &str, message_id: &str) -> Result<Value> {
+        anyhow::ensure!(
+            !self.task_is_running(task_id).await,
+            "task {task_id} is still running; wait for it to finish before rewinding"
+        );
+        let session_id = self.task_session_id(task_id).await.ok_or_else(|| {
+            anyhow!("no session recorded for task {task_id}; it cannot be rewound")
+        })?;
+        let message_id = message_id.to_owned();
+        let (kept, dropped) = tokio::task::spawn_blocking(move || {
+            rewind_session_on_disk(&session_id, &message_id)
+        })
+        .await
+        .map_err(|error| anyhow!("rewind task failed: {error}"))??;
+        self.record_audit(
+            Audit::TaskRewound,
+            None,
+            Some(task_id),
+            self.task_context(task_id)
+                .await
+                .and_then(|context| context.project_id),
+            Some(format!(
+                "rewound session {session_id} to message {message_id}: kept {kept}, dropped {dropped}"
+            )),
+        );
+        Ok(json!({
+            "kept_messages": kept,
+            "dropped_messages": dropped,
+        }))
+    }
+
     /// Subscribe to the event broadcast. Visible to the crate so the task
     /// runner's tests (commands_tests) can assert emitted deltas.
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<CoworkEvent> {
@@ -1546,6 +1656,7 @@ fn transcript_message(message: &crate::session::StoredMessage) -> Option<Value> 
         return None;
     }
     Some(json!({
+        "id": message.id,
         "role": role,
         "text": truncate_chars(&text, TRANSCRIPT_TEXT_CAP),
         "events": events,
@@ -1561,6 +1672,75 @@ fn truncate_chars(text: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}\u{2026} [truncated]", &text[..end])
+}
+
+/// Fork a persisted session on disk (v0.1.11): copy the parent's messages —
+/// optionally only up to a chosen message id — into a fresh child session
+/// that records the parent and inherits the conversation-shaping state, then
+/// persist it. Mirrors the engine's own split-fork recipe
+/// (`client_actions::clone_split_session`) applied to a session whose agent
+/// is not running: the persisted snapshot is authoritative, provider identity
+/// is kept so provider-native blocks stay valid, and a fresh provider
+/// session id makes the next turn rebuild context from the inherited history.
+fn fork_session_on_disk(
+    parent_session_id: &str,
+    to_message_id: Option<&str>,
+) -> Result<(String, usize, String)> {
+    let parent = crate::session::Session::load(parent_session_id)?;
+    let mut kept = parent.messages.clone();
+    if let Some(target) = to_message_id {
+        let index = kept
+            .iter()
+            .position(|message| message.id == target)
+            .ok_or_else(|| anyhow!("message {target} not found in session {parent_session_id}"))?;
+        kept.truncate(index + 1);
+    }
+    let inherited = kept.len();
+    let parent_name = parent.display_name().to_string();
+    let mut child = crate::session::Session::create(Some(parent_session_id.to_string()), None);
+    child.replace_messages(kept);
+    child.compaction = parent.compaction.clone();
+    // A partial cut can land inside the compacted prefix; drop the view
+    // rather than resuming with a summary that outlives its messages.
+    if let Some(state) = child.compaction.as_ref() {
+        if state.compacted_count > child.messages.len() {
+            child.compaction = None;
+        }
+    }
+    child.system_prompt = parent.system_prompt.clone();
+    child.working_dir = parent.working_dir.clone();
+    child.model = parent.model.clone();
+    child.provider_key = parent.provider_key.clone();
+    child.route_api_method = parent.route_api_method.clone();
+    child.custom_title = parent.custom_title.clone();
+    // Closed until the first follow-up activates it.
+    child.status = crate::session::SessionStatus::Closed;
+    child.append_fork_notice(parent_session_id, &parent_name);
+    child.save()?;
+    Ok((child.id.clone(), inherited, parent_name))
+}
+
+/// Rewind a persisted session on disk (v0.1.11): drop everything after the
+/// chosen message (the message itself is kept) and clear provider-resume
+/// state so the next follow-up rebuilds context from the truncated local
+/// history instead of a provider session that still remembers the future.
+fn rewind_session_on_disk(session_id: &str, message_id: &str) -> Result<(usize, usize)> {
+    let mut session = crate::session::Session::load(session_id)?;
+    let index = session
+        .messages
+        .iter()
+        .position(|message| message.id == message_id)
+        .ok_or_else(|| anyhow!("message {message_id} not found in session {session_id}"))?;
+    let dropped = session.messages.len() - (index + 1);
+    session.truncate_messages(index + 1);
+    if let Some(state) = session.compaction.as_ref() {
+        if state.compacted_count > session.messages.len() {
+            session.compaction = None;
+        }
+    }
+    session.provider_session_id = None;
+    session.save()?;
+    Ok((index + 1, dropped))
 }
 
 /// Build the follow-up launch for a finished task. Pure so tests can assert
@@ -2798,6 +2978,51 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                 Ok(Ok(cancelled)) => Ok(json!({ "cancelled": cancelled })),
                 Ok(Err(error)) => Err((-32000, error.to_string())),
                 Err(error) => Err((-32000, format!("schedule task failed: {error}"))),
+            }
+        }
+        "task.fork" => {
+            let source_task_id = request
+                .params
+                .get("source_task_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty());
+            let Some(source_task_id) = source_task_id else {
+                return Some(rpc_error(
+                    Some(id),
+                    -32602,
+                    "params require string source_task_id",
+                ));
+            };
+            let title = request
+                .params
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty());
+            // Optional fork point: inherit only up to this message instead of
+            // the whole conversation. Absent = full copy.
+            let to_message_id = request
+                .params
+                .get("to_message_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty());
+            rpc.fork_task(source_task_id, title, to_message_id)
+                .await
+                .map_err(|error| (-32000, error.to_string()))
+        }
+        "task.rewind" => {
+            let task_id = request.params.get("task_id").and_then(Value::as_str);
+            let message_id = request.params.get("message_id").and_then(Value::as_str);
+            match (task_id, message_id.filter(|id| !id.trim().is_empty())) {
+                (Some(task_id), Some(message_id)) => {
+                    rpc.rewind_task(task_id, message_id)
+                        .await
+                        .map_err(|error| (-32000, error.to_string()))
+                }
+                _ => Err((
+                    -32602,
+                    "params require string task_id and string message_id".to_string(),
+                )),
             }
         }
         "task.followup" => {
@@ -4468,6 +4693,238 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("no session recorded"));
+    }
+
+    /// Point the cowork store and the jcode session store at fresh temp dirs
+    /// for the fork/rewind tests. The store env lock must be held by the
+    /// caller for the whole test; `JCODE_HOME` is removed on drop because no
+    /// other test in this file sets it.
+    struct SessionEnv {
+        _store: tempfile::TempDir,
+        _home: tempfile::TempDir,
+    }
+
+    impl SessionEnv {
+        fn new() -> Self {
+            let store = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            // SAFETY: STORE_ENV_LOCK is held, so no other thread reads the
+            // environment while it mutates.
+            unsafe {
+                std::env::set_var("JCODE_COWORK_STORE_DIR", store.path());
+                std::env::set_var("JCODE_HOME", home.path());
+            }
+            Self {
+                _store: store,
+                _home: home,
+            }
+        }
+    }
+
+    impl Drop for SessionEnv {
+        fn drop(&mut self) {
+            // SAFETY: same lock discipline as setup.
+            unsafe { std::env::remove_var("JCODE_HOME") };
+        }
+    }
+
+    fn user_text_message(session: &mut crate::session::Session, text: &str) -> String {
+        session.add_message(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: text.to_owned(),
+                cache_control: None,
+            }],
+        )
+    }
+
+    fn assistant_text_message(session: &mut crate::session::Session, text: &str) -> String {
+        session.add_message(
+            crate::message::Role::Assistant,
+            vec![crate::message::ContentBlock::Text {
+                text: text.to_owned(),
+                cache_control: None,
+            }],
+        )
+    }
+
+    #[tokio::test]
+    async fn task_fork_creates_resumable_copy() {
+        let _env = lock_store_env();
+        let _session_env = SessionEnv::new();
+        let rpc = CoworkRpc::new();
+
+        let mut session = crate::session::Session::create(None, Some("Source".to_string()));
+        let first = user_text_message(&mut session, "first question");
+        let second = assistant_text_message(&mut session, "first answer");
+        session.save().unwrap();
+        let source_session_id = session.id.clone();
+        rpc.note_task_session("task-src", &source_session_id).await;
+        rpc.inner.task_contexts.lock().await.push_back((
+            "task-src".to_string(),
+            TaskContext {
+                mounts: Vec::new(),
+                project_id: None,
+                model: None,
+                goal: "Do the thing".to_string(),
+                title: Some("My task".to_string()),
+            },
+        ));
+
+        let response = dispatch_request(
+            authed_request(&rpc, 110, "task.fork", json!({ "source_task_id": "task-src" })),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        let fork = &response["result"];
+        let fork_task_id = fork["task_id"].as_str().unwrap();
+        let fork_session_id = fork["session_id"].as_str().unwrap();
+        assert_ne!(fork_task_id, "task-src");
+        assert_eq!(fork["messages_inherited"], 2);
+
+        // The fork is follow-up ready: session and context are registered.
+        assert!(rpc.task_session_id(fork_task_id).await.is_some());
+        let context = rpc.task_context(fork_task_id).await.unwrap();
+        assert_eq!(context.title.as_deref(), Some("Fork: My task"));
+        assert!(context.goal.contains("Forked from task task-src"));
+
+        // The persisted child records its parent and inherits the messages
+        // plus the (display-role, transcript-hidden) fork notice.
+        let child = crate::session::Session::load(fork_session_id).unwrap();
+        assert_eq!(child.parent_id.as_deref(), Some(source_session_id.as_str()));
+        assert_eq!(child.messages.len(), 3);
+        assert_eq!(child.messages[0].id, first);
+        assert_eq!(child.messages[1].id, second);
+
+        // The transcript the forked tab would show carries per-message ids
+        // and only the visible conversation.
+        let transcript = dispatch_request(
+            authed_request(&rpc, 111, "task.transcript", json!({ "task_id": fork_task_id })),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        let messages = transcript["result"]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["id"], first);
+        assert_eq!(messages[0]["text"], "first question");
+        assert_eq!(messages[1]["id"], second);
+        assert_eq!(messages[1]["text"], "first answer");
+
+        // The fork is auditable.
+        let entries = crate::cli::cowork_audit::query(None, Some(fork_task_id), Some("task_forked"), 10)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn task_fork_rejects_while_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let rpc = CoworkRpc::new();
+        let task_id = rpc
+            .start_task_with(
+                TaskLaunch::new(
+                    "Long task".to_string(),
+                    vec![CoworkMount::read_write(directory.path())],
+                ),
+                |_, _, _, _, _, _, _| async { std::future::pending::<Result<String>>().await },
+            )
+            .await
+            .unwrap();
+        rpc.note_task_session(&task_id, "sess-fork").await;
+
+        let response = dispatch_request(
+            authed_request(&rpc, 112, "task.fork", json!({ "source_task_id": task_id })),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("still running"));
+        let _ = rpc.stop_task(&task_id).await;
+    }
+
+    #[tokio::test]
+    async fn task_rewind_truncates_session_and_audits() {
+        let _env = lock_store_env();
+        let _session_env = SessionEnv::new();
+        let rpc = CoworkRpc::new();
+
+        let mut session = crate::session::Session::create(None, None);
+        let first = user_text_message(&mut session, "one");
+        let second = assistant_text_message(&mut session, "two");
+        let _third = user_text_message(&mut session, "three");
+        session.provider_session_id = Some("prov-1".to_string());
+        session.save().unwrap();
+        rpc.note_task_session("task-rw", &session.id).await;
+        rpc.inner.task_contexts.lock().await.push_back((
+            "task-rw".to_string(),
+            TaskContext {
+                mounts: Vec::new(),
+                project_id: None,
+                model: None,
+                goal: "Rewind me".to_string(),
+                title: None,
+            },
+        ));
+
+        // An unknown message id fails cleanly and leaves the session alone.
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                113,
+                "task.rewind",
+                json!({ "task_id": "task-rw", "message_id": "nope" }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not found"));
+
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                114,
+                "task.rewind",
+                json!({ "task_id": "task-rw", "message_id": second }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["result"]["kept_messages"], 2);
+        assert_eq!(response["result"]["dropped_messages"], 1);
+
+        // The truncation persisted: the kept prefix ends at the target and
+        // provider-resume state was cleared so context rebuilds locally.
+        let reloaded = crate::session::Session::load(&session.id).unwrap();
+        assert_eq!(reloaded.messages.len(), 2);
+        assert_eq!(reloaded.messages[0].id, first);
+        assert_eq!(reloaded.messages[1].id, second);
+        assert!(reloaded.provider_session_id.is_none());
+
+        let transcript = dispatch_request(
+            authed_request(&rpc, 115, "task.transcript", json!({ "task_id": "task-rw" })),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        let messages = transcript["result"]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["text"], "two");
+
+        let entries = crate::cli::cowork_audit::query(None, Some("task-rw"), Some("task_rewound"), 10)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
     }
 
     #[tokio::test]

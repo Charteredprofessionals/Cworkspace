@@ -55,6 +55,10 @@ pub enum AuditEventKind {
     MountAdded,
     /// A project mount was revoked.
     MountRevoked,
+    /// A finished task was forked into a new resumable task.
+    TaskForked,
+    /// A finished task's conversation was rewound to an earlier message.
+    TaskRewound,
 }
 
 impl AuditEventKind {
@@ -74,6 +78,8 @@ impl AuditEventKind {
             AuditEventKind::ProjectDeleted => "project_deleted",
             AuditEventKind::MountAdded => "mount_added",
             AuditEventKind::MountRevoked => "mount_revoked",
+            AuditEventKind::TaskForked => "task_forked",
+            AuditEventKind::TaskRewound => "task_rewound",
         }
     }
 }

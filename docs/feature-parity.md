@@ -33,6 +33,8 @@ Daemon-side enforcement is identical either way — the desktop talks to the sam
 | Feed replay on reattach | New tab reseeds from the persisted transcript, v0.1.9 |
 | Audit ledger | Every gate decision, rule/policy change, and project/mount event recorded; AUDIT sidebar → Approval ledger (`audit.query`), v0.1.10 |
 | Per-task display titles | Double-click a tab title; daemon persists it (`task.set_title`), tray + replay prefer it, v0.1.10 |
+| Fork a finished task | **Fork task** on finished sessions: daemon copies the persisted session (child of the original, fork notice included) into a follow-up-ready new task with inherited mounts/project/model (`task.fork`), v0.1.11 |
+| Rewind a conversation | **Rewind here** on every transcript message: drops everything after the chosen point, clears provider-resume state so context rebuilds locally (`task.rewind`), v0.1.11 |
 
 ## CLI-assisted (by design)
 
@@ -50,7 +52,6 @@ Daemon-side enforcement is identical either way — the desktop talks to the sam
 
 ## Not yet bridged (backlog)
 
-- Session fork/rewind of a finished desktop task (follow-up turns resume the session via `task.followup`; forking to a new tab and rewinding to an earlier turn are pending).
 - Ambient runner parity (the desktop scheduler is a separate project-scoped store, not the TUI ambient queue).
 - Split-pane / parent-child workstreams.
 - Connectors/OAuth (browser/app scopes) + browser/computer-use escalation UI.

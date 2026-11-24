@@ -1043,6 +1043,49 @@ async fn task_list(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, S
     })
 }
 
+/// Fork a finished task into a new resumable task seeded by a copy of its
+/// session (v0.1.11). `to_message_id` optionally limits the inherited
+/// history to everything up to and including that message.
+#[tauri::command]
+async fn task_fork(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    source_task_id: String,
+    title: Option<String>,
+    to_message_id: Option<String>,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        let mut params = json!({ "source_task_id": source_task_id });
+        if let Some(title) = title {
+            params["title"] = json!(title);
+        }
+        if let Some(to_message_id) = to_message_id {
+            params["to_message_id"] = json!(to_message_id);
+        }
+        connection.request("task.fork", params)
+    })
+}
+
+/// Rewind a finished task's conversation to a chosen transcript message
+/// (v0.1.11): everything after it is dropped and the next follow-up
+/// continues from the truncated history.
+#[tauri::command]
+async fn task_rewind(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    task_id: String,
+    message_id: String,
+) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request(
+            "task.rewind",
+            json!({ "task_id": task_id, "message_id": message_id }),
+        )
+    })
+}
+
 #[tauri::command]
 async fn set_task_title(
     app: AppHandle,
@@ -1441,6 +1484,8 @@ pub fn run() {
             settings_update,
             task_transcript,
             task_list,
+            task_fork,
+            task_rewind,
             set_task_title,
             audit_query,
             task_followup,
