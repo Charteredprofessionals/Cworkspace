@@ -41,11 +41,110 @@ impl MountAccess {
     }
 }
 
+/// Stable filesystem identity of a mounted directory, captured when the
+/// mount is added. Lets a health check tell "the folder was renamed or
+/// moved" apart from "the folder is gone" by re-finding the same inode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// Observed health of a recorded mount path. Computed on demand at
+/// serialization time — never persisted — so a stale snapshot can never
+/// mask a folder that moved or disappeared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MountHealth {
+    /// The recorded path resolves; the directory is reachable.
+    Available,
+    /// The recorded path is gone but the mounted directory itself still
+    /// exists elsewhere (renamed or moved); `current_path` says where.
+    Moved,
+    /// The directory could not be found at the recorded path or nearby.
+    Disconnected,
+}
+
+#[derive(Clone, Debug)]
+pub struct MountObservation {
+    pub health: MountHealth,
+    /// Where the directory lives now, for `MountHealth::Moved`.
+    pub current_path: Option<PathBuf>,
+}
+
+/// Classify a recorded mount path against the live filesystem. `identity`
+/// is the (dev, ino) pair captured at mount time; legacy stores and
+/// non-Unix platforms have `None` and only get available/disconnected.
+pub fn observe_mount(recorded: &Path, identity: Option<MountIdentity>) -> MountObservation {
+    if std::fs::metadata(recorded).is_ok() {
+        return MountObservation {
+            health: MountHealth::Available,
+            current_path: None,
+        };
+    }
+    #[cfg(unix)]
+    if let Some(identity) = identity {
+        // Rename/move within the same parent: scan the parent's direct
+        // children for the directory carrying the recorded identity. One
+        // bounded readdir — no filesystem-wide walk.
+        if let Some(parent) = recorded.parent() {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    if entry.path() == recorded {
+                        continue;
+                    }
+                    if let Ok(meta) = entry.metadata() {
+                        if !meta.is_dir() {
+                            continue;
+                        }
+                        use std::os::unix::fs::MetadataExt;
+                        if meta.dev() == identity.dev && meta.ino() == identity.ino {
+                            return MountObservation {
+                                health: MountHealth::Moved,
+                                current_path: Some(entry.path()),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = identity;
+    MountObservation {
+        health: MountHealth::Disconnected,
+        current_path: None,
+    }
+}
+
+/// Capture the filesystem identity of a directory. Unix only; other
+/// platforms leave mounts without an identity and moved-detection degrades
+/// to available/disconnected.
+#[cfg(unix)]
+fn mount_identity(path: &Path) -> Option<MountIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| MountIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+}
+
+#[cfg(not(unix))]
+fn mount_identity(_path: &Path) -> Option<MountIdentity> {
+    None
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectMount {
     pub path: PathBuf,
     pub access: MountAccess,
     pub added_at: String,
+    /// (dev, ino) at mount time (Unix). Absent for legacy mounts; used by
+    /// `observe_mount` to re-find a folder that was renamed or moved.
+    #[serde(default)]
+    pub identity: Option<MountIdentity>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +180,32 @@ impl Project {
     /// All mount roots regardless of access level.
     pub fn all_roots(&self) -> Vec<PathBuf> {
         self.mounts.iter().map(|mount| mount.path.clone()).collect()
+    }
+
+    /// JSON view with live mount health annotations. The store keeps the
+    /// configuration; health is recomputed on every serialization so the
+    /// desktop always sees the filesystem as it is right now.
+    pub fn view_json(&self) -> serde_json::Value {
+        let mut value = match serde_json::to_value(self) {
+            Ok(value) => value,
+            Err(_) => return serde_json::Value::Null,
+        };
+        let Some(views) = value.get_mut("mounts").and_then(|m| m.as_array_mut()) else {
+            return value;
+        };
+        for (mount, view) in self.mounts.iter().zip(views.iter_mut()) {
+            let observation = observe_mount(&mount.path, mount.identity);
+            if let Some(current) = &observation.current_path {
+                view["current_path"] =
+                    serde_json::Value::String(current.display().to_string());
+            }
+            view["health"] = serde_json::json!(match observation.health {
+                MountHealth::Available => "available",
+                MountHealth::Moved => "moved",
+                MountHealth::Disconnected => "disconnected",
+            });
+        }
+        value
     }
 }
 
@@ -254,10 +379,12 @@ impl ProjectStore {
         {
             bail!("folder is already mounted on this project: {}", canonical.display());
         }
+        let identity = mount_identity(&canonical);
         project.mounts.push(ProjectMount {
             path: canonical,
             access,
             added_at: timestamp(),
+            identity,
         });
         project.updated_at = timestamp();
         let updated = project.clone();
@@ -456,5 +583,77 @@ mod tests {
         assert!(stamp.ends_with('Z'));
         assert_eq!(&stamp[4..5], "-");
         assert_eq!(&stamp[10..11], "T");
+    }
+
+    #[test]
+    fn mount_health_tracks_moves_and_deletions() {
+        let (temp, store) = temp_store();
+        let project = store.create("Health", "", "", "").unwrap();
+        let dir = temp.path().join("workspace");
+        std::fs::create_dir(&dir).unwrap();
+        let updated = ProjectStore::add_mount_sync(
+            &store.path,
+            &project.id,
+            &dir,
+            MountAccess::ReadWrite,
+        )
+        .unwrap();
+
+        let mount = &updated.mounts[0];
+        assert!(mount.identity.is_some(), "identity captured at mount time");
+        assert_eq!(
+            observe_mount(&mount.path, mount.identity).health,
+            MountHealth::Available
+        );
+
+        // Health is a view, not store state: the JSON view annotates it,
+        // the persisted document does not.
+        assert_eq!(updated.view_json()["mounts"][0]["health"], "available");
+        let persisted = std::fs::read_to_string(&store.path).unwrap();
+        assert!(!persisted.contains("\"health\""), "health must not be persisted");
+
+        // Renamed in place: recorded path gone, same inode re-found nearby.
+        let renamed = temp.path().join("workspace-renamed");
+        std::fs::rename(&dir, &renamed).unwrap();
+        let moved = observe_mount(&mount.path, mount.identity);
+        assert_eq!(moved.health, MountHealth::Moved);
+        assert_eq!(moved.current_path.as_deref(), Some(renamed.as_path()));
+
+        // Deleted outright: nowhere to re-find it.
+        std::fs::remove_dir(&renamed).unwrap();
+        assert_eq!(
+            observe_mount(&mount.path, mount.identity).health,
+            MountHealth::Disconnected
+        );
+        assert_eq!(moved.current_path.as_deref(), Some(renamed.as_path()));
+    }
+
+    #[test]
+    fn legacy_mount_without_identity_reports_disconnected_when_gone() {
+        let (temp, store) = temp_store();
+        let project = store.create("Legacy", "", "", "").unwrap();
+        let dir = temp.path().join("legacy");
+        std::fs::create_dir(&dir).unwrap();
+        let updated = ProjectStore::add_mount_sync(
+            &store.path,
+            &project.id,
+            &dir,
+            MountAccess::ReadOnly,
+        )
+        .unwrap();
+        // Simulate a legacy store entry: no identity recorded.
+        let legacy = ProjectMount {
+            identity: None,
+            ..updated.mounts[0].clone()
+        };
+        assert_eq!(
+            observe_mount(&legacy.path, None).health,
+            MountHealth::Available
+        );
+        std::fs::remove_dir(&dir).unwrap();
+        assert_eq!(
+            observe_mount(&legacy.path, None).health,
+            MountHealth::Disconnected
+        );
     }
 }

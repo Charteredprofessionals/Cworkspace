@@ -374,6 +374,10 @@ pub struct TaskContext {
     pub mounts: Vec<CoworkMount>,
     pub project_id: Option<String>,
     pub model: Option<String>,
+    /// The launch goal. Recorded so reattach surfaces (tray menu, feed
+    /// replay) can name running tasks without having seen the launch
+    /// event — the GUI often (re)connects after a task already started.
+    pub goal: String,
 }
 
 /// A pending approval and what it was for, so "remember this choice" can
@@ -382,6 +386,18 @@ struct PendingApproval {
     sender: oneshot::Sender<bool>,
     tool: String,
     task_id: String,
+}
+
+/// One entry of `task.list`: a currently-registered task and what the
+/// daemon knows about it. Only running tasks appear — the tasks map entry
+/// IS the live join handle, removed on completion.
+#[derive(Debug, Clone)]
+pub struct TaskSummary {
+    pub task_id: String,
+    pub running: bool,
+    /// Recorded launch goal, when one is on file. The tray menu and feed
+    /// replay render this instead of a bare task id.
+    pub goal: Option<String>,
 }
 
 impl CoworkRpc {
@@ -762,6 +778,7 @@ where
         mounts: launch.mounts.clone(),
         project_id: launch.project_id.clone(),
         model: launch.model.clone(),
+        goal: launch.goal.clone(),
     };
     let work = run(
         launch.goal,
@@ -827,14 +844,32 @@ pub async fn task_is_running(&self, task_id: &str) -> bool {
     self.inner.tasks.lock().await.contains_key(task_id)
 }
 
-/// Task ids currently registered and whether their work is still running.
-pub async fn list_tasks(&self) -> Vec<(String, bool)> {
-    self.inner
+/// Task ids currently registered and whether their work is still running,
+/// with recorded goals where known.
+pub async fn list_tasks(&self) -> Vec<TaskSummary> {
+    let ids: Vec<String> = self
+        .inner
         .tasks
         .lock()
         .await
         .keys()
-        .map(|task_id| (task_id.clone(), true))
+        .cloned()
+        .collect();
+    let contexts = self.inner.task_contexts.lock().await;
+    ids.into_iter()
+        .map(|task_id| {
+            let goal = contexts
+                .iter()
+                .rev()
+                .find(|(existing, _)| *existing == task_id)
+                .map(|(_, context)| context.goal.clone())
+                .filter(|goal| !goal.is_empty());
+            TaskSummary {
+                task_id,
+                running: true,
+                goal,
+            }
+        })
         .collect()
 }
 
@@ -1907,7 +1942,7 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                                 .and_then(Value::as_str)
                                 .unwrap_or(""),
                         )
-                        .map(|project| json!({ "project": project }))
+                        .map(|project| json!({ "project": project.view_json() }))
                         .map_err(|error| (-32000, error.to_string()))
                 }
                 None => Err((-32602, "params require string name".to_string())),
@@ -1916,7 +1951,12 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
         "project.list" => rpc
             .project_store()
             .list()
-            .map(|projects| json!({ "projects": projects }))
+            .map(|projects| {
+                    json!({ "projects": projects
+                        .iter()
+                        .map(|project| project.view_json())
+                        .collect::<Vec<_>>() })
+                })
             .map_err(|error| (-32000, error.to_string())),
         "project.get" | "mount.list" => {
             let project_id = request.params.get("project_id").and_then(Value::as_str);
@@ -1924,7 +1964,7 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                 Some(project_id) => rpc
                     .project_store()
                     .get(project_id)
-                    .map(|project| json!({ "project": project }))
+                    .map(|project| json!({ "project": project.view_json() }))
                     .map_err(|error| (-32000, error.to_string())),
                 None => Err((-32602, "params require string project_id".to_string())),
             }
@@ -1977,7 +2017,7 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                     }
                     Ok(())
                 })
-                .map(|project| json!({ "project": project }))
+                .map(|project| json!({ "project": project.view_json() }))
                 .map_err(|error| (-32000, error.to_string()))
         }
         "project.delete" => {
@@ -2017,7 +2057,7 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                     })
                     .await
                     {
-                        Ok(Ok(project)) => Ok(json!({ "project": project })),
+                        Ok(Ok(project)) => Ok(json!({ "project": project.view_json() })),
                         Ok(Err(error)) => Err((-32000, error.to_string())),
                         Err(error) => Err((-32000, format!("mount task failed: {error}"))),
                     }
@@ -2044,7 +2084,7 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                     })
                     .await
                     {
-                        Ok(Ok(project)) => Ok(json!({ "project": project })),
+                        Ok(Ok(project)) => Ok(json!({ "project": project.view_json() })),
                         Ok(Err(error)) => Err((-32000, error.to_string())),
                         Err(error) => Err((-32000, format!("revoke task failed: {error}"))),
                     }
@@ -2060,7 +2100,13 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
             Ok(json!({
                 "tasks": tasks
                     .into_iter()
-                    .map(|(task_id, running)| json!({ "task_id": task_id, "running": running }))
+                    .map(|task| {
+                        json!({
+                            "task_id": task.task_id,
+                            "running": task.running,
+                            "goal": task.goal,
+                        })
+                    })
                     .collect::<Vec<_>>(),
             }))
         }
@@ -3110,6 +3156,7 @@ mod tests {
                 mounts: vec![],
                 project_id: Some("proj-9".to_owned()),
                 model: None,
+                goal: "Write the Q3 review".to_owned(),
             },
         ));
 
@@ -3160,6 +3207,7 @@ mod tests {
                 mounts: vec![],
                 project_id: Some("proj-7".to_owned()),
                 model: None,
+                goal: "Draft the brief".to_owned(),
             },
         ));
 
@@ -3337,6 +3385,7 @@ mod tests {
                 mounts: vec![],
                 project_id: None,
                 model: None,
+                goal: String::new(),
             },
         ));
 
@@ -3671,6 +3720,136 @@ mod tests {
         drop(write_registration);
         // SAFETY: same lock discipline as the set above.
         unsafe { std::env::remove_var("JCODE_COWORK_STORE_DIR") };
+    }
+
+    #[tokio::test]
+    async fn mount_health_states_surface_in_mount_list() {
+        let _env = lock_store_env();
+        let store_dir = tempfile::tempdir().unwrap();
+        // SAFETY: the STORE_ENV_LOCK is held, so no other thread reads the
+        // environment while it mutates.
+        unsafe { std::env::set_var("JCODE_COWORK_STORE_DIR", store_dir.path()) };
+        let rpc = CoworkRpc::new();
+
+        let response = dispatch_request(
+            authed_request(&rpc, 60, "project.create", json!({ "name": "Health" })),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        let project_id = response["result"]["project"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mounted = workspace.path().join("mount-me");
+        std::fs::create_dir(&mounted).unwrap();
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                61,
+                "mount.add",
+                json!({
+                    "project_id": project_id,
+                    "path": mounted.display().to_string(),
+                    "access": "read_write",
+                }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response["result"]["project"]["mounts"][0]["health"],
+            "available"
+        );
+
+        // Renamed within the same parent: the daemon reports the move and
+        // where the folder went.
+        let renamed = workspace.path().join("mount-me-renamed");
+        std::fs::rename(&mounted, &renamed).unwrap();
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                62,
+                "mount.list",
+                json!({ "project_id": project_id }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        let mount = &response["result"]["project"]["mounts"][0];
+        assert_eq!(mount["health"], "moved", "got: {mount}");
+        assert!(
+            mount["current_path"].as_str().unwrap().ends_with("mount-me-renamed"),
+            "got: {mount}"
+        );
+
+        // Deleted outright: disconnected, no current_path.
+        std::fs::remove_dir(&renamed).unwrap();
+        let response = dispatch_request(
+            authed_request(
+                &rpc,
+                63,
+                "mount.list",
+                json!({ "project_id": project_id }),
+            ),
+            &rpc,
+        )
+        .await
+        .unwrap();
+        let mount = &response["result"]["project"]["mounts"][0];
+        assert_eq!(mount["health"], "disconnected", "got: {mount}");
+        assert!(mount.get("current_path").is_none(), "got: {mount}");
+    }
+
+    #[tokio::test]
+    async fn task_list_surfaces_recorded_goals() {
+        let _env = lock_store_env();
+        let store_dir = tempfile::tempdir().unwrap();
+        // SAFETY: the STORE_ENV_LOCK is held, so no other thread reads the
+        // environment while it mutates.
+        unsafe { std::env::set_var("JCODE_COWORK_STORE_DIR", store_dir.path()) };
+        let rpc = CoworkRpc::new();
+
+        // No tasks yet: empty list.
+        let response = dispatch_request(authed_request(&rpc, 70, "task.list", json!({})), &rpc)
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["tasks"].as_array().unwrap().len(), 0);
+
+        // A running task with a recorded goal surfaces it — that goal is
+        // what the tray menu and feed replay render.
+        rpc.inner.task_contexts.lock().await.push_back((
+            "task-live".to_owned(),
+            TaskContext {
+                mounts: vec![],
+                project_id: None,
+                model: None,
+                goal: "Draft the launch brief".to_owned(),
+            },
+        ));
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        rpc.inner
+            .tasks
+            .lock()
+            .await
+            .insert("task-live".to_owned(), handle);
+        let response = dispatch_request(authed_request(&rpc, 71, "task.list", json!({})), &rpc)
+            .await
+            .unwrap();
+        let tasks = response["result"]["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["task_id"].as_str().unwrap(), "task-live");
+        assert_eq!(tasks[0]["running"], true);
+        assert_eq!(
+            tasks[0]["goal"].as_str().unwrap(),
+            "Draft the launch brief"
+        );
     }
 
     #[tokio::test]
@@ -4166,6 +4345,7 @@ mod tests {
             mounts: vec![CoworkMount::read_write(directory.path())],
             project_id: Some("proj-1".to_owned()),
             model: Some("original-model".to_owned()),
+            goal: "Summarize the workbook".to_owned(),
         };
         // No override: keep the original model; project instructions carried.
         let launch = build_followup_launch(

@@ -357,6 +357,9 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #728772; outli
 .access-badge { flex: 0 0 auto; font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 5px; border-radius: 3px; }
 .access-badge.read_write { background: #e2eee9; color: #256a52; }
 .access-badge.read_only { background: #edeae0; color: #7a6f52; }
+.mount-health { flex: 0 0 auto; font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 5px; border-radius: 3px; }
+.mount-health.moved { background: #f3e8d7; color: #8a5a1e; }
+.mount-health.disconnected { background: #f2ddd9; color: #8a3528; }
 
 .tab-title-input { flex: 1; min-width: 0; width: 100%; font: inherit; font-size: 11px; padding: 1px 4px; border: 1px solid #b8b6a8; border-radius: 3px; background: #fffefa; color: var(--ink); }
 

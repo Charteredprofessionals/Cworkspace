@@ -12,7 +12,7 @@ use base64::Engine;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent, Wry};
 use uuid::Uuid;
 
@@ -531,10 +531,13 @@ fn quit_application(app: &AppHandle) {
     app.exit(0);
 }
 
-/// Keep the tray's task counter current by polling the daemon's task list
-/// every 20 seconds. Polling (instead of counting events) stays correct
-/// across reattach: the count reflects what the daemon itself believes.
-fn tray_task_watcher(app: AppHandle, item: MenuItem<Wry>) {
+/// Keep the tray menu current by polling the daemon's task list every 20
+/// seconds and rebuilding the menu: one clickable entry per running task
+/// (goal as the label) above the status line. Polling (instead of counting
+/// events) stays correct across reattach: the menu reflects what the
+/// daemon itself believes. Menus are built on the main thread; this thread
+/// only fetches the task list.
+fn tray_task_watcher(app: AppHandle, tray: TrayIcon<Wry>) {
     loop {
         thread::sleep(Duration::from_secs(20));
         let Some(bridge) = app.try_state::<Bridge>() else { return };
@@ -543,33 +546,119 @@ fn tray_task_watcher(app: AppHandle, item: MenuItem<Wry>) {
             .lock()
             .ok()
             .and_then(|slot| slot.as_ref().map(Arc::clone));
-        let label = match connection {
+        let connected = matches!(
+            connection.as_ref().map(|connection| connection.alive.load(Ordering::Acquire)),
+            Some(true)
+        );
+        let (tasks, responsive): (Vec<(String, String)>, bool) = match connection {
             Some(connection) if connection.alive.load(Ordering::Acquire) => {
                 match connection.request("task.list", json!({})) {
-                    Ok(value) => {
-                        let count = value
+                    Ok(value) => (
+                        value
                             .get("tasks")
                             .and_then(Value::as_array)
-                            .map(|tasks| tasks.len())
-                            .unwrap_or(0);
-                        match count {
-                            0 => "No tasks running".to_owned(),
-                            1 => "1 task running".to_owned(),
-                            other => format!("{other} tasks running"),
-                        }
-                    }
-                    Err(_) => "Daemon not responding".to_owned(),
+                            .map(|tasks| {
+                                tasks
+                                    .iter()
+                                    .filter_map(|task| {
+                                        let id = task
+                                            .get("task_id")
+                                            .and_then(Value::as_str)?
+                                            .to_owned();
+                                        let goal = truncate_task_label(
+                                            task.get("goal")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("Running task"),
+                                        );
+                                        Some((id, goal))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        true,
+                    ),
+                    Err(_) => (Vec::new(), false),
                 }
             }
-            _ => "Daemon stopped".to_owned(),
+            _ => (Vec::new(), false),
+        };
+        let status = if tasks.is_empty() {
+            match (connected, responsive) {
+                (false, _) => "Daemon stopped".to_owned(),
+                (true, false) => "Daemon not responding".to_owned(),
+                (true, true) => "No tasks running".to_owned(),
+            }
+        } else {
+            match tasks.len() {
+                1 => "1 task running".to_owned(),
+                other => format!("{other} tasks running"),
+            }
         };
         let _ = app.run_on_main_thread({
-            let item = item.clone();
+            let app = app.clone();
+            let tray = tray.clone();
             move || {
-                let _ = item.set_text(&label);
+                let open_item = match MenuItem::with_id(
+                    &app,
+                    "open",
+                    "Open Cworkspace",
+                    true,
+                    None::<&str>,
+                ) {
+                    Ok(item) => item,
+                    Err(_) => return,
+                };
+                let status_item =
+                    match MenuItem::with_id(&app, "tasks", &status, false, None::<&str>) {
+                        Ok(item) => item,
+                        Err(_) => return,
+                    };
+                let mut items: Vec<MenuItem<Wry>> = vec![open_item, status_item];
+                if let Ok(separator) = PredefinedMenuItem::separator(&app) {
+                    items.push(separator);
+                }
+                for (task_id, goal) in &tasks {
+                    if let Ok(item) = MenuItem::with_id(
+                        &app,
+                        format!("task-{task_id}"),
+                        goal,
+                        true,
+                        None::<&str>,
+                    ) {
+                        items.push(item);
+                    }
+                }
+                if let Ok(separator) = PredefinedMenuItem::separator(&app) {
+                    items.push(separator);
+                }
+                if let Ok(quit_item) = MenuItem::with_id(
+                    &app,
+                    "quit",
+                    "Quit Cworkspace (stops background tasks)",
+                    true,
+                    None::<&str>,
+                ) {
+                    items.push(quit_item);
+                }
+                let refs: Vec<&MenuItem<Wry>> = items.iter().collect();
+                if let Ok(menu) = Menu::with_items(&app, &refs) {
+                    let _ = tray.set_menu(Some(menu));
+                }
             }
         });
     }
+}
+
+/// Tray labels stay one line: cut the goal on a char boundary with an
+/// ellipsis instead of relying on the platform to clip it.
+fn truncate_task_label(goal: &str) -> String {
+    const MAX_CHARS: usize = 48;
+    let trimmed = goal.trim();
+    if trimmed.chars().count() <= MAX_CHARS {
+        return trimmed.to_owned();
+    }
+    let cut: String = trimmed.chars().take(MAX_CHARS).collect();
+    format!("{cut}…")
 }
 
 fn canonical_folder(path: &str) -> Result<PathBuf, String> {
@@ -944,6 +1033,14 @@ async fn task_transcript(
 }
 
 #[tauri::command]
+async fn task_list(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, String> {
+    tokio::task::block_in_place(|| {
+        let connection = ensure_connection(&app, &bridge)?;
+        connection.request("task.list", json!({}))
+    })
+}
+
+#[tauri::command]
 async fn tools_list(app: AppHandle, bridge: State<'_, Bridge>) -> Result<Value, String> {
     tokio::task::block_in_place(|| {
         let connection = ensure_connection(&app, &bridge)?;
@@ -1247,7 +1344,7 @@ pub fn run() {
                     &quit_item,
                 ],
             )?;
-            TrayIconBuilder::with_id("main-tray")
+            let tray = TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().expect("bundle icon").clone())
                 .menu(&menu)
                 .show_menu_on_left_click(false)
@@ -1255,7 +1352,15 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => show_main_window(app),
                     "quit" => quit_application(app),
-                    _ => {}
+                    other => {
+                        // Per-task entries from the dynamic tray menu:
+                        // focus the window and ask the webview to open
+                        // that task's tab.
+                        if let Some(task_id) = other.strip_prefix("task-") {
+                            show_main_window(app);
+                            let _ = app.emit("tray-focus-task", task_id.to_owned());
+                        }
+                    }
                 })
                 .on_tray_icon_event(|tray, event| {
                     if matches!(
@@ -1271,8 +1376,8 @@ pub fn run() {
                 })
                 .build(app)?;
             let watcher_app = app.handle().clone();
-            let watcher_item = tasks_item.clone();
-            thread::spawn(move || tray_task_watcher(watcher_app, watcher_item));
+            let watcher_tray = tray.clone();
+            thread::spawn(move || tray_task_watcher(watcher_app, watcher_tray));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1294,6 +1399,7 @@ pub fn run() {
             settings_get,
             settings_update,
             task_transcript,
+            task_list,
             task_followup,
             tools_list,
             permission_list,

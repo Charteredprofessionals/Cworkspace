@@ -186,6 +186,11 @@ type ProjectMount = {
   path: string;
   access: "read_only" | "read_write";
   added_at: string;
+  /// Live filesystem health, computed daemon-side on every project read:
+  /// "available", "moved" (current_path says where the folder went), or
+  /// "disconnected". Absent on older daemons.
+  health?: "available" | "moved" | "disconnected";
+  current_path?: string;
 };
 
 type Project = {
@@ -527,6 +532,25 @@ function App() {
             `Reattached to the background daemon — ${handshake.running_tasks} task(s) still running. Your work never stopped.`,
           );
         }
+        // Feed replay on reattach: the daemon outlives the GUI, so tasks
+        // started before this window existed (or in the previous window)
+        // have no tab yet. Rebuild the roster from the daemon's own task
+        // list, then seed each new tab's feed from the persisted
+        // transcript so it shows where the work actually stands.
+        try {
+          const listed = await invoke<{ task_id: string; running: boolean; goal?: string | null }[]>("task_list");
+          let firstReplayed = true;
+          for (const task of listed) {
+            if (cancelled) break;
+            if (!task.running) continue;
+            if (tabsRef.current.some((tab) => tab.taskId === task.task_id)) continue;
+            await replayRunningTask(task.task_id, task.goal || "", firstReplayed);
+            firstReplayed = false;
+          }
+        } catch {
+          // Daemon too old for task_list or nothing to replay — live
+          // events still work; nothing to recover here.
+        }
         // Protocol handshake (Milestone 0 exit criterion): a daemon whose
         // protocol version predates the GUI's would fail every newer RPC with
         // "Method not found" — surface that immediately instead.
@@ -688,6 +712,20 @@ function App() {
       if (buffered.timer !== null) window.clearTimeout(buffered.timer);
     }
     deltaBuffers.current.clear();
+  }, []);
+
+  // Tray "task" menu items (dynamic tray): the Rust side focuses the
+  // window; this listener opens the matching tab if this window has one.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<string>("tray-focus-task", ({ payload: taskId }) => {
+      const owner = tabsRef.current.find((tab) => tab.taskId === taskId);
+      if (owner) setActiveTabId(owner.id);
+    })
+      .then((fn) => { unlisten = fn; })
+      .catch(() => undefined);
+    return () => { unlisten?.(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -984,6 +1022,58 @@ function App() {
     }
   }
 
+  /// Reattach replay: rebuild a tab for a task the daemon is still running
+  /// that this window never saw. History titles win over the daemon's raw
+  /// goal hint; the feed is seeded from the persisted transcript so the
+  /// user sees where the work stands instead of a blank spinner.
+  async function replayRunningTask(taskId: string, goalHint: string, activate: boolean) {
+    const remembered = history.find((entry) => entry.taskId === taskId)?.goal || "";
+    const goal = goalHint || remembered;
+    const shell = newTab();
+    const tab: SessionTab = {
+      ...shell,
+      goal,
+      title: goal ? tabTitle(goal) : `Resumed ${taskId.slice(0, 8)}`,
+      status: "running",
+      taskId,
+      projectName: "",
+    };
+    setTabs((current) => [...current, tab]);
+    if (activate) setActiveTabId(tab.id);
+    try {
+      const transcript = await invoke<{ messages?: TranscriptEntry[] }>("task_transcript", { taskId, limit: 400 });
+      const entries: FeedEntry[] = [];
+      for (const message of transcript.messages ?? []) {
+        for (const toolEvent of message.events ?? []) {
+          if (toolEvent.type === "tool_use" && toolEvent.tool) {
+            entries.push({
+              key: `replay-${taskId}-${entries.length}`,
+              event: "ToolInvoked",
+              data: { tool: toolEvent.tool, summary: toolEvent.text ?? "" },
+              createdAt: Date.now(),
+            });
+          }
+        }
+        if (message.role === "assistant" && message.text.trim()) {
+          entries.push({
+            key: `replay-${taskId}-${entries.length}`,
+            event: "TaskDelta",
+            data: { text: message.text.trim() },
+            createdAt: Date.now(),
+          });
+        }
+      }
+      if (entries.length) {
+        setTabs((current) => current.map((existing) => (
+          existing.id === tab.id && existing.feed.length === 0 ? { ...existing, feed: entries } : existing
+        )));
+      }
+    } catch {
+      // No transcript recorded yet (task may have just started) — the tab
+      // still receives live events from here on.
+    }
+  }
+
   async function stopTask() {
     const tab = activeTab;
     if (!tab?.taskId) return;
@@ -1124,6 +1214,18 @@ function App() {
                   <span className={`folder-dot ${mount.access === "read_only" ? "readonly" : ""}`} />
                   <span className="folder-label">{folderName(mount.path)}</span>
                   <span className={`access-badge ${mount.access}`}>{mount.access === "read_only" ? "read-only" : "read/write"}</span>
+                  {mount.health && mount.health !== "available" && (
+                    <span
+                      className={`mount-health ${mount.health}`}
+                      title={mount.health === "moved" && mount.current_path
+                        ? `Folder moved — now at ${mount.current_path}`
+                        : mount.health === "moved"
+                          ? "Folder moved"
+                          : "Folder not found on disk"}
+                    >
+                      {mount.health === "moved" ? "moved" : "disconnected"}
+                    </span>
+                  )}
                   <button className="icon-button folder-remove" aria-label={`Revoke ${folderName(mount.path)}`} title="Revoke access" onClick={() => revokeProjectMount(mount.path)}><X size={14} /></button>
                 </div>
               ))}
