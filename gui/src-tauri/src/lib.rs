@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent, Wry};
 use uuid::Uuid;
@@ -598,55 +598,52 @@ fn tray_task_watcher(app: AppHandle, tray: TrayIcon<Wry>) {
             let app = app.clone();
             let tray = tray.clone();
             move || {
-                let open_item = match MenuItem::with_id(
-                    &app,
-                    "open",
-                    "Open Cworkspace",
-                    true,
-                    None::<&str>,
-                ) {
-                    Ok(item) => item,
-                    Err(_) => return,
-                };
-                let status_item =
-                    match MenuItem::with_id(&app, "tasks", &status, false, None::<&str>) {
-                        Ok(item) => item,
-                        Err(_) => return,
-                    };
-                let mut items: Vec<MenuItem<Wry>> = vec![open_item, status_item];
-                if let Ok(separator) = PredefinedMenuItem::separator(&app) {
-                    items.push(separator);
-                }
-                for (task_id, goal) in &tasks {
-                    if let Ok(item) = MenuItem::with_id(
-                        &app,
-                        format!("task-{task_id}"),
-                        goal,
-                        true,
-                        None::<&str>,
-                    ) {
-                        items.push(item);
-                    }
-                }
-                if let Ok(separator) = PredefinedMenuItem::separator(&app) {
-                    items.push(separator);
-                }
-                if let Ok(quit_item) = MenuItem::with_id(
-                    &app,
-                    "quit",
-                    "Quit Cworkspace (stops background tasks)",
-                    true,
-                    None::<&str>,
-                ) {
-                    items.push(quit_item);
-                }
-                let refs: Vec<&MenuItem<Wry>> = items.iter().collect();
-                if let Ok(menu) = Menu::with_items(&app, &refs) {
-                    let _ = tray.set_menu(Some(menu));
-                }
+                let _ = build_tray_menu(&app, &tray, &status, &tasks);
             }
         });
     }
+}
+
+/// Rebuild the tray menu: Open / status line / one entry per running task /
+/// Quit. Items are built eagerly and collected as trait objects so plain
+/// items and separators share one `Menu::with_items` call.
+fn build_tray_menu(
+    app: &AppHandle,
+    tray: &TrayIcon<Wry>,
+    status: &str,
+    tasks: &[(String, String)],
+) -> tauri::Result<()> {
+    let open_item = MenuItem::with_id(app, "open", "Open Cworkspace", true, None::<&str>)?;
+    let status_item = MenuItem::with_id(app, "tasks", status, false, None::<&str>)?;
+    let separator_before = PredefinedMenuItem::separator(app)?;
+    let mut task_items = Vec::new();
+    for (task_id, goal) in tasks {
+        task_items.push(MenuItem::with_id(
+            app,
+            format!("task-{task_id}"),
+            goal,
+            true,
+            None::<&str>,
+        )?);
+    }
+    let separator_after = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(
+        app,
+        "quit",
+        "Quit Cworkspace (stops background tasks)",
+        true,
+        None::<&str>,
+    )?;
+
+    let mut items: Vec<&dyn IsMenuItem<Wry>> =
+        vec![&open_item, &status_item, &separator_before];
+    for item in &task_items {
+        items.push(item);
+    }
+    items.push(&separator_after);
+    items.push(&quit_item);
+    let menu = Menu::with_items(app, &items)?;
+    tray.set_menu(Some(menu))
 }
 
 /// Tray labels stay one line: cut the goal on a char boundary with an
