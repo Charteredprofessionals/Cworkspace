@@ -1422,10 +1422,12 @@ pub async fn list_tasks(&self) -> Vec<TaskSummary> {
         let fork_title: Option<String> = title
             .map(|title| title.chars().take(200).collect::<String>())
             .or_else(|| {
-                parent_name
-                    .as_deref()
-                    .filter(|name| !name.trim().is_empty())
-                    .map(|name| format!("Fork: {}", name.trim()))
+                let name = parent_name.trim();
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(format!("Fork: {name}"))
+                }
             });
         let new_task_id = crate::id::new_id("cowork");
         {
@@ -1486,7 +1488,8 @@ pub async fn list_tasks(&self) -> Vec<TaskSummary> {
             Some(task_id),
             self.task_context(task_id)
                 .await
-                .and_then(|context| context.project_id),
+                .and_then(|context| context.project_id)
+                .as_deref(),
             Some(format!(
                 "rewound session {session_id} to message {message_id}: kept {kept}, dropped {dropped}"
             )),
