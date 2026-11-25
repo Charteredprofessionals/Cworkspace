@@ -1477,8 +1477,10 @@ pub async fn list_tasks(&self) -> Vec<TaskSummary> {
             anyhow!("no session recorded for task {task_id}; it cannot be rewound")
         })?;
         let message_id = message_id.to_owned();
+        let rewind_session = session_id.clone();
+        let rewind_message = message_id.clone();
         let (kept, dropped) = tokio::task::spawn_blocking(move || {
-            rewind_session_on_disk(&session_id, &message_id)
+            rewind_session_on_disk(&rewind_session, &rewind_message)
         })
         .await
         .map_err(|error| anyhow!("rewind task failed: {error}"))??;
