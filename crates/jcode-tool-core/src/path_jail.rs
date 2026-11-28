@@ -230,4 +230,150 @@ mod tests {
             }
         }
     }
+    /// Property 1 (adversarial, 1,000 cases): for any input containing `..`,
+    /// mixed separators, or deep nesting, `verify_path` must never return
+    /// `Ok(path)` whose canonical prefix is outside an allowed root.
+    #[test]
+    fn property1_traversal_invariant_one_thousand_cases() {
+        fn check(jail: &PathJail, canonical_root: &Path, input: &str) {
+            if let Ok(resolved) = jail.verify_path(Path::new(input)) {
+                assert!(
+                    resolved.starts_with(canonical_root),
+                    "input {:?} escaped to {:?}",
+                    input,
+                    resolved
+                );
+            }
+        }
+
+        let temp = TestDir::new();
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).expect("create workspace");
+        let canonical_root = root.canonicalize().expect("canonicalize workspace");
+        let jail = PathJail::new(vec![root.clone()]).expect("create path jail");
+
+        let sibling = temp.path().join("workspace-private");
+        fs::create_dir(&sibling).expect("create sibling");
+        fs::write(sibling.join("secret.txt"), "top-secret").expect("write secret");
+
+        let mut cases: Vec<String> = Vec::new();
+        for i in 0..1000u32 {
+            let depth = (i % 6) + 1;
+            let mut s = String::new();
+            for _ in 0..depth {
+                s.push_str("..");
+                s.push_str(if i % 2 == 0 { "/" } else { "\\" });
+            }
+            s.push_str("workspace-private");
+            s.push_str(if i % 3 == 0 { "/" } else { "\\" });
+            s.push_str("secret.txt");
+            cases.push(s.clone());
+            cases.push(format!(
+                "workspace{}{}",
+                if i % 2 == 0 { "/" } else { "\\" },
+                s
+            ));
+        }
+        cases.sort();
+        cases.dedup();
+        let cases: Vec<String> = cases.into_iter().take(1000).collect();
+
+        for input in &cases {
+            check(&jail, &canonical_root, input);
+        }
+    }
+
+    /// Explicit named red-team vectors (Property 1).
+    #[test]
+    fn redteam_named_traversal_vectors() {
+        let temp = TestDir::new();
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).expect("create workspace");
+        let canonical_root = root.canonicalize().expect("canonicalize workspace");
+        let jail = PathJail::new(vec![root.clone()]).expect("create path jail");
+
+        let sibling = temp.path().join("workspace-private");
+        fs::create_dir(&sibling).expect("create sibling");
+        fs::write(sibling.join("secret.txt"), "top-secret").expect("write secret");
+
+        let vectors: Vec<PathBuf> = vec![
+            root.join("..")
+                .join("..")
+                .join("workspace-private")
+                .join("secret.txt"),
+            root.join("..").join("workspace-private").join("secret.txt"),
+            Path::new("workspace/../../workspace-private/secret.txt").to_path_buf(),
+            Path::new("workspace\\..\\..\\workspace-private\\secret.txt").to_path_buf(),
+            root.join("a")
+                .join("b")
+                .join("..")
+                .join("..")
+                .join("..")
+                .join("workspace-private")
+                .join("secret.txt"),
+            sibling.join("secret.txt"),
+        ];
+
+        for candidate in vectors {
+            if let Ok(resolved) = jail.verify_path(&candidate) {
+                assert!(
+                    resolved.starts_with(&canonical_root),
+                    "traversal vector {:?} escaped to {:?}",
+                    candidate,
+                    resolved
+                );
+            }
+        }
+    }
+
+    /// NTFS Alternate Data Stream rejection (Windows-specific code path).
+    #[cfg(windows)]
+    #[test]
+    fn redteam_ads_stream_is_rejected() {
+        let temp = TestDir::new();
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).expect("create workspace");
+        let jail = PathJail::new(vec![root.clone()]).expect("create path jail");
+        fs::write(root.join("allowed_file.txt"), "benign").expect("write file");
+        let ads = Path::new(r"allowed_file.txt:hidden_stream:$DATA");
+        assert!(
+            jail.verify_path(ads).is_err(),
+            "ADS stream must be rejected"
+        );
+    }
+
+    /// Extended-length UNC prefix manipulation rejection (Windows-specific).
+    #[cfg(windows)]
+    #[test]
+    fn redteam_extended_length_unc_is_rejected() {
+        let temp = TestDir::new();
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).expect("create workspace");
+        let jail = PathJail::new(vec![root.clone()]).expect("create path jail");
+        let unc = Path::new(r"\\?\C:\Windows\win.ini");
+        assert!(
+            jail.verify_path(unc).is_err(),
+            "extended-length UNC system path must be rejected"
+        );
+    }
+
+    /// Directory junction escape rejection (Windows-specific).
+    #[cfg(windows)]
+    #[test]
+    fn redteam_directory_junction_escape_is_rejected() {
+        use std::os::windows::fs::symlink_dir;
+        let temp = TestDir::new();
+        let root = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).expect("create workspace");
+        fs::create_dir(&outside).expect("create outside directory");
+        fs::write(outside.join("secret.txt"), "junction-secret").expect("write secret");
+        symlink_dir(&outside, root.join("escape")).expect("create junction");
+        let jail = PathJail::new(vec![root.clone()]).expect("create path jail");
+        assert!(
+            jail.verify_path(&root.join("escape").join("secret.txt"))
+                .is_err(),
+            "directory junction escape must be rejected"
+        );
+    }
 }

@@ -2671,9 +2671,20 @@ pub async fn run_cowork_task(
         ));
     }
     let registry = crate::tool::Registry::new(provider.clone()).await;
+    // Give Cowork tasks the same configured MCP connectors as CLI agent
+    // sessions. Mirrors `run_single_message_command`: advertise cached tool
+    // schemas synchronously (so the first locked tool snapshot already
+    // contains MCP tools) and connect on first use. Cowork tasks are
+    // long-lived, so late background connections register on a later turn
+    // and no cold-cache wait is needed here. (desktop parity 5.2)
+    if run_command_mcp_enabled() {
+        registry.register_mcp_tools(None, None, None).await;
+    }
     let mut agent = crate::agent::Agent::new(provider, registry);
     agent.set_working_dir(&working_dir.display().to_string());
     let session_id = agent.session_id().to_owned();
+    // NOTE: the binding is load-bearing — a bare `let _ =` would drop the
+    // registrations (including the tool-event subscription) immediately.
     let _registrations = rpc.register_agent_session(&session_id, roots).await?;
     let base_prompt = crate::prompt::load_base_system_prompt(Some(&working_dir));
     agent.set_system_prompt(&format!(

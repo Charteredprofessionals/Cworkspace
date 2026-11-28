@@ -87,7 +87,8 @@ mod tests {
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: ToolExecutionMode::Direct,
-        };
+        require_validator: false,
+};
         let stats = || -> SessionEditStats {
             serde_json::from_slice(
                 &std::fs::read(home.path().join("sessions/edit-stats/stats_test.json")).unwrap(),
@@ -215,6 +216,7 @@ mod tests {
         // Another session sharing the worktree has its own counter.
         let other = ToolContext {
             session_id: "other".into(),
+            require_validator: false,
             ..ctx.clone()
         };
         crate::tool::write::WriteTool

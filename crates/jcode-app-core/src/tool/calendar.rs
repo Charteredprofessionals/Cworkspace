@@ -616,7 +616,8 @@ mod tests {
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: super::super::ToolExecutionMode::Direct,
-        };
+        require_validator: false,
+};
         let tool = CalendarTool::new();
         assert!(tool.client.is_configured(), "Calendar not granted");
 
@@ -669,7 +670,8 @@ mod tests {
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: super::super::ToolExecutionMode::Direct,
-        };
+        require_validator: false,
+};
         let tool = CalendarTool::new();
         let created = tool
             .execute(

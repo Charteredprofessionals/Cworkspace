@@ -100,7 +100,9 @@ fn is_internal_system_reminder_message(message: &StoredMessage) -> bool {
         .is_some_and(|text| text.starts_with("<system-reminder>"))
 }
 
-fn is_visible_conversation_message(message: &StoredMessage) -> bool {
+/// Pub for the desktop transcript bridge (app-core replay): true when a
+/// persisted message is part of the user-visible conversation.
+pub fn is_visible_conversation_message(message: &StoredMessage) -> bool {
     message.display_role.is_none()
         && !is_internal_system_reminder_message(message)
         && !is_scheduled_task_message(message)

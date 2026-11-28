@@ -11,7 +11,8 @@ fn test_ctx(root: &Path) -> ToolContext {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: super::super::ToolExecutionMode::Direct,
-    }
+    require_validator: false,
+}
 }
 
 fn test_exposure(message_index: usize, total_messages: usize) -> ExposureDescriptor {

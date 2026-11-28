@@ -417,7 +417,8 @@ pub(super) fn handle_run_subagent(
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: crate::tool::ToolExecutionMode::Direct,
-        };
+        require_validator: false,
+};
 
         let started = Instant::now();
         let tool_name_for_exec = tool_name.clone();

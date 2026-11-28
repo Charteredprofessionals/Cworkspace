@@ -58,7 +58,8 @@ fn ctx(session: &str) -> ToolContext {
         stdin_request_tx: None,
         graceful_shutdown_signal: None,
         execution_mode: super::super::ToolExecutionMode::Direct,
-    }
+    require_validator: false,
+}
 }
 
 async fn registry() -> Registry {

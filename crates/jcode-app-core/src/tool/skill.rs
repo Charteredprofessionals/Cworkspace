@@ -408,7 +408,8 @@ mod tests {
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: crate::tool::ToolExecutionMode::Direct,
-        }
+        require_validator: false,
+}
     }
 
     #[test]
@@ -562,6 +563,7 @@ mod tests {
     fn context_with_working_dir(dir: &std::path::Path) -> ToolContext {
         ToolContext {
             working_dir: Some(dir.to_path_buf()),
+            require_validator: false,
             ..create_test_context()
         }
     }

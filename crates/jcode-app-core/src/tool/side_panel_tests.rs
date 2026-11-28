@@ -46,7 +46,8 @@ async fn side_panel_tool_writes_page() {
                 stdin_request_tx: None,
                 graceful_shutdown_signal: None,
                 execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
-            },
+            require_validator: false,
+},
         )
         .await
         .expect("tool execute");
@@ -77,7 +78,8 @@ async fn side_panel_tool_loads_file_with_derived_page_id() {
                 stdin_request_tx: None,
                 graceful_shutdown_signal: None,
                 execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
-            },
+            require_validator: false,
+},
         )
         .await
         .expect("tool execute");

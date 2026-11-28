@@ -518,7 +518,8 @@ mod tests {
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: super::super::ToolExecutionMode::Direct,
-        }
+        require_validator: false,
+}
     }
 
     fn render(diff: &str, old: &str) -> Result<String> {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
@@ -93,7 +93,11 @@ type HistoryEntry = {
   goal: string;
   status: "running" | "completed" | "stopped" | "failed";
   updatedAt: number;
+  sessionId?: string;
 };
+
+type RecoveredEntry = { role: string; timestamp?: string; text: string };
+type LoginProviderInfo = { id: string; name: string; detail: string; method: string };
 
 type Artifact = {
   path: string;
@@ -156,7 +160,7 @@ function App() {
   const [history, setHistory] = useState<HistoryEntry[]>(initialHistory);
   const [goal, setGoal] = useState("");
   const [activeTaskId, setActiveTaskId] = useState("");
-  const [taskStatus, setTaskStatus] = useState<"idle" | "running" | "completed" | "stopped">("idle");
+  const [taskStatus, setTaskStatus] = useState<"idle" | "running" | "completed" | "stopped" | "failed">("idle");
   const [daemonStatus, setDaemonStatus] = useState<"connecting" | "connected" | "offline">("connecting");
   const [feed, setFeed] = useState<FeedEntry[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -165,10 +169,29 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [handledApprovals, setHandledApprovals] = useState<Record<string, boolean>>({});
+  const [recovered, setRecovered] = useState<RecoveredEntry[]>([]);
+  const [providers, setProviders] = useState<LoginProviderInfo[]>([]);
+  const [authProviderId, setAuthProviderId] = useState("");
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [authNotice, setAuthNotice] = useState("");
+  const [authCatalog, setAuthCatalog] = useState<"loading" | "ready" | "unavailable">("loading");
+  const restoreEpoch = useRef(0);
 
   useEffect(() => {
     localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 30)));
   }, [history]);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<{ providers?: LoginProviderInfo[] }>("auth_providers")
+      .then((result) => {
+        if (cancelled) return;
+        setProviders(result.providers || []);
+        setAuthCatalog("ready");
+      })
+      .catch(() => { if (!cancelled) setAuthCatalog("unavailable"); });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -203,9 +226,29 @@ function App() {
           setPreviewOpen(true);
         }
       }
+      if (payload.event === "AgentSpawned") {
+        // Remember the daemon session id so this task's transcript can be
+        // recovered from persisted records after a restart (parity 5.4).
+        // Attribute by the event's task_id, not the activeTaskId closure, so
+        // a task switch around a spawn cannot corrupt the wrong entry.
+        const agentId = text(payload.data || {}, "agent_id");
+        const spawnedTaskId = text(payload.data || {}, "task_id");
+        if (agentId && spawnedTaskId) {
+          setHistory((current) => current.map((item) => item.taskId === spawnedTaskId ? { ...item, sessionId: agentId, updatedAt: Date.now() } : item));
+        }
+      }
       if (payload.event === "TaskCompleted") {
-        setTaskStatus("completed");
-        setHistory((current) => current.map((item) => item.taskId === activeTaskId ? { ...item, status: "completed", updatedAt: Date.now() } : item));
+        // Honor completion success and summary (parity 5.3): a failed task
+        // must never render as completed. The daemon marks a user stop with
+        // success:false and the fixed summary "Task stopped by user"
+        // (src/ipc/cowork_rpc.rs stop_task) — that renders as stopped.
+        const data = payload.data || {};
+        const success = typeof data.success === "boolean" ? data.success : true;
+        const stopped = !success && text(data, "summary") === "Task stopped by user";
+        const status: HistoryEntry["status"] = stopped ? "stopped" : success ? "completed" : "failed";
+        const completedTaskId = text(data, "task_id") || activeTaskId;
+        setHistory((current) => current.map((item) => item.taskId === completedTaskId ? { ...item, status, updatedAt: Date.now() } : item));
+        if (completedTaskId === activeTaskId) setTaskStatus(status);
       }
     })
       .then((stopListening) => {
@@ -265,6 +308,8 @@ function App() {
     setArtifacts([]);
     setSelectedArtifact(null);
     setHandledApprovals({});
+    setRecovered([]);
+    restoreEpoch.current += 1;
     try {
       const taskId = await invoke<string>("start_cowork_task", { goal: goal.trim(), allowedRoots: folders });
       setDaemonStatus("connected");
@@ -300,14 +345,46 @@ function App() {
     }
   }
 
-  function restoreHistory(item: HistoryEntry) {
+  async function restoreHistory(item: HistoryEntry) {
     setGoal(item.goal);
     setActiveTaskId(item.taskId);
-    setTaskStatus(item.status === "running" ? "running" : item.status === "completed" ? "completed" : "stopped");
+    setRecovered([]);
+    const epoch = ++restoreEpoch.current;
+    setTaskStatus(item.status === "running" ? "running" : item.status === "completed" ? "completed" : item.status === "failed" ? "failed" : "stopped");
     setFeed([]);
     setArtifacts([]);
     setSelectedArtifact(null);
-    setError("History stores task summaries only; daemon events are available for the current connection.");
+    if (!item.sessionId) {
+      setError("History stores task summaries only; daemon events are available for the current connection.");
+      return;
+    }
+    // Recover the persisted transcript over the narrow history bridge
+    // (parity 5.4) instead of leaving the tab empty after a restart.
+    try {
+      const result = await invoke<{ entries?: RecoveredEntry[] }>("session_transcript", { sessionId: item.sessionId });
+      const entries = result.entries || [];
+      if (!entries.length) {
+        setError("The persisted transcript for this task is empty.");
+        return;
+      }
+      if (epoch !== restoreEpoch.current) return;
+      setError("");
+      setRecovered(entries);
+    } catch (reason) {
+      setError(`Could not recover the transcript: ${errorMessage(reason)}`);
+    }
+  }
+
+  async function saveApiKey() {
+    setError("");
+    setAuthNotice("");
+    try {
+      await invoke("auth_set_api_key", { provider: authProviderId, apiKey: apiKeyInput });
+      setApiKeyInput("");
+      setAuthNotice("Key saved in jcode's local store. Credentials hot-reload — no restart needed.");
+    } catch (reason) {
+      setError(`Could not save the API key: ${errorMessage(reason)}`);
+    }
   }
 
   return (
@@ -319,7 +396,7 @@ function App() {
           <div><div className="brand-name">jcode <span>cowork</span></div><div className="brand-subtitle">A space for the work ahead</div></div>
         </div>
 
-        <button className="new-session" onClick={() => { setGoal(""); setFeed([]); setArtifacts([]); setSelectedArtifact(null); setTaskStatus("idle"); setError(""); }}>
+        <button className="new-session" onClick={() => { setGoal(""); setFeed([]); setArtifacts([]); setSelectedArtifact(null); setTaskStatus("idle"); setError(""); setRecovered([]); restoreEpoch.current += 1; }}>
           <Plus size={16} strokeWidth={2.2} /> New task <span>⌘ N</span>
         </button>
 
@@ -336,6 +413,27 @@ function App() {
             ))}
             {!folders.length && <p className="sidebar-empty">Your folders stay yours. Mount one to begin.</p>}
           </div>
+        </section>
+
+        <section className="sidebar-section provider-section">
+          <div className="section-heading"><span>CONNECT A PROVIDER</span><ShieldCheck size={14} /></div>
+          {providers.length ? (
+            <div className="provider-list">
+              <select className="provider-select" value={authProviderId} aria-label="Provider" onChange={(event) => setAuthProviderId(event.target.value)}>
+                <option value="">Choose a provider…</option>
+                {providers.filter((provider) => provider.method === "ApiKey").map((provider) => (
+                  <option key={provider.id} value={provider.id}>{provider.name}</option>
+                ))}
+              </select>
+              <input className="provider-key" type="password" autoComplete="off" value={apiKeyInput} placeholder="API key — masked, never in chat" onChange={(event) => setApiKeyInput(event.target.value)} />
+              <button className="provider-save" disabled={!authProviderId || !apiKeyInput.trim() || busy} onClick={saveApiKey}><ShieldCheck size={14} /> Save key</button>
+              {authNotice && <p className="provider-notice">{authNotice}</p>}
+            </div>
+          ) : authCatalog === "loading" ? (
+            <p className="sidebar-empty">Loading provider sign-in…</p>
+          ) : (
+            <p className="sidebar-empty">Provider sign-in is unavailable — reconnect to jcode, then reopen this panel.</p>
+          )}
         </section>
 
         <section className="sidebar-section history-section">
@@ -376,12 +474,26 @@ function App() {
 
           {error && <div className="error-banner" role="alert"><AlertCircle size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => setError("")}><X size={15} /></button></div>}
 
-          <div className="feed-heading"><div><span className="feed-kicker">LIVE SESSION</span><h2>Work in motion</h2></div><div className="feed-actions">{taskStatus === "running" && <button className="stop-action" onClick={stopTask}><StopCircle size={15} /> Stop task</button>}<span className={`task-badge ${taskStatus}`}>{taskStatus === "running" ? <><i className="pulse-dot" /> In progress</> : taskStatus === "completed" ? "Completed" : taskStatus === "stopped" ? "Stopped" : "Waiting"}</span></div></div>
+          <div className="feed-heading"><div><span className="feed-kicker">LIVE SESSION</span><h2>Work in motion</h2></div><div className="feed-actions">{taskStatus === "running" && <button className="stop-action" onClick={stopTask}><StopCircle size={15} /> Stop task</button>}<span className={`task-badge ${taskStatus}`}>{taskStatus === "running" ? <><i className="pulse-dot" /> In progress</> : taskStatus === "completed" ? "Completed" : taskStatus === "stopped" ? "Stopped" : taskStatus === "failed" ? "Failed" : "Waiting"}</span></div></div>
 
           <div className="feed-list">
             {feed.map((entry) => <FeedCard key={entry.key} entry={entry} handled={handledApprovals} onAnswer={answerApproval} />)}
             {!feed.length && <div className="feed-empty"><div className="empty-orbit"><ArrowDown size={19} /></div><strong>{taskStatus === "running" ? "Connecting to your task…" : "The next step starts with you"}</strong><span>When work begins, agents, tool activity, and approval requests will appear here.</span></div>}
           </div>
+          {recovered.length > 0 && (
+            <section className="recovered-block">
+              <div className="section-heading"><span>RECOVERED TRANSCRIPT</span><History size={14} /></div>
+              {taskStatus === "running" && <p className="recovered-note">This task was still marked running when the desktop closed. Check its state before resuming.</p>}
+              <div className="recovered-list">
+                {recovered.map((entry, index) => (
+                  <div className={`recovered-entry ${entry.role}`} key={index}>
+                    <span className="recovered-role">{entry.role === "user" ? "You" : "Cowork"}</span>
+                    <p>{entry.text}</p>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
           {feed.length > 0 && <div className="feed-end"><span /> Session activity <span /></div>}
         </div>
       </section>
@@ -417,16 +529,18 @@ function FeedCard({ entry, handled, onAnswer }: { entry: FeedEntry; handled: Rec
   const toolName = text(entry.data, "tool", "tool_name", "name") || "Tool";
   const description = text(entry.data, "description", "summary", "message", "input", "arguments");
   const artifactPath = text(entry.data, "path");
+  const taskStopped = entry.event === "TaskCompleted" && text(entry.data, "summary") === "Task stopped by user";
+  const taskFailed = entry.event === "TaskCompleted" && !taskStopped && typeof entry.data.success === "boolean" && entry.data.success === false;
 
   return (
     <article className={`feed-entry ${entry.event.toLowerCase()}`}>
-      <div className="timeline-rail"><span className={`event-symbol ${entry.event.toLowerCase()}`}>{entry.event === "AgentSpawned" ? <Sparkles size={14} /> : entry.event === "ToolInvoked" ? <ChevronRight size={14} /> : entry.event === "ArtifactCreated" ? <FileText size={14} /> : entry.event === "ApprovalRequired" ? <ShieldCheck size={14} /> : <Check size={14} />}</span><span className="rail-line" /></div>
+      <div className="timeline-rail"><span className={`event-symbol ${entry.event.toLowerCase()}`}>{entry.event === "AgentSpawned" ? <Sparkles size={14} /> : entry.event === "ToolInvoked" ? <ChevronRight size={14} /> : entry.event === "ArtifactCreated" ? <FileText size={14} /> : entry.event === "ApprovalRequired" ? <ShieldCheck size={14} /> : taskFailed ? <X size={14} /> : <Check size={14} />}</span><span className="rail-line" /></div>
       <div className="event-body">
-        <button className="event-title-row" onClick={() => setExpanded((value) => !value)}><div><span className="event-label">{label}</span><strong>{entry.event === "AgentSpawned" ? agentName : entry.event === "ToolInvoked" ? toolName : entry.event === "ArtifactCreated" ? folderName(artifactPath || "New file") : entry.event === "ApprovalRequired" ? text(entry.data, "tool", "tool_name") || "Action needs your approval" : "This task is complete"}</strong></div><span className="event-time"><Clock3 size={12} /> {new Date(entry.createdAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span></button>
+        <button className="event-title-row" onClick={() => setExpanded((value) => !value)}><div><span className="event-label">{label}</span><strong>{entry.event === "AgentSpawned" ? agentName : entry.event === "ToolInvoked" ? toolName : entry.event === "ArtifactCreated" ? folderName(artifactPath || "New file") : entry.event === "ApprovalRequired" ? text(entry.data, "tool", "tool_name") || "Action needs your approval" : taskStopped ? "This task was stopped" : taskFailed ? "This task failed" : "This task is complete"}</strong></div><span className="event-time"><Clock3 size={12} /> {new Date(entry.createdAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span></button>
         {expanded && <div className="event-detail">
           {entry.event === "ApprovalRequired" ? <div className={`approval-card ${approvalHandled ? "answered" : ""}`}><div className="approval-copy"><span className="approval-eyebrow"><ShieldCheck size={13} /> YOUR DECISION</span><p>{description || "An agent is requesting permission to continue with this action."}</p>{text(entry.data, "tool", "tool_name") && <code>{text(entry.data, "tool", "tool_name")}</code>}</div>{approvalHandled ? <div className="approval-result"><Check size={14} /> {handled[approvalKey] ? "Allowed" : "Rejected"}</div> : <div className="approval-actions"><button className="reject-button" onClick={() => typeof approvalId === "string" || typeof approvalId === "number" ? onAnswer(approvalId, false) : undefined}><X size={14} /> Reject</button><button className="allow-button" onClick={() => typeof approvalId === "string" || typeof approvalId === "number" ? onAnswer(approvalId, true) : undefined}><Check size={14} /> Allow</button></div>}</div>
           : entry.event === "ArtifactCreated" ? <p className="event-description">{artifactPath || description || "A new deliverable is ready to preview."}</p>
-          : <p className="event-description">{description || (entry.event === "AgentSpawned" ? "Preparing a focused workstream." : entry.event === "ToolInvoked" ? "Working through the requested step." : "The requested work has finished.")}</p>}
+          : <p className="event-description">{description || (entry.event === "AgentSpawned" ? "Preparing a focused workstream." : entry.event === "ToolInvoked" ? "Working through the requested step." : taskStopped ? "You stopped this task." : taskFailed ? "The task ended with an error." : "The requested work has finished.")}</p>}
         </div>}
       </div>
     </article>
