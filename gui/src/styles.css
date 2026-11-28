@@ -228,3 +228,34 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #728772; outli
   .artifact-panel.closed { display: none; }
   .approval-counter { right: 12px; bottom: 12px; }
 }
+
+/* Provider sign-in (desktop parity 5.1) */
+.provider-list { display: flex; flex-direction: column; gap: 7px; margin: 3px 7px; }
+.provider-select, .provider-key {
+  width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: 8px;
+  background: #ffffff; color: var(--ink); padding: 7px 9px; font-size: 12px; font-family: inherit;
+}
+.provider-select:focus, .provider-key:focus { outline: 2px solid var(--moss); outline-offset: -1px; }
+.provider-save {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  border: 1px solid #dce5d6; border-radius: 8px; background: #edf1e8; color: #57705a;
+  padding: 6px 10px; font-size: 11px; cursor: pointer;
+}
+.provider-save:disabled { opacity: 0.5; cursor: default; }
+.provider-notice { margin: 2px 0 0; font-size: 11px; color: var(--muted); }
+
+/* Failed task badge (desktop parity 5.3) */
+.task-badge.failed { background: #f6e7e3; color: #9b5444; border-color: #ecd2cb; }
+.history-status.failed { background: #c9705f; }
+
+/* Recovered transcript (desktop parity 5.4) */
+.recovered-block { margin-top: 18px; border-top: 1px dashed var(--line); padding-top: 14px; }
+.recovered-note { margin: 6px 2px; font-size: 11px; color: #9a6c3f; }
+.recovered-list { display: flex; flex-direction: column; gap: 8px; }
+.recovered-entry {
+  border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+  padding: 9px 12px; max-width: 720px;
+}
+.recovered-entry.assistant { margin-left: 26px; }
+.recovered-role { display: block; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+.recovered-entry p { margin: 0; font-size: 12px; white-space: pre-wrap; word-break: break-word; }

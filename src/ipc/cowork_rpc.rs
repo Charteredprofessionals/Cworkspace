@@ -44,6 +44,19 @@ pub enum CoworkEvent {
     },
 }
 
+/// Keeps the per-session tool-event forwarding task alive. Aborting on drop
+/// mirrors the other session registrations, whose drops tear down their
+/// session-scoped state exactly when the Cowork task ends.
+pub struct SessionToolEventSubscription {
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for SessionToolEventSubscription {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
 #[derive(Clone)]
 pub struct CoworkRpc {
     inner: Arc<CoworkRpcInner>,
@@ -81,6 +94,7 @@ impl CoworkRpc {
         crate::tool::SessionPathValidatorRegistration,
         crate::tool::SessionApprovalRegistration,
         crate::tool::SessionArtifactCreatedRegistration,
+        SessionToolEventSubscription,
     )> {
         let jail_roots = validate_workspace_roots(roots).await?;
         let session_id = session_id.to_owned();
@@ -123,10 +137,48 @@ impl CoworkRpc {
                         .map_err(|error| error.to_string())
                 }
             });
+        // Surface tool activity to the desktop: the agent loop already
+        // publishes `ToolUpdated(Running)` on the global Bus for every tool
+        // call, so subscribe here and forward matching events as
+        // `CoworkEvent::ToolInvoked`. The subscription task lives exactly as
+        // long as the returned registration (desktop parity 5.3).
+        let weak = Arc::downgrade(&self.inner);
+        let mut tool_events = crate::bus::Bus::global().subscribe();
+        let bus_session_id = session_id.clone();
+        let tool_subscription_task = tokio::spawn(async move {
+            loop {
+                match tool_events.recv().await {
+                    Ok(crate::bus::BusEvent::ToolUpdated(event))
+                        if event.session_id == bus_session_id
+                            && matches!(event.status, crate::bus::ToolStatus::Running) =>
+                    {
+                        let Some(inner) = weak.upgrade() else {
+                            return;
+                        };
+                        let _ = CoworkRpc { inner }.emit_event(CoworkEvent::ToolInvoked {
+                            tool_call_id: event.tool_call_id,
+                            tool_name: event.tool_name,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        crate::logging::warn(&format!(
+                            "Cowork tool-event feed lagged; {skipped} events skipped"
+                        ));
+                        continue;
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let tool_event_registration = SessionToolEventSubscription {
+            abort: tool_subscription_task.abort_handle(),
+        };
         Ok((
             path_registration,
             approval_registration,
             artifact_registration,
+            tool_event_registration,
         ))
     }
 
@@ -472,6 +524,49 @@ async fn dispatch_request(request: RpcRequest, rpc: &CoworkRpc) -> Option<Value>
                 None => Err((-32602, "params require string task_id".to_string())),
             }
         }
+        "session_list" => {
+            // Narrow desktop history bridge over jcode's persisted session
+            // records (desktop parity 5.4). Read-only: summaries only, no
+            // message bodies leave the daemon here.
+            let limit = request
+                .params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(50)
+                .clamp(1, 200) as usize;
+            // Parsing sessions is disk- and CPU-heavy (journal replay per
+            // file) — keep it off the async dispatch path.
+            let sessions = tokio::task::spawn_blocking(move || {
+                crate::replay::list_recent_sessions(limit)
+            })
+            .await
+            .unwrap_or_default();
+            Ok(json!({ "sessions": sessions }))
+        }
+        "session_transcript" => {
+            let session_id = request.params.get("session_id").and_then(Value::as_str);
+            match session_id {
+                // Session ids are opaque names (session_<id>_<ts>). Reject
+                // anything path-like: load_session resolves ids as paths
+                // first, and the non-Windows WS fallback listener is
+                // unauthenticated, so a path-shaped id must not become an
+                // arbitrary file read.
+                Some(session_id)
+                    if !session_id.trim().is_empty()
+                        && !session_id.contains('/')
+                        && !session_id.contains('\\')
+                        && !session_id.contains("..") =>
+                {
+                    crate::replay::load_session_transcript(session_id, 400)
+                        .map(|entries| json!({ "session_id": session_id, "entries": entries }))
+                        .map_err(|error| (-32000, error.to_string()))
+                }
+                _ => Err((
+                    -32602,
+                    "params require non-empty string session_id".to_string(),
+                )),
+            }
+        }
         "approve_tool_call" => {
             let approval_id = request.params.get("id").and_then(Value::as_str);
             let approved = request.params.get("approved").and_then(Value::as_bool);
@@ -704,6 +799,38 @@ mod tests {
         .unwrap();
 
         assert_eq!(response["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn session_list_returns_a_sessions_array_without_error() {
+        let response = dispatch_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(4)),
+                method: "session_list".to_string(),
+                params: json!({ "limit": 5 }),
+            },
+            &CoworkRpc::new(),
+        )
+        .await
+        .unwrap();
+        assert!(response["result"]["sessions"].is_array());
+    }
+
+    #[tokio::test]
+    async fn session_transcript_rejects_unknown_sessions_with_a_daemon_error() {
+        let response = dispatch_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(5)),
+                method: "session_transcript".to_string(),
+                params: json!({ "session_id": "definitely-missing-session-zz" }),
+            },
+            &CoworkRpc::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32000);
     }
 
     #[tokio::test]

@@ -609,6 +609,124 @@ pub fn load_session(id_or_path: &str) -> Result<Session> {
     );
 }
 
+/// Narrow desktop-facing session summary for the Cowork history bridge
+/// (desktop parity 5.4). Read-only view over jcode's persisted session
+/// records; the desktop renders summaries while transcripts stay loaded on
+/// demand through [`load_session_transcript`].
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub working_dir: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub message_count: usize,
+}
+
+/// List persisted sessions, newest first, capped at `limit` entries.
+/// Missing or unreadable session files are skipped, never fatal.
+pub fn list_recent_sessions(limit: usize) -> Vec<SessionSummary> {
+    let sessions_dir = match crate::storage::jcode_dir().map(|dir| dir.join("sessions")) {
+        Ok(dir) => dir,
+        Err(_) => return Vec::new(),
+    };
+    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+        return Vec::new();
+    };
+    // Session files carry the full transcript (journal replay per parse), so
+    // only parse the `limit` most recently modified files instead of every
+    // file in the directory.
+    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .map(|ext| ext == "json")
+                .unwrap_or(false)
+        })
+        .filter_map(|entry| {
+            let modified = entry.metadata().and_then(|meta| meta.modified()).ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.truncate(limit);
+    let mut sessions: Vec<Session> = candidates
+        .into_iter()
+        .filter_map(|(_, path)| Session::load_from_path(&path).ok())
+        .collect();
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sessions
+        .into_iter()
+        .map(|session| SessionSummary {
+            id: session.id,
+            title: session.title,
+            working_dir: session.working_dir,
+            created_at: session.created_at.to_rfc3339(),
+            updated_at: session.updated_at.to_rfc3339(),
+            message_count: session.messages.len(),
+        })
+        .collect()
+}
+
+/// One readable transcript line for the desktop recovery view (desktop
+/// parity 5.4): user and assistant text only, trimmed to keep the wire
+/// response lean.
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptEntry {
+    pub role: String,
+    pub timestamp: Option<String>,
+    pub text: String,
+}
+
+/// Load the readable transcript of a persisted session by ID (or path).
+/// Tool calls, reasoning blocks, and empty messages are skipped.
+pub fn load_session_transcript(session_id: &str, max_entries: usize) -> Result<Vec<TranscriptEntry>> {
+    let session = load_session(session_id)?;
+    const ENTRY_TEXT_LIMIT: usize = 4000;
+    let mut entries = Vec::new();
+    for message in &session.messages {
+        // Keep daemon plumbing (system reminders, scheduled-task prompts)
+        // out of the desktop recovery view.
+        if !crate::session::is_visible_conversation_message(message) {
+            continue;
+        }
+        let role = if matches!(message.role, Role::User) {
+            "user"
+        } else {
+            "assistant"
+        };
+        let mut text = String::new();
+        for block in &message.content {
+            if let ContentBlock::Text {
+                text: block_text, ..
+            } = block
+            {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(block_text);
+            }
+        }
+        if text.trim().is_empty() {
+            continue;
+        }
+        if text.chars().count() > ENTRY_TEXT_LIMIT {
+            text = text.chars().take(ENTRY_TEXT_LIMIT).collect();
+        }
+        entries.push(TranscriptEntry {
+            role: role.to_string(),
+            timestamp: message.timestamp.map(|ts| ts.to_rfc3339()),
+            text,
+        });
+        if entries.len() >= max_entries {
+            break;
+        }
+    }
+    Ok(entries)
+}
+
 #[derive(Debug, Clone)]
 pub struct SwarmReplaySession {
     pub session: Session,

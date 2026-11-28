@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use jcode_sdk::{AuthClient, AuthOptions, ConnectOptions, JcodeClient};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
@@ -413,6 +414,95 @@ async fn respond_approval(
     Ok(())
 }
 
+/// Recent persisted sessions for the desktop recovery view (desktop parity
+/// 5.4). Summaries only; transcripts load on demand through `session_transcript`.
+#[tauri::command]
+async fn list_sessions(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    limit: Option<u32>,
+) -> Result<Value, String> {
+    let connection = ensure_connection(&app, &bridge)?;
+    let limit = limit.unwrap_or(50).clamp(1, 200);
+    connection.request("session_list", json!({ "limit": limit }))
+}
+
+/// Readable transcript of a persisted session, for restoring a task's history
+/// after the desktop restarts (desktop parity 5.4). Read-only.
+#[tauri::command]
+async fn session_transcript(
+    app: AppHandle,
+    bridge: State<'_, Bridge>,
+    session_id: String,
+) -> Result<Value, String> {
+    if session_id.trim().is_empty() {
+        return Err("A session id is required to recover a transcript".to_owned());
+    }
+    let connection = ensure_connection(&app, &bridge)?;
+    connection.request("session_transcript", json!({ "session_id": session_id }))
+}
+
+/// Provider login catalog for the desktop sign-in panel (desktop parity 5.1),
+/// per docs/DESKTOP_AUTH_SDK.md: build the picker from `AuthClient::providers()`.
+/// The catalog call is local and never transports credential material.
+#[tauri::command]
+async fn auth_providers() -> Result<Value, String> {
+    tokio::task::spawn_blocking(|| {
+        let options = AuthOptions {
+            binary: std::env::var_os("JCODE_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("jcode")),
+            jcode_home: None,
+            socket: None,
+            timeout: Duration::from_secs(30),
+        };
+        let client = AuthClient::new(options);
+        let providers: Vec<Value> = client
+            .providers()
+            .into_iter()
+            .map(|provider| {
+                json!({
+                    "id": provider.id,
+                    "name": provider.display_name,
+                    "detail": provider.detail,
+                    "method": format!("{:?}", provider.method),
+                })
+            })
+            .collect();
+        Ok(json!({ "providers": providers }))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Save an API key through the jcode SDK (desktop parity 5.1). Keys arrive
+/// from a masked, transient input in the UI and are never logged; the SDK
+/// persists them in jcode's owner-only provider store and hot-reloads
+/// credentials. Runs on a worker thread per the SDK contract.
+#[tauri::command]
+async fn auth_set_api_key(provider: String, api_key: String) -> Result<(), String> {
+    let provider = provider.trim().to_owned();
+    if provider.is_empty() {
+        return Err("A provider is required".to_owned());
+    }
+    let api_key = api_key.trim().to_owned();
+    if api_key.is_empty() {
+        return Err("Enter an API key before saving".to_owned());
+    }
+    tokio::task::spawn_blocking(move || {
+        let options = ConnectOptions {
+            client_name: "jcode-cowork-desktop/1.0".to_owned(),
+            ..Default::default()
+        };
+        let client = JcodeClient::connect(options).map_err(|error| error.to_string())?;
+        client
+            .set_api_key(&provider, &api_key)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[derive(Serialize)]
 struct ArtifactPayload {
     name: String,
@@ -473,7 +563,11 @@ pub fn run() {
             start_cowork_task,
             stop_task,
             respond_approval,
-            read_artifact
+            read_artifact,
+            list_sessions,
+            session_transcript,
+            auth_providers,
+            auth_set_api_key
         ])
         .build(tauri::generate_context!())
         .expect("error while building jcode Cowork")
